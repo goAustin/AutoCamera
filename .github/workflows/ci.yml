@@ -40,6 +40,8 @@ jobs:
         run: pnpm install --frozen-lockfile
       - name: Verify ffmpeg
         run: ffmpeg -version && ffprobe -version
+      - name: Generate synthetic media fixture
+        run: pnpm media:fixture
       - name: Check repository
         env:
           NODE_ENV: test

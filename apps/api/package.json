@@ -18,10 +18,14 @@
     "@fastify/cors": "11.3.0",
     "@fastify/swagger": "9.8.1",
     "@fastify/swagger-ui": "6.1.1",
+    "@h3/comfy-client": "workspace:0.1.0",
     "@h3/config": "workspace:0.1.0",
     "@h3/db": "workspace:0.1.0",
     "@h3/domain": "workspace:0.1.0",
+    "@h3/evaluator": "workspace:0.1.0",
+    "@h3/object-store": "workspace:0.1.0",
     "@h3/telemetry": "workspace:0.1.0",
+    "@h3/workflow-compiler": "workspace:0.1.0",
     "fastify": "5.12.1",
     "zod": "4.4.3"
   }

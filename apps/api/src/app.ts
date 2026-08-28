@@ -16,6 +16,8 @@ import {
   toIsoUtc,
   type Clock,
   type DomainEvent,
+  type EvaluationResult,
+  type GenerationAttempt,
   type IdGenerator,
   type MicroUsd,
   type Shot,
@@ -35,6 +37,9 @@ import {
 } from '@h3/db';
 import { getApiConfig, type ApiConfig } from '@h3/config';
 import { createTraceId } from '@h3/telemetry';
+import { createLocalArtifactStore, type ArtifactStore } from '@h3/object-store';
+import type { ComfyClient } from '@h3/comfy-client';
+import type { MediaEvaluator } from '@h3/evaluator';
 import {
   ApplicationError,
   DEV_TENANT_ID,
@@ -42,6 +47,12 @@ import {
   StaticStoryboardPlanner,
   type PlanningAgent,
 } from './application.js';
+import {
+  GenerationApplicationService,
+  GenerationApplicationError,
+  GenerationWorker,
+  type CreateAttemptCommand,
+} from './generation.js';
 
 export interface ApiLiveResponse {
   readonly service: 'api';
@@ -73,6 +84,11 @@ export interface ApiAppOptions {
   readonly planner?: PlanningAgent;
   readonly clock?: Clock;
   readonly idGenerator?: IdGenerator;
+  readonly comfyClient?: ComfyClient;
+  readonly artifactStore?: ArtifactStore;
+  readonly evaluator?: MediaEvaluator;
+  readonly generationWorker?: GenerationWorker;
+  readonly startGenerationWorker?: boolean;
 }
 
 class HttpProblemError extends Error {
@@ -110,6 +126,30 @@ const createProjectBodySchema = z
 const approveStoryboardBodySchema = z
   .object({ proposalId: z.string().uuid().optional() })
   .strict();
+
+const createAttemptBodySchema = z
+  .object({
+    seed: z.number().int().optional(),
+    steps: z.number().int().positive().max(100).optional(),
+    scenario: z
+      .enum([
+        'success',
+        'duplicate-events',
+        'disconnect-reconcile',
+        'execution-failure',
+        'timeout',
+        'uncertain-submission',
+      ])
+      .optional(),
+  })
+  .strict();
+
+const rejectAttemptBodySchema = z
+  .object({ reasonCode: z.string().trim().min(1).max(64) })
+  .strict();
+
+type CreateAttemptBody = z.infer<typeof createAttemptBodySchema>;
+type RejectAttemptBody = z.infer<typeof rejectAttemptBodySchema>;
 
 type CreateProjectBody = z.infer<typeof createProjectBodySchema>;
 type ApproveStoryboardBody = z.infer<typeof approveStoryboardBodySchema>;
@@ -259,6 +299,85 @@ const proposalJsonSchema = {
   },
 } as const;
 
+const attemptJsonSchema = {
+  type: 'object',
+  required: [
+    'id',
+    'tenantId',
+    'projectId',
+    'shotId',
+    'idempotencyKey',
+    'status',
+    'seed',
+    'steps',
+    'requestedWidth',
+    'requestedHeight',
+    'requestedDurationSeconds',
+    'workflowHash',
+    'correlationId',
+    'estimatedCostMicrousd',
+    'version',
+    'queuedAt',
+    'createdAt',
+    'updatedAt',
+  ],
+  properties: {
+    id: { type: 'string', format: 'uuid' },
+    tenantId: { type: 'string', format: 'uuid' },
+    projectId: { type: 'string', format: 'uuid' },
+    shotId: { type: 'string', format: 'uuid' },
+    idempotencyKey: { type: 'string' },
+    status: { type: 'string' },
+    seed: { type: 'integer' },
+    steps: { type: 'integer' },
+    requestedWidth: { type: 'integer' },
+    requestedHeight: { type: 'integer' },
+    requestedDurationSeconds: { type: 'number' },
+    workflowVersionId: { type: 'string', format: 'uuid' },
+    workflowHash: { type: 'string' },
+    correlationId: { type: 'string' },
+    traceId: { type: 'string' },
+    scenario: { type: 'string' },
+    comfyPromptId: { type: 'string' },
+    leaseOwner: { type: 'string' },
+    leaseExpiresAt: { type: 'string', format: 'date-time' },
+    queuedAt: { type: 'string', format: 'date-time' },
+    submittedAt: { type: 'string', format: 'date-time' },
+    finishedAt: { type: 'string', format: 'date-time' },
+    computeSeconds: { type: 'number' },
+    estimatedCostMicrousd: { type: 'integer' },
+    failureCode: { type: 'string' },
+    failureMessage: { type: 'string' },
+    sourceAttemptId: { type: 'string', format: 'uuid' },
+    artifactId: { type: 'string', format: 'uuid' },
+    version: { type: 'integer' },
+    createdAt: { type: 'string', format: 'date-time' },
+    updatedAt: { type: 'string', format: 'date-time' },
+  },
+} as const;
+
+const evaluationJsonSchema = {
+  type: 'object',
+  required: [
+    'id',
+    'attemptId',
+    'evaluatorVersion',
+    'status',
+    'checks',
+    'details',
+    'evaluatedAt',
+  ],
+  properties: {
+    id: { type: 'string', format: 'uuid' },
+    attemptId: { type: 'string', format: 'uuid' },
+    evaluatorVersion: { type: 'string' },
+    status: { type: 'string', enum: ['passed', 'failed'] },
+    checks: { type: 'object' },
+    details: { type: 'object' },
+    evaluatedAt: { type: 'string', format: 'date-time' },
+  },
+} as const;
+
 function canonicalize(value: unknown): string {
   if (value === null || typeof value !== 'object') {
     return JSON.stringify(value) ?? 'null';
@@ -336,6 +455,64 @@ function shotResponse(shot: Shot): Record<string, unknown> {
   return response;
 }
 
+function attemptResponse(attempt: GenerationAttempt): Record<string, unknown> {
+  const response: Record<string, unknown> = {
+    id: attempt.id,
+    tenantId: attempt.tenantId,
+    projectId: attempt.projectId,
+    shotId: attempt.shotId,
+    idempotencyKey: attempt.idempotencyKey,
+    status: attempt.status,
+    seed: attempt.seed,
+    steps: attempt.steps,
+    requestedWidth: attempt.requestedWidth,
+    requestedHeight: attempt.requestedHeight,
+    requestedDurationSeconds: attempt.requestedDurationSeconds,
+    workflowHash: attempt.workflowHash,
+    correlationId: attempt.correlationId,
+    estimatedCostMicrousd: attempt.estimatedCostMicrousd,
+    estimatedCostUsd: formatMicrousdToUsd(attempt.estimatedCostMicrousd),
+    queuedAt: attempt.queuedAt,
+    version: attempt.version,
+    createdAt: attempt.createdAt,
+    updatedAt: attempt.updatedAt,
+  };
+  const optional: ReadonlyArray<[string, unknown]> = [
+    ['workflowVersionId', attempt.workflowVersionId],
+    ['traceId', attempt.traceId],
+    ['scenario', attempt.scenario],
+    ['comfyPromptId', attempt.comfyPromptId],
+    ['leaseOwner', attempt.leaseOwner],
+    ['leaseExpiresAt', attempt.leaseExpiresAt],
+    ['submittedAt', attempt.submittedAt],
+    ['finishedAt', attempt.finishedAt],
+    ['computeSeconds', attempt.computeSeconds],
+    ['failureCode', attempt.failureCode],
+    ['failureMessage', attempt.failureMessage],
+    ['sourceAttemptId', attempt.sourceAttemptId],
+    ['artifactId', attempt.artifactId],
+  ];
+  for (const [key, value] of optional) {
+    if (value !== undefined) response[key] = value;
+  }
+  return response;
+}
+
+function evaluationResponse(result: EvaluationResult): Record<string, unknown> {
+  return {
+    id: result.id,
+    tenantId: result.tenantId,
+    projectId: result.projectId,
+    shotId: result.shotId,
+    attemptId: result.attemptId,
+    evaluatorVersion: result.evaluatorVersion,
+    status: result.status,
+    checks: result.checks,
+    details: result.details,
+    evaluatedAt: result.evaluatedAt,
+  };
+}
+
 function eventResponse(event: DomainEvent): Record<string, unknown> {
   const response: Record<string, unknown> = {
     id: event.id,
@@ -366,6 +543,31 @@ function params(request: FastifyRequest): { readonly projectId: string } {
     );
   }
   return { projectId: candidate.projectId };
+}
+
+function resourceParam(
+  request: FastifyRequest,
+  name: 'shotId' | 'attemptId' | 'artifactId',
+): Uuid {
+  const candidate = request.params as Record<string, unknown>;
+  if (typeof candidate[name] !== 'string') {
+    throw new HttpProblemError(
+      'INVALID_PATH_PARAMETER',
+      'The resource identifier is invalid.',
+      400,
+      false,
+    );
+  }
+  try {
+    return assertProjectUuid(candidate[name]);
+  } catch {
+    throw new HttpProblemError(
+      'INVALID_PATH_PARAMETER',
+      'The resource identifier is invalid.',
+      400,
+      false,
+    );
+  }
 }
 
 function parseProjectId(request: FastifyRequest): Uuid {
@@ -581,6 +783,11 @@ function sendProblem(
     code = error.code;
     retryable = error.retryable;
     detail = error.message;
+  } else if (error instanceof GenerationApplicationError) {
+    status = error.status;
+    code = error.code;
+    retryable = error.retryable;
+    detail = error.message;
   } else if (error instanceof DomainError) {
     status = 422;
     code = error.code;
@@ -663,6 +870,33 @@ function baseRouteSchemas() {
         remainingUsd: { type: 'string' },
       },
     },
+    attemptResponse: {
+      type: 'object',
+      required: ['attempt'],
+      properties: { attempt: attemptJsonSchema },
+    },
+    attemptsResponse: {
+      type: 'object',
+      required: ['attempts'],
+      properties: { attempts: { type: 'array', items: attemptJsonSchema } },
+    },
+    attemptDetailResponse: {
+      type: 'object',
+      required: ['attempt'],
+      properties: {
+        attempt: attemptJsonSchema,
+        evaluation: evaluationJsonSchema,
+      },
+    },
+    reviewResponse: {
+      type: 'object',
+      required: ['attempt', 'shot', 'project'],
+      properties: {
+        attempt: attemptJsonSchema,
+        shot: shotJsonSchema,
+        project: projectJsonSchema,
+      },
+    },
   } as const;
 }
 
@@ -683,6 +917,24 @@ export function buildApiApp(options: ApiAppOptions = {}): FastifyInstance {
     ...(options.clock ? { clock: options.clock } : {}),
     ...(options.idGenerator ? { idGenerator: options.idGenerator } : {}),
   });
+  const generationService = new GenerationApplicationService({
+    store,
+    tenantId: service.tenantId,
+    idGenerator: service.idGenerator,
+    ...(options.comfyClient ? { comfyClient: options.comfyClient } : {}),
+    artifactStore:
+      options.artifactStore ?? createLocalArtifactStore(config.artifactRoot),
+    ...(options.evaluator ? { evaluator: options.evaluator } : {}),
+    ...(options.clock ? { clock: options.clock } : {}),
+  });
+  const generationWorker =
+    options.generationWorker ??
+    new GenerationWorker({
+      service: generationService,
+      workerId: config.gpuWorkerId,
+      leaseSeconds: config.attemptLeaseSeconds,
+      timeoutSeconds: config.attemptTimeoutSeconds,
+    });
   const authToken =
     config.devAuthToken || (config.nodeEnv === 'test' ? 'test-token' : '');
   const schemas = baseRouteSchemas();
@@ -707,14 +959,27 @@ export function buildApiApp(options: ApiAppOptions = {}): FastifyInstance {
     openapi: {
       info: {
         title: 'H3 VideoOps API',
-        description: 'Phase 2 domain, persistence, and project API.',
-        version: '0.2.0',
+        description: 'Phase 3 durable fake-generation and review API.',
+        version: '0.3.0',
       },
       tags: [
         { name: 'projects', description: 'Project and storyboard operations' },
+        {
+          name: 'generation',
+          description: 'Preview attempts and human review',
+        },
       ],
     },
   });
+
+  app.decorate('generationService', generationService);
+  app.decorate('generationWorker', generationWorker);
+  if (options.startGenerationWorker) {
+    void generationWorker.run();
+    app.addHook('onClose', async () => {
+      await generationWorker.stop();
+    });
+  }
   void app.register(swaggerUi, { routePrefix: '/documentation' });
 
   app.addHook('onRequest', async (request) => {
@@ -1015,6 +1280,289 @@ export function buildApiApp(options: ApiAppOptions = {}): FastifyInstance {
         };
       },
     );
+
+    routes.post(
+      '/v1/shots/:shotId/attempts',
+      {
+        schema: {
+          tags: ['generation'],
+          summary: 'Queue a preview generation attempt',
+          params: {
+            type: 'object',
+            required: ['shotId'],
+            properties: { shotId: { type: 'string', format: 'uuid' } },
+          },
+          body: {
+            type: 'object',
+            properties: {
+              seed: { type: 'integer' },
+              steps: { type: 'integer', minimum: 1, maximum: 100 },
+              scenario: {
+                type: 'string',
+                enum: [
+                  'success',
+                  'duplicate-events',
+                  'disconnect-reconcile',
+                  'execution-failure',
+                  'timeout',
+                  'uncertain-submission',
+                ],
+              },
+            },
+            additionalProperties: false,
+          },
+          response: { 201: schemas.attemptResponse },
+        },
+      },
+      async (request, reply) => {
+        const shotId = resourceParam(request, 'shotId');
+        const body = parseBody(
+          createAttemptBodySchema,
+          request.body,
+        ) as CreateAttemptBody;
+        const key = idempotencyKey(request);
+        const traceId = headerValue(request, 'x-trace-id');
+        const command: CreateAttemptCommand = {
+          idempotencyKey: key,
+          ...(body.seed !== undefined ? { seed: body.seed } : {}),
+          ...(body.steps !== undefined ? { steps: body.steps } : {}),
+          ...(body.scenario !== undefined ? { scenario: body.scenario } : {}),
+          ...(traceId ? { traceId } : {}),
+        };
+        const response = await executeIdempotent(
+          request,
+          service,
+          `shot.attempt.create:${shotId}`,
+          body,
+          async (repositories) => ({
+            status: 201,
+            body: {
+              attempt: attemptResponse(
+                await generationService.createAttemptInTransaction(
+                  repositories,
+                  shotId,
+                  command,
+                ),
+              ),
+            },
+          }),
+        );
+        return reply.code(response.status as 201).send(response.body);
+      },
+    );
+
+    routes.get(
+      '/v1/shots/:shotId/attempts',
+      {
+        schema: {
+          tags: ['generation'],
+          summary: 'List generation attempts for a shot',
+          params: {
+            type: 'object',
+            required: ['shotId'],
+            properties: { shotId: { type: 'string', format: 'uuid' } },
+          },
+          response: { 200: schemas.attemptsResponse },
+        },
+      },
+      async (request) => {
+        const shotId = resourceParam(request, 'shotId');
+        return {
+          attempts: (await generationService.listAttempts(shotId)).map(
+            attemptResponse,
+          ),
+        };
+      },
+    );
+
+    routes.get(
+      '/v1/attempts/:attemptId',
+      {
+        schema: {
+          tags: ['generation'],
+          summary: 'Get an attempt and its technical evaluation',
+          params: {
+            type: 'object',
+            required: ['attemptId'],
+            properties: { attemptId: { type: 'string', format: 'uuid' } },
+          },
+          response: { 200: schemas.attemptDetailResponse },
+        },
+      },
+      async (request) => {
+        const attemptId = resourceParam(request, 'attemptId');
+        const attempt = await generationService.getAttempt(attemptId);
+        const evaluation = await store.withTransaction((repositories) =>
+          repositories.evaluations.findByAttempt(service.tenantId, attemptId),
+        );
+        return {
+          attempt: attemptResponse(attempt),
+          ...(evaluation ? { evaluation: evaluationResponse(evaluation) } : {}),
+        };
+      },
+    );
+
+    routes.post(
+      '/v1/attempts/:attemptId/accept',
+      {
+        schema: {
+          tags: ['generation'],
+          summary: 'Accept a technically validated attempt',
+          params: {
+            type: 'object',
+            required: ['attemptId'],
+            properties: { attemptId: { type: 'string', format: 'uuid' } },
+          },
+          response: { 200: schemas.reviewResponse },
+        },
+      },
+      async (request, reply) => {
+        const attemptId = resourceParam(request, 'attemptId');
+        const body = request.body ?? {};
+        const response = await executeIdempotent(
+          request,
+          service,
+          `attempt.accept:${attemptId}`,
+          body,
+          async (repositories) => {
+            const result = await generationService.acceptAttemptInTransaction(
+              repositories,
+              attemptId,
+            );
+            return {
+              status: 200,
+              body: {
+                attempt: attemptResponse(result.attempt),
+                shot: shotResponse(result.shot),
+                project: projectResponse(result.project),
+              },
+            };
+          },
+        );
+        return reply.code(response.status as 200).send(response.body);
+      },
+    );
+
+    routes.post(
+      '/v1/attempts/:attemptId/reject',
+      {
+        schema: {
+          tags: ['generation'],
+          summary: 'Reject an attempt with a stable reason code',
+          params: {
+            type: 'object',
+            required: ['attemptId'],
+            properties: { attemptId: { type: 'string', format: 'uuid' } },
+          },
+          body: {
+            type: 'object',
+            required: ['reasonCode'],
+            properties: {
+              reasonCode: { type: 'string', minLength: 1, maxLength: 64 },
+            },
+            additionalProperties: false,
+          },
+          response: { 200: schemas.reviewResponse },
+        },
+      },
+      async (request, reply) => {
+        const attemptId = resourceParam(request, 'attemptId');
+        const body = parseBody(
+          rejectAttemptBodySchema,
+          request.body,
+        ) as RejectAttemptBody;
+        const response = await executeIdempotent(
+          request,
+          service,
+          `attempt.reject:${attemptId}`,
+          body,
+          async (repositories) => {
+            const result = await generationService.rejectAttemptInTransaction(
+              repositories,
+              attemptId,
+              body.reasonCode,
+            );
+            return {
+              status: 200,
+              body: {
+                attempt: attemptResponse(result.attempt),
+                shot: shotResponse(result.shot),
+                project: projectResponse(result.project),
+              },
+            };
+          },
+        );
+        return reply.code(response.status as 200).send(response.body);
+      },
+    );
+
+    routes.post(
+      '/v1/attempts/:attemptId/regenerate',
+      {
+        schema: {
+          tags: ['generation'],
+          summary: 'Queue a new attempt derived from a rejected attempt',
+          params: {
+            type: 'object',
+            required: ['attemptId'],
+            properties: { attemptId: { type: 'string', format: 'uuid' } },
+          },
+          body: {
+            type: 'object',
+            properties: {
+              seed: { type: 'integer' },
+              steps: { type: 'integer', minimum: 1, maximum: 100 },
+              scenario: {
+                type: 'string',
+                enum: [
+                  'success',
+                  'duplicate-events',
+                  'disconnect-reconcile',
+                  'execution-failure',
+                  'timeout',
+                  'uncertain-submission',
+                ],
+              },
+            },
+            additionalProperties: false,
+          },
+          response: { 201: schemas.attemptResponse },
+        },
+      },
+      async (request, reply) => {
+        const attemptId = resourceParam(request, 'attemptId');
+        const body = parseBody(
+          createAttemptBodySchema,
+          request.body,
+        ) as CreateAttemptBody;
+        const key = idempotencyKey(request);
+        const command: CreateAttemptCommand = {
+          idempotencyKey: key,
+          ...(body.seed !== undefined ? { seed: body.seed } : {}),
+          ...(body.steps !== undefined ? { steps: body.steps } : {}),
+          ...(body.scenario !== undefined ? { scenario: body.scenario } : {}),
+        };
+        const response = await executeIdempotent(
+          request,
+          service,
+          `attempt.regenerate:${attemptId}`,
+          body,
+          async (repositories) => ({
+            status: 201,
+            body: {
+              attempt: attemptResponse(
+                await generationService.regenerateAttemptInTransaction(
+                  repositories,
+                  attemptId,
+                  command,
+                ),
+              ),
+            },
+          }),
+        );
+        return reply.code(response.status as 201).send(response.body);
+      },
+    );
   });
 
   return app;
@@ -1034,6 +1582,7 @@ export async function startApi(
     config,
     databaseReady: () => checkDatabaseReady(pool),
     store,
+    startGenerationWorker: true,
   });
 
   app.addHook('onClose', async () => {

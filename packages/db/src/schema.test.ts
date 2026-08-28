@@ -40,4 +40,19 @@ describe('Phase 2 migration contract', () => {
     expect(sql).toContain('CONSTRAINT video_projects_budget_non_negative');
     expect(sql).toContain('CONSTRAINT video_projects_version_positive');
   });
+
+  it('declares the Phase 3 generation, artifact, and evaluation durability contract', () => {
+    const sql = readFileSync(
+      join(migrationsDirectory, '0002_phase3_generation.sql'),
+      'utf8',
+    );
+    expect(sql).toContain('ADD COLUMN correlation_id TEXT');
+    expect(sql).toContain('ADD COLUMN source_attempt_id UUID');
+    expect(sql).toContain('ADD COLUMN artifact_id UUID');
+    expect(sql).toContain('workflow_versions_hash_unique');
+    expect(sql).toContain('generation_attempts_idempotency_key_unique');
+    expect(sql).toContain('artifacts_attempt_unique');
+    expect(sql).toContain('generation_attempts_queue_idx');
+    expect(sql).toContain('generation_attempts_failure_message_bounded');
+  });
 });

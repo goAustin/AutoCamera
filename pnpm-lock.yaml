@@ -35,6 +35,9 @@ importers:
       '@fastify/swagger-ui':
         specifier: 6.1.1
         version: 6.1.1
+      '@h3/comfy-client':
+        specifier: workspace:0.1.0
+        version: link:../../packages/comfy-client
       '@h3/config':
         specifier: workspace:0.1.0
         version: link:../../packages/config
@@ -44,9 +47,18 @@ importers:
       '@h3/domain':
         specifier: workspace:0.1.0
         version: link:../../packages/domain
+      '@h3/evaluator':
+        specifier: workspace:0.1.0
+        version: link:../../packages/evaluator
+      '@h3/object-store':
+        specifier: workspace:0.1.0
+        version: link:../../packages/object-store
       '@h3/telemetry':
         specifier: workspace:0.1.0
         version: link:../../packages/telemetry
+      '@h3/workflow-compiler':
+        specifier: workspace:0.1.0
+        version: link:../../packages/workflow-compiler
       fastify:
         specifier: 5.12.1
         version: 5.12.1

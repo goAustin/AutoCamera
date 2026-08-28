@@ -1,0 +1,48 @@
+{
+  "family": "h3-t2v-fixture",
+  "version": "h3-t2v-fixture-v1",
+  "requiredNodes": [
+    { "nodeId": "1", "classType": "CLIPTextEncode" },
+    { "nodeId": "2", "classType": "EmptyHunyuanLatentVideo" },
+    { "nodeId": "3", "classType": "KSampler" },
+    { "nodeId": "4", "classType": "SaveVideo" }
+  ],
+  "bindings": [
+    {
+      "name": "prompt",
+      "nodeId": "1",
+      "classType": "CLIPTextEncode",
+      "path": ["inputs", "text"]
+    },
+    {
+      "name": "width",
+      "nodeId": "2",
+      "classType": "EmptyHunyuanLatentVideo",
+      "path": ["inputs", "width"]
+    },
+    {
+      "name": "height",
+      "nodeId": "2",
+      "classType": "EmptyHunyuanLatentVideo",
+      "path": ["inputs", "height"]
+    },
+    {
+      "name": "durationFrames",
+      "nodeId": "2",
+      "classType": "EmptyHunyuanLatentVideo",
+      "path": ["inputs", "length"]
+    },
+    {
+      "name": "seed",
+      "nodeId": "3",
+      "classType": "KSampler",
+      "path": ["inputs", "seed"]
+    },
+    {
+      "name": "steps",
+      "nodeId": "3",
+      "classType": "KSampler",
+      "path": ["inputs", "steps"]
+    }
+  ]
+}

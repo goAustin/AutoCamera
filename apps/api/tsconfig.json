@@ -9,15 +9,23 @@
     "paths": {
       "@h3/config": ["../../packages/config/src/index.ts"],
       "@h3/db": ["../../packages/db/src/index.ts"],
+      "@h3/comfy-client": ["../../packages/comfy-client/src/index.ts"],
+      "@h3/evaluator": ["../../packages/evaluator/src/index.ts"],
+      "@h3/object-store": ["../../packages/object-store/src/index.ts"],
       "@h3/telemetry": ["../../packages/telemetry/src/index.ts"],
-      "@h3/domain": ["../../packages/domain/src/index.ts"]
+      "@h3/domain": ["../../packages/domain/src/index.ts"],
+      "@h3/workflow-compiler": ["../../packages/workflow-compiler/src/index.ts"]
     }
   },
   "references": [
     { "path": "../../packages/config/tsconfig.json" },
     { "path": "../../packages/db/tsconfig.json" },
     { "path": "../../packages/domain/tsconfig.json" },
-    { "path": "../../packages/telemetry/tsconfig.json" }
+    { "path": "../../packages/telemetry/tsconfig.json" },
+    { "path": "../../packages/comfy-client/tsconfig.json" },
+    { "path": "../../packages/evaluator/tsconfig.json" },
+    { "path": "../../packages/object-store/tsconfig.json" },
+    { "path": "../../packages/workflow-compiler/tsconfig.json" }
   ],
-  "include": ["src/app.ts", "src/application.ts", "src/main.ts"]
+  "include": ["src"]
 }

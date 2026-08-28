@@ -4,15 +4,22 @@ import { fileURLToPath } from 'node:url';
 import { Pool, type QueryResult, type QueryResultRow } from 'pg';
 import {
   assertMicrousd,
+  assertGenerationAttempt,
   assertUuid,
+  ATTEMPT_FAILURE_CODES,
   type Clock,
   type DomainEvent,
   DomainError,
+  parseGenerationAttemptStatus,
   parseDomainEventType,
   parseProjectStatus,
   parseShotStatus,
   parseStoryboardStatus,
   toIsoUtc,
+  type ArtifactRecord,
+  type AttemptFailureCode,
+  type EvaluationResult,
+  type GenerationAttempt,
   type Shot,
   type StoryboardProposal,
   type Uuid,
@@ -139,12 +146,85 @@ export interface ShotRepository {
   createMany(shots: readonly Shot[]): Promise<void>;
   listByProject(projectId: Uuid): Promise<readonly Shot[]>;
   findById(projectId: Uuid, shotId: Uuid): Promise<Shot | null>;
+  findByIdAny(shotId: Uuid): Promise<Shot | null>;
   update(shot: Shot, expectedVersion: number): Promise<Shot>;
+}
+
+export interface AttemptRepository {
+  create(attempt: GenerationAttempt): Promise<void>;
+  findById(tenantId: Uuid, attemptId: Uuid): Promise<GenerationAttempt | null>;
+  findByPromptId(
+    tenantId: Uuid,
+    promptId: string,
+  ): Promise<GenerationAttempt | null>;
+  findByCorrelationId(
+    tenantId: Uuid,
+    correlationId: string,
+  ): Promise<GenerationAttempt | null>;
+  listByShot(
+    tenantId: Uuid,
+    shotId: Uuid,
+  ): Promise<readonly GenerationAttempt[]>;
+  listByProject(
+    tenantId: Uuid,
+    projectId: Uuid,
+  ): Promise<readonly GenerationAttempt[]>;
+  update(
+    attempt: GenerationAttempt,
+    expectedVersion: number,
+  ): Promise<GenerationAttempt>;
+  claimNext(
+    workerId: string,
+    now: string,
+    leaseExpiresAt: string,
+  ): Promise<GenerationAttempt | null>;
+  heartbeat(
+    attemptId: Uuid,
+    workerId: string,
+    leaseExpiresAt: string,
+  ): Promise<GenerationAttempt | null>;
+  release(
+    attemptId: Uuid,
+    workerId: string,
+    updatedAt: string,
+  ): Promise<GenerationAttempt | null>;
+  recoverStale(now: string): Promise<readonly GenerationAttempt[]>;
+}
+
+export interface ArtifactRepository {
+  create(artifact: ArtifactRecord): Promise<void>;
+  findById(tenantId: Uuid, artifactId: Uuid): Promise<ArtifactRecord | null>;
+  findByAttempt(
+    tenantId: Uuid,
+    attemptId: Uuid,
+  ): Promise<ArtifactRecord | null>;
+}
+
+export interface EvaluationRepository {
+  create(result: EvaluationResult): Promise<void>;
+  findByAttempt(
+    tenantId: Uuid,
+    attemptId: Uuid,
+  ): Promise<EvaluationResult | null>;
+}
+
+export interface WorkflowVersionRecord {
+  readonly id: Uuid;
+  readonly version: string;
+  readonly workflowHash: string;
+  readonly workflowJson: Readonly<Record<string, unknown>>;
+  readonly createdAt: string;
+}
+
+export interface WorkflowVersionRepository {
+  findByHash(workflowHash: string): Promise<WorkflowVersionRecord | null>;
+  create(version: WorkflowVersionRecord): Promise<void>;
 }
 
 export interface EventRepository {
   append(event: DomainEvent): Promise<void>;
   listByProject(projectId: Uuid): Promise<readonly DomainEvent[]>;
+  listOrphans(tenantId: Uuid): Promise<readonly DomainEvent[]>;
 }
 
 export interface OutboxMessage {
@@ -204,6 +284,10 @@ export interface Repositories {
   readonly projects: ProjectRepository;
   readonly storyboards: StoryboardRepository;
   readonly shots: ShotRepository;
+  readonly attempts: AttemptRepository;
+  readonly artifacts: ArtifactRepository;
+  readonly evaluations: EvaluationRepository;
+  readonly workflowVersions: WorkflowVersionRepository;
   readonly events: EventRepository;
   readonly outbox: OutboxRepository;
   readonly idempotency: IdempotencyRepository;
@@ -259,6 +343,74 @@ interface ShotRow extends QueryResultRow {
   version: number;
   created_at: DatabaseTimestamp;
   updated_at: DatabaseTimestamp;
+}
+
+interface AttemptRow extends QueryResultRow {
+  id: string;
+  tenant_id: string;
+  project_id: string;
+  shot_id: string;
+  idempotency_key: string;
+  status: string;
+  seed: string | number;
+  steps: number;
+  requested_width: number;
+  requested_height: number;
+  requested_duration_seconds: string | number;
+  workflow_version_id: string | null;
+  workflow_hash: string;
+  correlation_id: string;
+  trace_id: string | null;
+  scenario: string | null;
+  comfy_prompt_id: string | null;
+  lease_owner: string | null;
+  lease_expires_at: DatabaseTimestamp | null;
+  queued_at: DatabaseTimestamp;
+  submitted_at: DatabaseTimestamp | null;
+  finished_at: DatabaseTimestamp | null;
+  compute_seconds: string | number | null;
+  estimated_cost_microusd: string | number;
+  failure_code: string | null;
+  failure_message: string | null;
+  source_attempt_id: string | null;
+  artifact_id: string | null;
+  version: number;
+  created_at: DatabaseTimestamp;
+  updated_at: DatabaseTimestamp;
+}
+
+interface ArtifactRow extends QueryResultRow {
+  id: string;
+  tenant_id: string;
+  project_id: string;
+  shot_id: string;
+  attempt_id: string;
+  object_key: string;
+  mime_type: string;
+  byte_size: string | number;
+  sha256: string;
+  created_at: DatabaseTimestamp;
+}
+
+interface EvaluationRow extends QueryResultRow {
+  id: string;
+  tenant_id: string;
+  project_id: string;
+  shot_id: string;
+  attempt_id: string;
+  evaluator_version: string;
+  status: string;
+  checks: unknown;
+  details: unknown;
+  evaluated_at: DatabaseTimestamp;
+}
+
+interface WorkflowVersionRow extends QueryResultRow {
+  id: string;
+  version: string;
+  workflow_hash: string;
+  workflow_json: unknown;
+  created_at: DatabaseTimestamp;
 }
 
 interface EventRow extends QueryResultRow {
@@ -445,6 +597,162 @@ function mapShot(row: ShotRow): Shot {
     return { ...shot, acceptedAttemptId };
   }
   return shot;
+}
+
+function optionalDatabaseTimestamp(
+  value: DatabaseTimestamp | null,
+): string | undefined {
+  return value === null ? undefined : databaseTimestamp(value);
+}
+
+function optionalDatabaseNumber(
+  value: string | number | null,
+): number | undefined {
+  return value === null ? undefined : databaseNumber(value);
+}
+
+function attemptFailureCode(
+  value: string | null,
+): AttemptFailureCode | undefined {
+  if (value === null) {
+    return undefined;
+  }
+  if (!ATTEMPT_FAILURE_CODES.includes(value as AttemptFailureCode)) {
+    throw new RepositoryError(
+      'DATABASE_ERROR',
+      'Database returned an unknown attempt failure code.',
+    );
+  }
+  return value as AttemptFailureCode;
+}
+
+function mapAttempt(row: AttemptRow): GenerationAttempt {
+  const workflowVersionId = row.workflow_version_id
+    ? assertUuid(row.workflow_version_id)
+    : undefined;
+  const traceId = row.trace_id ?? undefined;
+  const scenario = row.scenario ?? undefined;
+  const comfyPromptId = row.comfy_prompt_id ?? undefined;
+  const leaseOwner = row.lease_owner ?? undefined;
+  const leaseExpiresAt = optionalDatabaseTimestamp(row.lease_expires_at);
+  const submittedAt = optionalDatabaseTimestamp(row.submitted_at);
+  const finishedAt = optionalDatabaseTimestamp(row.finished_at);
+  const computeSeconds = optionalDatabaseNumber(row.compute_seconds);
+  const failureCode = attemptFailureCode(row.failure_code);
+  const failureMessage = row.failure_message ?? undefined;
+  const sourceAttemptId = row.source_attempt_id
+    ? assertUuid(row.source_attempt_id)
+    : undefined;
+  const artifactId = row.artifact_id ? assertUuid(row.artifact_id) : undefined;
+  const attempt: GenerationAttempt = {
+    id: assertUuid(row.id),
+    tenantId: assertUuid(row.tenant_id),
+    projectId: assertUuid(row.project_id),
+    shotId: assertUuid(row.shot_id),
+    idempotencyKey: row.idempotency_key,
+    status: parseGenerationAttemptStatus(row.status),
+    seed: databaseNumber(row.seed),
+    steps: row.steps,
+    requestedWidth: row.requested_width,
+    requestedHeight: row.requested_height,
+    requestedDurationSeconds: databaseNumber(row.requested_duration_seconds),
+    workflowHash: row.workflow_hash,
+    correlationId: row.correlation_id,
+    estimatedCostMicrousd: assertMicrousd(
+      databaseNumber(row.estimated_cost_microusd),
+    ),
+    version: row.version,
+    queuedAt: databaseTimestamp(row.queued_at) as GenerationAttempt['queuedAt'],
+    createdAt: databaseTimestamp(
+      row.created_at,
+    ) as GenerationAttempt['createdAt'],
+    updatedAt: databaseTimestamp(
+      row.updated_at,
+    ) as GenerationAttempt['updatedAt'],
+    ...(workflowVersionId ? { workflowVersionId } : {}),
+    ...(traceId ? { traceId } : {}),
+    ...(scenario ? { scenario } : {}),
+    ...(comfyPromptId ? { comfyPromptId } : {}),
+    ...(leaseOwner ? { leaseOwner } : {}),
+    ...(leaseExpiresAt
+      ? {
+          leaseExpiresAt: leaseExpiresAt as NonNullable<
+            GenerationAttempt['leaseExpiresAt']
+          >,
+        }
+      : {}),
+    ...(submittedAt
+      ? {
+          submittedAt: submittedAt as NonNullable<
+            GenerationAttempt['submittedAt']
+          >,
+        }
+      : {}),
+    ...(finishedAt
+      ? {
+          finishedAt: finishedAt as NonNullable<
+            GenerationAttempt['finishedAt']
+          >,
+        }
+      : {}),
+    ...(computeSeconds !== undefined ? { computeSeconds } : {}),
+    ...(failureCode ? { failureCode } : {}),
+    ...(failureMessage ? { failureMessage } : {}),
+    ...(sourceAttemptId ? { sourceAttemptId } : {}),
+    ...(artifactId ? { artifactId } : {}),
+  };
+  assertGenerationAttempt(attempt);
+  return attempt;
+}
+
+function mapArtifact(row: ArtifactRow): ArtifactRecord {
+  return {
+    id: assertUuid(row.id),
+    tenantId: assertUuid(row.tenant_id),
+    projectId: assertUuid(row.project_id),
+    shotId: assertUuid(row.shot_id),
+    attemptId: assertUuid(row.attempt_id),
+    objectKey: row.object_key,
+    mimeType: row.mime_type,
+    byteSize: databaseNumber(row.byte_size),
+    sha256: row.sha256,
+    createdAt: databaseTimestamp(row.created_at) as ArtifactRecord['createdAt'],
+  };
+}
+
+function mapEvaluation(row: EvaluationRow): EvaluationResult {
+  if (row.status !== 'passed' && row.status !== 'failed') {
+    throw new RepositoryError(
+      'DATABASE_ERROR',
+      'Database returned an unknown evaluation status.',
+    );
+  }
+  return {
+    id: assertUuid(row.id),
+    tenantId: assertUuid(row.tenant_id),
+    projectId: assertUuid(row.project_id),
+    shotId: assertUuid(row.shot_id),
+    attemptId: assertUuid(row.attempt_id),
+    evaluatorVersion: row.evaluator_version,
+    status: row.status,
+    checks: (row.checks ?? {}) as EvaluationResult['checks'],
+    details: (row.details ?? {}) as EvaluationResult['details'],
+    evaluatedAt: databaseTimestamp(
+      row.evaluated_at,
+    ) as EvaluationResult['evaluatedAt'],
+  };
+}
+
+function mapWorkflowVersion(row: WorkflowVersionRow): WorkflowVersionRecord {
+  return {
+    id: assertUuid(row.id),
+    version: row.version,
+    workflowHash: row.workflow_hash,
+    workflowJson: (row.workflow_json ?? {}) as Readonly<
+      Record<string, unknown>
+    >,
+    createdAt: databaseTimestamp(row.created_at),
+  };
 }
 
 function mapEvent(row: EventRow): DomainEvent {
@@ -746,6 +1054,15 @@ class PostgresShotRepository implements ShotRepository {
     return row ? mapShot(row) : null;
   }
 
+  async findByIdAny(shotId: Uuid): Promise<Shot | null> {
+    const result = await this.executor.query<ShotRow>(
+      'SELECT * FROM shots WHERE id = $1',
+      [shotId],
+    );
+    const row = result.rows[0];
+    return row ? mapShot(row) : null;
+  }
+
   async update(shot: Shot, expectedVersion: number): Promise<Shot> {
     const result = await this.executor.query<ShotRow>(
       `UPDATE shots
@@ -773,6 +1090,421 @@ class PostgresShotRepository implements ShotRepository {
       );
     }
     return mapShot(row);
+  }
+}
+
+class PostgresAttemptRepository implements AttemptRepository {
+  private readonly executor: SqlExecutor;
+
+  constructor(executor: SqlExecutor) {
+    this.executor = executor;
+  }
+
+  async create(attempt: GenerationAttempt): Promise<void> {
+    await this.executor.query(
+      `INSERT INTO generation_attempts (
+        id, tenant_id, project_id, shot_id, idempotency_key, status, seed, steps,
+        requested_width, requested_height, requested_duration_seconds,
+        workflow_version_id, workflow_hash, correlation_id, trace_id,
+        scenario, comfy_prompt_id, lease_owner, lease_expires_at, queued_at, submitted_at,
+        finished_at, compute_seconds, estimated_cost_microusd, failure_code,
+        failure_message, source_attempt_id, artifact_id, version, created_at,
+        updated_at
+      ) VALUES (
+        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
+        $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29,
+        $30, $31
+      )`,
+      [
+        attempt.id,
+        attempt.tenantId,
+        attempt.projectId,
+        attempt.shotId,
+        attempt.idempotencyKey,
+        attempt.status,
+        attempt.seed,
+        attempt.steps,
+        attempt.requestedWidth,
+        attempt.requestedHeight,
+        attempt.requestedDurationSeconds,
+        attempt.workflowVersionId ?? null,
+        attempt.workflowHash,
+        attempt.correlationId,
+        attempt.traceId ?? null,
+        attempt.scenario ?? null,
+        attempt.comfyPromptId ?? null,
+        attempt.leaseOwner ?? null,
+        attempt.leaseExpiresAt ?? null,
+        attempt.queuedAt,
+        attempt.submittedAt ?? null,
+        attempt.finishedAt ?? null,
+        attempt.computeSeconds ?? null,
+        attempt.estimatedCostMicrousd,
+        attempt.failureCode ?? null,
+        attempt.failureMessage ?? null,
+        attempt.sourceAttemptId ?? null,
+        attempt.artifactId ?? null,
+        attempt.version,
+        attempt.createdAt,
+        attempt.updatedAt,
+      ],
+    );
+  }
+
+  async findById(
+    tenantId: Uuid,
+    attemptId: Uuid,
+  ): Promise<GenerationAttempt | null> {
+    const result = await this.executor.query<AttemptRow>(
+      'SELECT * FROM generation_attempts WHERE tenant_id = $1 AND id = $2',
+      [tenantId, attemptId],
+    );
+    const row = result.rows[0];
+    return row ? mapAttempt(row) : null;
+  }
+
+  async findByPromptId(
+    tenantId: Uuid,
+    promptId: string,
+  ): Promise<GenerationAttempt | null> {
+    const result = await this.executor.query<AttemptRow>(
+      'SELECT * FROM generation_attempts WHERE tenant_id = $1 AND comfy_prompt_id = $2',
+      [tenantId, promptId],
+    );
+    const row = result.rows[0];
+    return row ? mapAttempt(row) : null;
+  }
+
+  async findByCorrelationId(
+    tenantId: Uuid,
+    correlationId: string,
+  ): Promise<GenerationAttempt | null> {
+    const result = await this.executor.query<AttemptRow>(
+      'SELECT * FROM generation_attempts WHERE tenant_id = $1 AND correlation_id = $2',
+      [tenantId, correlationId],
+    );
+    const row = result.rows[0];
+    return row ? mapAttempt(row) : null;
+  }
+
+  async listByShot(
+    tenantId: Uuid,
+    shotId: Uuid,
+  ): Promise<readonly GenerationAttempt[]> {
+    const result = await this.executor.query<AttemptRow>(
+      `SELECT * FROM generation_attempts
+       WHERE tenant_id = $1 AND shot_id = $2
+       ORDER BY created_at, id`,
+      [tenantId, shotId],
+    );
+    return result.rows.map(mapAttempt);
+  }
+
+  async listByProject(
+    tenantId: Uuid,
+    projectId: Uuid,
+  ): Promise<readonly GenerationAttempt[]> {
+    const result = await this.executor.query<AttemptRow>(
+      `SELECT * FROM generation_attempts
+       WHERE tenant_id = $1 AND project_id = $2
+       ORDER BY created_at, id`,
+      [tenantId, projectId],
+    );
+    return result.rows.map(mapAttempt);
+  }
+
+  async update(
+    attempt: GenerationAttempt,
+    expectedVersion: number,
+  ): Promise<GenerationAttempt> {
+    const result = await this.executor.query<AttemptRow>(
+      `UPDATE generation_attempts
+       SET status = $1,
+           workflow_version_id = $2,
+           workflow_hash = $3,
+           correlation_id = $4,
+           trace_id = $5,
+           scenario = $6,
+           comfy_prompt_id = $7,
+           lease_owner = $8,
+           lease_expires_at = $9,
+           submitted_at = $10,
+           finished_at = $11,
+           compute_seconds = $12,
+           estimated_cost_microusd = $13,
+           failure_code = $14,
+           failure_message = $15,
+           source_attempt_id = $16,
+           artifact_id = $17,
+           version = $18,
+           updated_at = $19
+       WHERE id = $20 AND tenant_id = $21 AND version = $22
+       RETURNING *`,
+      [
+        attempt.status,
+        attempt.workflowVersionId ?? null,
+        attempt.workflowHash,
+        attempt.correlationId,
+        attempt.traceId ?? null,
+        attempt.scenario ?? null,
+        attempt.comfyPromptId ?? null,
+        attempt.leaseOwner ?? null,
+        attempt.leaseExpiresAt ?? null,
+        attempt.submittedAt ?? null,
+        attempt.finishedAt ?? null,
+        attempt.computeSeconds ?? null,
+        attempt.estimatedCostMicrousd,
+        attempt.failureCode ?? null,
+        attempt.failureMessage ?? null,
+        attempt.sourceAttemptId ?? null,
+        attempt.artifactId ?? null,
+        attempt.version,
+        attempt.updatedAt,
+        attempt.id,
+        attempt.tenantId,
+        expectedVersion,
+      ],
+    );
+    const row = result.rows[0];
+    if (!row) {
+      throw new RepositoryError(
+        'OPTIMISTIC_CONFLICT',
+        'The generation attempt was modified by another transaction.',
+      );
+    }
+    return mapAttempt(row);
+  }
+
+  async claimNext(
+    workerId: string,
+    now: string,
+    leaseExpiresAt: string,
+  ): Promise<GenerationAttempt | null> {
+    const result = await this.executor.query<AttemptRow>(
+      `WITH candidate AS (
+        SELECT id
+        FROM generation_attempts
+        WHERE status = 'queued'
+          AND (lease_expires_at IS NULL OR lease_expires_at < $2)
+          AND NOT EXISTS (
+            SELECT 1
+            FROM generation_attempts active
+            WHERE active.lease_owner = $1
+              AND active.lease_expires_at IS NOT NULL
+              AND active.lease_expires_at >= $2
+              AND active.status IN (
+                'claimed', 'submitting', 'submitted', 'running',
+                'generated', 'evaluating'
+              )
+          )
+        ORDER BY queued_at, id
+        FOR UPDATE SKIP LOCKED
+        LIMIT 1
+      )
+      UPDATE generation_attempts attempt
+      SET status = 'claimed',
+          lease_owner = $1,
+          lease_expires_at = $3,
+          version = attempt.version + 1,
+          updated_at = $2
+      FROM candidate
+      WHERE attempt.id = candidate.id
+      RETURNING attempt.*`,
+      [workerId, now, leaseExpiresAt],
+    );
+    const row = result.rows[0];
+    return row ? mapAttempt(row) : null;
+  }
+
+  async heartbeat(
+    attemptId: Uuid,
+    workerId: string,
+    leaseExpiresAt: string,
+  ): Promise<GenerationAttempt | null> {
+    const result = await this.executor.query<AttemptRow>(
+      `UPDATE generation_attempts
+       SET lease_expires_at = $1,
+           version = version + 1,
+           updated_at = now()
+       WHERE id = $2 AND lease_owner = $3
+         AND status IN ('claimed', 'submitting', 'submitted', 'running', 'generated', 'evaluating')
+       RETURNING *`,
+      [leaseExpiresAt, attemptId, workerId],
+    );
+    const row = result.rows[0];
+    return row ? mapAttempt(row) : null;
+  }
+
+  async release(
+    attemptId: Uuid,
+    workerId: string,
+    updatedAt: string,
+  ): Promise<GenerationAttempt | null> {
+    const result = await this.executor.query<AttemptRow>(
+      `UPDATE generation_attempts
+       SET status = 'queued',
+           lease_owner = NULL,
+           lease_expires_at = NULL,
+           version = version + 1,
+           updated_at = $3
+       WHERE id = $1 AND lease_owner = $2
+         AND status IN ('claimed', 'submitting', 'submitted', 'running', 'generated', 'evaluating')
+       RETURNING *`,
+      [attemptId, workerId, updatedAt],
+    );
+    const row = result.rows[0];
+    return row ? mapAttempt(row) : null;
+  }
+
+  async recoverStale(now: string): Promise<readonly GenerationAttempt[]> {
+    const result = await this.executor.query<AttemptRow>(
+      `UPDATE generation_attempts
+       SET status = 'queued',
+           lease_owner = NULL,
+           lease_expires_at = NULL,
+           version = version + 1,
+           updated_at = $1
+       WHERE lease_expires_at IS NOT NULL
+         AND lease_expires_at < $1
+         AND status IN ('claimed', 'submitting', 'submitted', 'running', 'generated', 'evaluating')
+       RETURNING *`,
+      [now],
+    );
+    return result.rows.map(mapAttempt);
+  }
+}
+
+class PostgresArtifactRepository implements ArtifactRepository {
+  private readonly executor: SqlExecutor;
+
+  constructor(executor: SqlExecutor) {
+    this.executor = executor;
+  }
+
+  async create(artifact: ArtifactRecord): Promise<void> {
+    await this.executor.query(
+      `INSERT INTO artifacts (
+        id, tenant_id, project_id, shot_id, attempt_id, object_key, mime_type,
+        byte_size, sha256, created_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+      [
+        artifact.id,
+        artifact.tenantId,
+        artifact.projectId,
+        artifact.shotId,
+        artifact.attemptId,
+        artifact.objectKey,
+        artifact.mimeType,
+        artifact.byteSize,
+        artifact.sha256,
+        artifact.createdAt,
+      ],
+    );
+  }
+
+  async findById(
+    tenantId: Uuid,
+    artifactId: Uuid,
+  ): Promise<ArtifactRecord | null> {
+    const result = await this.executor.query<ArtifactRow>(
+      'SELECT * FROM artifacts WHERE tenant_id = $1 AND id = $2',
+      [tenantId, artifactId],
+    );
+    const row = result.rows[0];
+    return row ? mapArtifact(row) : null;
+  }
+
+  async findByAttempt(
+    tenantId: Uuid,
+    attemptId: Uuid,
+  ): Promise<ArtifactRecord | null> {
+    const result = await this.executor.query<ArtifactRow>(
+      `SELECT * FROM artifacts
+       WHERE tenant_id = $1 AND attempt_id = $2
+       ORDER BY created_at DESC, id DESC
+       LIMIT 1`,
+      [tenantId, attemptId],
+    );
+    const row = result.rows[0];
+    return row ? mapArtifact(row) : null;
+  }
+}
+
+class PostgresEvaluationRepository implements EvaluationRepository {
+  private readonly executor: SqlExecutor;
+
+  constructor(executor: SqlExecutor) {
+    this.executor = executor;
+  }
+
+  async create(result: EvaluationResult): Promise<void> {
+    await this.executor.query(
+      `INSERT INTO evaluation_results (
+        id, tenant_id, project_id, shot_id, attempt_id, evaluator_version,
+        status, checks, details, evaluated_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb, $10)`,
+      [
+        result.id,
+        result.tenantId,
+        result.projectId,
+        result.shotId,
+        result.attemptId,
+        result.evaluatorVersion,
+        result.status,
+        databaseJson(result.checks),
+        databaseJson(result.details),
+        result.evaluatedAt,
+      ],
+    );
+  }
+
+  async findByAttempt(
+    tenantId: Uuid,
+    attemptId: Uuid,
+  ): Promise<EvaluationResult | null> {
+    const result = await this.executor.query<EvaluationRow>(
+      'SELECT * FROM evaluation_results WHERE tenant_id = $1 AND attempt_id = $2',
+      [tenantId, attemptId],
+    );
+    const row = result.rows[0];
+    return row ? mapEvaluation(row) : null;
+  }
+}
+
+class PostgresWorkflowVersionRepository implements WorkflowVersionRepository {
+  private readonly executor: SqlExecutor;
+
+  constructor(executor: SqlExecutor) {
+    this.executor = executor;
+  }
+
+  async findByHash(
+    workflowHash: string,
+  ): Promise<WorkflowVersionRecord | null> {
+    const result = await this.executor.query<WorkflowVersionRow>(
+      `SELECT * FROM workflow_versions
+       WHERE workflow_hash = $1
+       ORDER BY created_at, id
+       LIMIT 1`,
+      [workflowHash],
+    );
+    const row = result.rows[0];
+    return row ? mapWorkflowVersion(row) : null;
+  }
+
+  async create(version: WorkflowVersionRecord): Promise<void> {
+    await this.executor.query(
+      `INSERT INTO workflow_versions (
+        id, version, workflow_hash, workflow_json, created_at
+      ) VALUES ($1, $2, $3, $4::jsonb, $5)`,
+      [
+        version.id,
+        version.version,
+        version.workflowHash,
+        databaseJson(version.workflowJson),
+        version.createdAt,
+      ],
+    );
   }
 }
 
@@ -813,6 +1545,16 @@ class PostgresEventRepository implements EventRepository {
        WHERE project_id = $1
        ORDER BY event_sequence`,
       [projectId],
+    );
+    return result.rows.map(mapEvent);
+  }
+
+  async listOrphans(tenantId: Uuid): Promise<readonly DomainEvent[]> {
+    const result = await this.executor.query<EventRow>(
+      `SELECT * FROM domain_events
+       WHERE tenant_id = $1 AND project_id IS NULL AND type = 'orphan.event'
+       ORDER BY event_sequence`,
+      [tenantId],
     );
     return result.rows.map(mapEvent);
   }
@@ -972,6 +1714,10 @@ function createPostgresRepositories(executor: SqlExecutor): Repositories {
     projects: new PostgresProjectRepository(executor),
     storyboards: new PostgresStoryboardRepository(executor),
     shots: new PostgresShotRepository(executor),
+    attempts: new PostgresAttemptRepository(executor),
+    artifacts: new PostgresArtifactRepository(executor),
+    evaluations: new PostgresEvaluationRepository(executor),
+    workflowVersions: new PostgresWorkflowVersionRepository(executor),
     events: new PostgresEventRepository(executor),
     outbox: new PostgresOutboxRepository(executor),
     idempotency: new PostgresIdempotencyRepository(executor),
@@ -1025,6 +1771,10 @@ interface MemoryState {
   readonly projects: Map<Uuid, VideoProject>;
   readonly storyboards: Map<Uuid, StoryboardProposal>;
   readonly shots: Map<Uuid, Shot>;
+  readonly attempts: Map<Uuid, GenerationAttempt>;
+  readonly artifacts: Map<Uuid, ArtifactRecord>;
+  readonly evaluations: Map<Uuid, EvaluationResult>;
+  readonly workflowVersions: Map<Uuid, WorkflowVersionRecord>;
   readonly events: Map<Uuid, DomainEvent>;
   readonly outbox: Map<
     Uuid,
@@ -1042,6 +1792,10 @@ function emptyMemoryState(): MemoryState {
     projects: new Map(),
     storyboards: new Map(),
     shots: new Map(),
+    attempts: new Map(),
+    artifacts: new Map(),
+    evaluations: new Map(),
+    workflowVersions: new Map(),
     events: new Map(),
     outbox: new Map(),
     idempotency: new Map(),
@@ -1059,6 +1813,28 @@ function cloneMemoryState(state: MemoryState): MemoryState {
       ]),
     ),
     shots: new Map([...state.shots].map(([id, shot]) => [id, { ...shot }])),
+    attempts: new Map(
+      [...state.attempts].map(([id, attempt]) => [id, { ...attempt }]),
+    ),
+    artifacts: new Map(
+      [...state.artifacts].map(([id, artifact]) => [id, { ...artifact }]),
+    ),
+    evaluations: new Map(
+      [...state.evaluations].map(([id, result]) => [
+        id,
+        {
+          ...result,
+          checks: { ...result.checks },
+          details: { ...result.details },
+        },
+      ]),
+    ),
+    workflowVersions: new Map(
+      [...state.workflowVersions].map(([id, version]) => [
+        id,
+        { ...version, workflowJson: { ...version.workflowJson } },
+      ]),
+    ),
     events: new Map(
       [...state.events].map(([id, event]) => [
         id,
@@ -1083,6 +1859,10 @@ class MemoryRepositories implements Repositories {
   readonly projects: ProjectRepository;
   readonly storyboards: StoryboardRepository;
   readonly shots: ShotRepository;
+  readonly attempts: AttemptRepository;
+  readonly artifacts: ArtifactRepository;
+  readonly evaluations: EvaluationRepository;
+  readonly workflowVersions: WorkflowVersionRepository;
   readonly events: EventRepository;
   readonly outbox: OutboxRepository;
   readonly idempotency: IdempotencyRepository;
@@ -1217,6 +1997,10 @@ class MemoryRepositories implements Repositories {
         const shot = this.state.shots.get(shotId);
         return shot && shot.projectId === projectId ? { ...shot } : null;
       },
+      findByIdAny: async (shotId) => {
+        const shot = this.state.shots.get(shotId);
+        return shot ? { ...shot } : null;
+      },
       update: async (shot, expectedVersion) => {
         const current = this.state.shots.get(shot.id);
         if (!current || current.version !== expectedVersion) {
@@ -1227,6 +2011,335 @@ class MemoryRepositories implements Repositories {
         }
         this.state.shots.set(shot.id, { ...shot });
         return { ...shot };
+      },
+    };
+    this.attempts = {
+      create: async (attempt) => {
+        if (this.state.attempts.has(attempt.id)) {
+          throw new RepositoryError(
+            'UNIQUE_VIOLATION',
+            'Generation attempt already exists.',
+          );
+        }
+        if (
+          [...this.state.attempts.values()].some(
+            (current) =>
+              current.idempotencyKey === attempt.idempotencyKey &&
+              current.tenantId === attempt.tenantId,
+          )
+        ) {
+          throw new RepositoryError(
+            'UNIQUE_VIOLATION',
+            'Generation attempt idempotency key already exists.',
+          );
+        }
+        if (
+          attempt.comfyPromptId &&
+          [...this.state.attempts.values()].some(
+            (current) => current.comfyPromptId === attempt.comfyPromptId,
+          )
+        ) {
+          throw new RepositoryError(
+            'UNIQUE_VIOLATION',
+            'Comfy prompt identifier already exists.',
+          );
+        }
+        if (
+          [...this.state.attempts.values()].some(
+            (current) =>
+              current.tenantId === attempt.tenantId &&
+              current.correlationId === attempt.correlationId,
+          )
+        ) {
+          throw new RepositoryError(
+            'UNIQUE_VIOLATION',
+            'Generation attempt correlation identifier already exists.',
+          );
+        }
+        this.state.attempts.set(attempt.id, { ...attempt });
+      },
+      findById: async (tenantId, attemptId) => {
+        const attempt = this.state.attempts.get(attemptId);
+        return attempt && attempt.tenantId === tenantId ? { ...attempt } : null;
+      },
+      findByPromptId: async (tenantId, promptId) => {
+        const attempt = [...this.state.attempts.values()].find(
+          (current) =>
+            current.tenantId === tenantId && current.comfyPromptId === promptId,
+        );
+        return attempt ? { ...attempt } : null;
+      },
+      findByCorrelationId: async (tenantId, correlationId) => {
+        const attempt = [...this.state.attempts.values()].find(
+          (current) =>
+            current.tenantId === tenantId &&
+            current.correlationId === correlationId,
+        );
+        return attempt ? { ...attempt } : null;
+      },
+      listByShot: async (tenantId, shotId) =>
+        [...this.state.attempts.values()]
+          .filter(
+            (attempt) =>
+              attempt.tenantId === tenantId && attempt.shotId === shotId,
+          )
+          .sort(
+            (left, right) =>
+              left.createdAt.localeCompare(right.createdAt) ||
+              left.id.localeCompare(right.id),
+          )
+          .map((attempt) => ({ ...attempt })),
+      listByProject: async (tenantId, projectId) =>
+        [...this.state.attempts.values()]
+          .filter(
+            (attempt) =>
+              attempt.tenantId === tenantId && attempt.projectId === projectId,
+          )
+          .sort(
+            (left, right) =>
+              left.createdAt.localeCompare(right.createdAt) ||
+              left.id.localeCompare(right.id),
+          )
+          .map((attempt) => ({ ...attempt })),
+      update: async (attempt, expectedVersion) => {
+        const current = this.state.attempts.get(attempt.id);
+        if (!current || current.version !== expectedVersion) {
+          throw new RepositoryError(
+            'OPTIMISTIC_CONFLICT',
+            'The generation attempt was modified by another transaction.',
+          );
+        }
+        this.state.attempts.set(attempt.id, { ...attempt });
+        return { ...attempt };
+      },
+      claimNext: async (workerId, now, leaseExpiresAt) => {
+        const activeStatuses = new Set([
+          'claimed',
+          'submitting',
+          'submitted',
+          'running',
+          'generated',
+          'evaluating',
+        ]);
+        const hasActiveClaim = [...this.state.attempts.values()].some(
+          (attempt) =>
+            attempt.leaseOwner === workerId &&
+            attempt.leaseExpiresAt !== undefined &&
+            attempt.leaseExpiresAt >= now &&
+            activeStatuses.has(attempt.status),
+        );
+        if (hasActiveClaim) {
+          return null;
+        }
+        const candidate = [...this.state.attempts.values()]
+          .filter(
+            (attempt) =>
+              attempt.status === 'queued' &&
+              (attempt.leaseExpiresAt === undefined ||
+                attempt.leaseExpiresAt < now),
+          )
+          .sort(
+            (left, right) =>
+              left.queuedAt.localeCompare(right.queuedAt) ||
+              left.id.localeCompare(right.id),
+          )[0];
+        if (!candidate) {
+          return null;
+        }
+        const claimed: GenerationAttempt = {
+          ...candidate,
+          status: 'claimed',
+          leaseOwner: workerId,
+          leaseExpiresAt: leaseExpiresAt as NonNullable<
+            GenerationAttempt['leaseExpiresAt']
+          >,
+          version: candidate.version + 1,
+          updatedAt: now as GenerationAttempt['updatedAt'],
+        };
+        this.state.attempts.set(candidate.id, claimed);
+        return { ...claimed };
+      },
+      heartbeat: async (attemptId, workerId, leaseExpiresAt) => {
+        const current = this.state.attempts.get(attemptId);
+        if (
+          !current ||
+          current.leaseOwner !== workerId ||
+          ![
+            'claimed',
+            'submitting',
+            'submitted',
+            'running',
+            'generated',
+            'evaluating',
+          ].includes(current.status)
+        ) {
+          return null;
+        }
+        const updated: GenerationAttempt = {
+          ...current,
+          leaseExpiresAt: leaseExpiresAt as NonNullable<
+            GenerationAttempt['leaseExpiresAt']
+          >,
+          version: current.version + 1,
+          updatedAt: leaseExpiresAt as GenerationAttempt['updatedAt'],
+        };
+        this.state.attempts.set(attemptId, updated);
+        return { ...updated };
+      },
+      release: async (attemptId, workerId, updatedAt) => {
+        const current = this.state.attempts.get(attemptId);
+        if (
+          !current ||
+          current.leaseOwner !== workerId ||
+          ![
+            'claimed',
+            'submitting',
+            'submitted',
+            'running',
+            'generated',
+            'evaluating',
+          ].includes(current.status)
+        ) {
+          return null;
+        }
+        const {
+          leaseOwner: _leaseOwner,
+          leaseExpiresAt: _leaseExpiresAt,
+          ...withoutLease
+        } = current;
+        const released: GenerationAttempt = {
+          ...withoutLease,
+          status: 'queued',
+          version: current.version + 1,
+          updatedAt: updatedAt as GenerationAttempt['updatedAt'],
+        };
+        this.state.attempts.set(attemptId, released);
+        return { ...released };
+      },
+      recoverStale: async (now) => {
+        const activeStatuses = new Set([
+          'claimed',
+          'submitting',
+          'submitted',
+          'running',
+          'generated',
+          'evaluating',
+        ]);
+        const recovered: GenerationAttempt[] = [];
+        for (const current of this.state.attempts.values()) {
+          if (
+            !current.leaseExpiresAt ||
+            current.leaseExpiresAt >= now ||
+            !activeStatuses.has(current.status)
+          ) {
+            continue;
+          }
+          const {
+            leaseOwner: _leaseOwner,
+            leaseExpiresAt: _leaseExpiresAt,
+            ...withoutLease
+          } = current;
+          const updated: GenerationAttempt = {
+            ...withoutLease,
+            status: 'queued',
+            version: current.version + 1,
+            updatedAt: now as GenerationAttempt['updatedAt'],
+          };
+          this.state.attempts.set(current.id, updated);
+          recovered.push({ ...updated });
+        }
+        return recovered;
+      },
+    };
+    this.artifacts = {
+      create: async (artifact) => {
+        if (
+          this.state.artifacts.has(artifact.id) ||
+          [...this.state.artifacts.values()].some(
+            (current) =>
+              current.objectKey === artifact.objectKey ||
+              current.attemptId === artifact.attemptId,
+          )
+        ) {
+          throw new RepositoryError(
+            'UNIQUE_VIOLATION',
+            'Artifact already exists for this attempt.',
+          );
+        }
+        this.state.artifacts.set(artifact.id, { ...artifact });
+      },
+      findById: async (tenantId, artifactId) => {
+        const artifact = this.state.artifacts.get(artifactId);
+        return artifact && artifact.tenantId === tenantId
+          ? { ...artifact }
+          : null;
+      },
+      findByAttempt: async (tenantId, attemptId) => {
+        const artifact = [...this.state.artifacts.values()].find(
+          (current) =>
+            current.tenantId === tenantId && current.attemptId === attemptId,
+        );
+        return artifact ? { ...artifact } : null;
+      },
+    };
+    this.evaluations = {
+      create: async (result) => {
+        if (
+          this.state.evaluations.has(result.id) ||
+          [...this.state.evaluations.values()].some(
+            (current) => current.attemptId === result.attemptId,
+          )
+        ) {
+          throw new RepositoryError(
+            'UNIQUE_VIOLATION',
+            'An evaluation already exists for this attempt.',
+          );
+        }
+        this.state.evaluations.set(result.id, {
+          ...result,
+          checks: { ...result.checks },
+          details: { ...result.details },
+        });
+      },
+      findByAttempt: async (tenantId, attemptId) => {
+        const result = [...this.state.evaluations.values()].find(
+          (current) =>
+            current.tenantId === tenantId && current.attemptId === attemptId,
+        );
+        return result
+          ? {
+              ...result,
+              checks: { ...result.checks },
+              details: { ...result.details },
+            }
+          : null;
+      },
+    };
+    this.workflowVersions = {
+      findByHash: async (workflowHash) => {
+        const version = [...this.state.workflowVersions.values()].find(
+          (current) => current.workflowHash === workflowHash,
+        );
+        return version
+          ? { ...version, workflowJson: { ...version.workflowJson } }
+          : null;
+      },
+      create: async (version) => {
+        if (
+          this.state.workflowVersions.has(version.id) ||
+          [...this.state.workflowVersions.values()].some(
+            (current) => current.workflowHash === version.workflowHash,
+          )
+        ) {
+          throw new RepositoryError(
+            'UNIQUE_VIOLATION',
+            'Workflow version already exists for this hash.',
+          );
+        }
+        this.state.workflowVersions.set(version.id, {
+          ...version,
+          workflowJson: { ...version.workflowJson },
+        });
       },
     };
     this.events = {
@@ -1245,6 +2358,15 @@ class MemoryRepositories implements Repositories {
       listByProject: async (projectId) =>
         [...this.state.events.values()]
           .filter((event) => event.projectId === projectId)
+          .map((event) => ({ ...event, payload: { ...event.payload } })),
+      listOrphans: async (tenantId) =>
+        [...this.state.events.values()]
+          .filter(
+            (event) =>
+              event.tenantId === tenantId &&
+              event.projectId === undefined &&
+              event.type === 'orphan.event',
+          )
           .map((event) => ({ ...event, payload: { ...event.payload } })),
     };
     this.outbox = {

@@ -1,0 +1,15 @@
+{
+  "1": {
+    "class_type": "CLIPTextEncode",
+    "inputs": { "text": "fixture prompt" }
+  },
+  "2": {
+    "class_type": "EmptyHunyuanLatentVideo",
+    "inputs": { "width": 960, "height": 544, "length": 120 }
+  },
+  "3": { "class_type": "KSampler", "inputs": { "seed": 1, "steps": 8 } },
+  "4": {
+    "class_type": "SaveVideo",
+    "inputs": { "filename_prefix": "h3-t2v-fixture" }
+  }
+}

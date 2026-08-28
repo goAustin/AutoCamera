@@ -22,7 +22,8 @@
     "infra:up": "docker compose -f infra/compose.yaml up -d postgres",
     "infra:down": "docker compose -f infra/compose.yaml down",
     "infra:logs": "docker compose -f infra/compose.yaml logs -f postgres",
-    "db:migrate": "pnpm --filter @h3/db migrate"
+    "db:migrate": "pnpm --filter @h3/db migrate",
+    "media:fixture": "node --experimental-strip-types scripts/generate-fixture.ts"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.11",

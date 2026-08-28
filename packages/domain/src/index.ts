@@ -76,11 +76,19 @@ export const DOMAIN_EVENT_TYPES = [
   'attempt.claimed',
   'attempt.submitted',
   'attempt.execution_started',
+  'attempt.execution_progress',
+  'attempt.generated',
+  'attempt.evaluating',
+  'attempt.failed',
+  'attempt.timed_out',
+  'attempt.cancelled',
+  'attempt.regenerated',
   'artifact.stored',
   'evaluation.completed',
   'attempt.accepted',
   'attempt.rejected',
   'project.budget_denied',
+  'orphan.event',
   'project.completed',
 ] as const;
 export type DomainEventType = (typeof DOMAIN_EVENT_TYPES)[number];
@@ -89,13 +97,16 @@ export type DomainErrorCode =
   | 'UNKNOWN_PROJECT_STATUS'
   | 'UNKNOWN_STORYBOARD_STATUS'
   | 'UNKNOWN_SHOT_STATUS'
+  | 'UNKNOWN_ATTEMPT_STATUS'
   | 'UNKNOWN_EVENT_TYPE'
   | 'INVALID_PROJECT'
   | 'INVALID_STORYBOARD'
   | 'INVALID_SHOT'
+  | 'INVALID_ATTEMPT'
   | 'INVALID_PROJECT_TRANSITION'
   | 'INVALID_STORYBOARD_TRANSITION'
   | 'INVALID_SHOT_TRANSITION'
+  | 'INVALID_ATTEMPT_TRANSITION'
   | 'TARGET_DURATION_TOO_SHORT'
   | 'INVALID_MONEY'
   | 'NEGATIVE_MONEY'
@@ -177,6 +188,97 @@ export interface Shot {
   readonly updatedAt: IsoUtcTimestamp;
 }
 
+export const ATTEMPT_FAILURE_CODES = [
+  'COMFY_UNAVAILABLE',
+  'COMFY_SUBMISSION_UNCERTAIN',
+  'COMFY_EXECUTION_FAILED',
+  'COMFY_INTERRUPTED',
+  'GENERATION_TIMEOUT',
+  'ARTIFACT_DOWNLOAD_FAILED',
+  'ARTIFACT_STORAGE_FAILED',
+  'MEDIA_NOT_FOUND',
+  'MEDIA_INVALID_CONTAINER',
+  'MEDIA_MISSING_VIDEO',
+  'MEDIA_INVALID_DIMENSIONS',
+  'MEDIA_INVALID_DURATION',
+  'MEDIA_INVALID_FRAME_RATE',
+  'MEDIA_DECODE_FAILED',
+  'MEDIA_BLACK_OR_STATIC',
+  'MEDIA_CHECKSUM_MISMATCH',
+  'MEDIA_SIZE_MISMATCH',
+  'REVIEW_REJECTED',
+  'BUDGET_EXCEEDED',
+  'ATTEMPT_LIMIT_REACHED',
+] as const;
+export type AttemptFailureCode = (typeof ATTEMPT_FAILURE_CODES)[number];
+
+export interface GenerationAttempt {
+  readonly id: Uuid;
+  readonly tenantId: Uuid;
+  readonly projectId: Uuid;
+  readonly shotId: Uuid;
+  readonly idempotencyKey: string;
+  readonly status: GenerationAttemptStatus;
+  readonly seed: number;
+  readonly steps: number;
+  readonly requestedWidth: number;
+  readonly requestedHeight: number;
+  readonly requestedDurationSeconds: number;
+  readonly workflowVersionId?: Uuid;
+  readonly workflowHash: string;
+  readonly correlationId: string;
+  readonly traceId?: string;
+  readonly scenario?: string;
+  readonly comfyPromptId?: string;
+  readonly leaseOwner?: string;
+  readonly leaseExpiresAt?: IsoUtcTimestamp;
+  readonly queuedAt: IsoUtcTimestamp;
+  readonly submittedAt?: IsoUtcTimestamp;
+  readonly finishedAt?: IsoUtcTimestamp;
+  readonly computeSeconds?: number;
+  readonly estimatedCostMicrousd: MicroUsd;
+  readonly failureCode?: AttemptFailureCode;
+  readonly failureMessage?: string;
+  readonly sourceAttemptId?: Uuid;
+  readonly artifactId?: Uuid;
+  readonly version: number;
+  readonly createdAt: IsoUtcTimestamp;
+  readonly updatedAt: IsoUtcTimestamp;
+}
+
+export interface ArtifactRecord {
+  readonly id: Uuid;
+  readonly tenantId: Uuid;
+  readonly projectId: Uuid;
+  readonly shotId: Uuid;
+  readonly attemptId: Uuid;
+  readonly objectKey: string;
+  readonly mimeType: string;
+  readonly byteSize: number;
+  readonly sha256: string;
+  readonly createdAt: IsoUtcTimestamp;
+}
+
+export type EvaluationCheckStatus = 'passed' | 'failed' | 'not_applicable';
+
+export interface EvaluationCheck {
+  readonly status: EvaluationCheckStatus;
+  readonly detail: string;
+}
+
+export interface EvaluationResult {
+  readonly id: Uuid;
+  readonly tenantId: Uuid;
+  readonly projectId: Uuid;
+  readonly shotId: Uuid;
+  readonly attemptId: Uuid;
+  readonly evaluatorVersion: string;
+  readonly status: 'passed' | 'failed';
+  readonly checks: Readonly<Record<string, EvaluationCheck>>;
+  readonly details: Readonly<Record<string, unknown>>;
+  readonly evaluatedAt: IsoUtcTimestamp;
+}
+
 export interface DomainEvent {
   readonly id: Uuid;
   readonly type: DomainEventType;
@@ -245,9 +347,28 @@ export const SHOT_STATUS_TRANSITIONS: Readonly<
   cancelled: [],
 };
 
+export const ATTEMPT_STATUS_TRANSITIONS: Readonly<
+  Record<GenerationAttemptStatus, readonly GenerationAttemptStatus[]>
+> = {
+  queued: ['claimed', 'running', 'cancelled', 'failed'],
+  claimed: ['submitting', 'queued', 'cancelled', 'failed'],
+  submitting: ['submitted', 'queued', 'failed', 'timed_out'],
+  submitted: ['running', 'failed', 'timed_out', 'cancelled'],
+  running: ['generated', 'evaluating', 'failed', 'timed_out', 'cancelled'],
+  generated: ['evaluating', 'failed'],
+  evaluating: ['awaiting_review', 'failed'],
+  awaiting_review: ['accepted', 'rejected'],
+  accepted: [],
+  rejected: [],
+  failed: [],
+  timed_out: [],
+  cancelled: [],
+};
+
 const projectStatusSet = new Set<string>(PROJECT_STATUSES);
 const storyboardStatusSet = new Set<string>(STORYBOARD_STATUSES);
 const shotStatusSet = new Set<string>(SHOT_STATUSES);
+const attemptStatusSet = new Set<string>(GENERATION_ATTEMPT_STATUSES);
 const eventTypeSet = new Set<string>(DOMAIN_EVENT_TYPES);
 
 function isFiniteNumber(value: number): boolean {
@@ -270,6 +391,12 @@ export function isStoryboardStatus(value: unknown): value is StoryboardStatus {
 
 export function isShotStatus(value: unknown): value is ShotStatus {
   return typeof value === 'string' && shotStatusSet.has(value);
+}
+
+export function isGenerationAttemptStatus(
+  value: unknown,
+): value is GenerationAttemptStatus {
+  return typeof value === 'string' && attemptStatusSet.has(value);
 }
 
 export function isDomainEventType(value: unknown): value is DomainEventType {
@@ -301,6 +428,18 @@ export function parseShotStatus(value: unknown): ShotStatus {
     throw new DomainError(
       'UNKNOWN_SHOT_STATUS',
       'The shot status is not recognized.',
+    );
+  }
+  return value;
+}
+
+export function parseGenerationAttemptStatus(
+  value: unknown,
+): GenerationAttemptStatus {
+  if (!isGenerationAttemptStatus(value)) {
+    throw new DomainError(
+      'UNKNOWN_ATTEMPT_STATUS',
+      'The generation attempt status is not recognized.',
     );
   }
   return value;
@@ -592,6 +731,129 @@ function assertShot(shot: Shot): void {
   }
 }
 
+function assertAttempt(attempt: GenerationAttempt): void {
+  parseGenerationAttemptStatus(attempt.status);
+  assertUuid(attempt.id);
+  assertUuid(attempt.tenantId);
+  assertUuid(attempt.projectId);
+  assertUuid(attempt.shotId);
+  if (!attempt.idempotencyKey.trim() || attempt.idempotencyKey.length > 200) {
+    throw new DomainError(
+      'INVALID_ATTEMPT',
+      'Generation attempts require a bounded idempotency key.',
+    );
+  }
+  if (!Number.isSafeInteger(attempt.seed)) {
+    throw new DomainError(
+      'INVALID_ATTEMPT',
+      'Attempt seed must be a safe integer.',
+    );
+  }
+  if (!Number.isSafeInteger(attempt.steps) || attempt.steps <= 0) {
+    throw new DomainError(
+      'INVALID_ATTEMPT',
+      'Attempt steps must be a positive safe integer.',
+    );
+  }
+  if (
+    !Number.isSafeInteger(attempt.requestedWidth) ||
+    attempt.requestedWidth <= 0 ||
+    !Number.isSafeInteger(attempt.requestedHeight) ||
+    attempt.requestedHeight <= 0
+  ) {
+    throw new DomainError(
+      'INVALID_ATTEMPT',
+      'Attempt dimensions must be positive safe integers.',
+    );
+  }
+  if (
+    !isFiniteNumber(attempt.requestedDurationSeconds) ||
+    attempt.requestedDurationSeconds <= 0
+  ) {
+    throw new DomainError(
+      'INVALID_ATTEMPT',
+      'Attempt duration must be positive.',
+    );
+  }
+  if (!attempt.workflowHash.trim() || !attempt.correlationId.trim()) {
+    throw new DomainError(
+      'INVALID_ATTEMPT',
+      'Attempts require workflow and correlation identifiers.',
+    );
+  }
+  if (attempt.scenario !== undefined && attempt.scenario.length > 64) {
+    throw new DomainError(
+      'INVALID_ATTEMPT',
+      'Attempt scenarios must be short.',
+    );
+  }
+  assertMicrousd(attempt.estimatedCostMicrousd);
+  if (
+    attempt.computeSeconds !== undefined &&
+    (!isFiniteNumber(attempt.computeSeconds) || attempt.computeSeconds < 0)
+  ) {
+    throw new DomainError(
+      'INVALID_ATTEMPT',
+      'Attempt compute time must be non-negative.',
+    );
+  }
+  if (
+    attempt.failureCode !== undefined &&
+    !ATTEMPT_FAILURE_CODES.includes(attempt.failureCode)
+  ) {
+    throw new DomainError(
+      'INVALID_ATTEMPT',
+      'Attempt failure code is unknown.',
+    );
+  }
+  if (
+    attempt.failureMessage !== undefined &&
+    attempt.failureMessage.length > 500
+  ) {
+    throw new DomainError(
+      'INVALID_ATTEMPT',
+      'Attempt failure messages must be short and redacted.',
+    );
+  }
+  assertUuidIfPresent(attempt.workflowVersionId);
+  assertUuidIfPresent(attempt.sourceAttemptId);
+  assertUuidIfPresent(attempt.artifactId);
+  assertIsoIfPresent(attempt.leaseExpiresAt);
+  assertIsoIfPresent(attempt.submittedAt);
+  assertIsoIfPresent(attempt.finishedAt);
+  if (attempt.comfyPromptId !== undefined && !attempt.comfyPromptId.trim()) {
+    throw new DomainError(
+      'INVALID_ATTEMPT',
+      'Comfy prompt identifiers are non-blank.',
+    );
+  }
+  if (attempt.leaseOwner !== undefined && !attempt.leaseOwner.trim()) {
+    throw new DomainError('INVALID_ATTEMPT', 'Lease owners are non-blank.');
+  }
+  assertSafeInteger(attempt.version, 'INVALID_ATTEMPT');
+  if (attempt.version < 1) {
+    throw new DomainError(
+      'INVALID_ATTEMPT',
+      'Attempt version must be positive.',
+    );
+  }
+  assertUtcTimestamp(attempt.queuedAt);
+  assertUtcTimestamp(attempt.createdAt);
+  assertUtcTimestamp(attempt.updatedAt);
+}
+
+function assertUuidIfPresent(value: Uuid | undefined): void {
+  if (value !== undefined) {
+    assertUuid(value);
+  }
+}
+
+function assertIsoIfPresent(value: IsoUtcTimestamp | undefined): void {
+  if (value !== undefined) {
+    assertUtcTimestamp(value);
+  }
+}
+
 function transition<
   T extends { readonly status: string; readonly version: number },
 >(
@@ -676,6 +938,23 @@ export function transitionShot(shot: Shot, nextStatus: unknown): Shot {
   return next;
 }
 
+export function transitionGenerationAttempt(
+  attempt: GenerationAttempt,
+  nextStatus: unknown,
+): GenerationAttempt {
+  assertAttempt(attempt);
+  const currentStatus = parseGenerationAttemptStatus(attempt.status);
+  const parsedNextStatus = parseGenerationAttemptStatus(nextStatus);
+  return transition(
+    attempt,
+    parsedNextStatus,
+    currentStatus,
+    ATTEMPT_STATUS_TRANSITIONS,
+    'INVALID_ATTEMPT_TRANSITION',
+    'UNKNOWN_ATTEMPT_STATUS',
+  );
+}
+
 export type TransitionResult<Value> =
   | { readonly ok: true; readonly value: Value }
   | { readonly ok: false; readonly error: DomainError };
@@ -720,6 +999,35 @@ export function tryTransitionShot(
     }
     throw error;
   }
+}
+
+export function tryTransitionGenerationAttempt(
+  attempt: GenerationAttempt,
+  nextStatus: unknown,
+): TransitionResult<GenerationAttempt> {
+  try {
+    return {
+      ok: true,
+      value: transitionGenerationAttempt(attempt, nextStatus),
+    };
+  } catch (error) {
+    if (error instanceof DomainError) {
+      return { ok: false, error };
+    }
+    throw error;
+  }
+}
+
+export function isTerminalGenerationAttempt(
+  status: GenerationAttemptStatus,
+): boolean {
+  return (
+    status === 'accepted' ||
+    status === 'rejected' ||
+    status === 'failed' ||
+    status === 'timed_out' ||
+    status === 'cancelled'
+  );
 }
 
 export interface CreateProjectInput {
@@ -824,6 +1132,66 @@ export function createShot(input: CreateShotInput): Shot {
   };
   assertShot(shot);
   return shot;
+}
+
+export interface CreateGenerationAttemptInput {
+  readonly id: Uuid;
+  readonly tenantId: Uuid;
+  readonly projectId: Uuid;
+  readonly shotId: Uuid;
+  readonly idempotencyKey: string;
+  readonly seed: number;
+  readonly steps: number;
+  readonly requestedWidth: number;
+  readonly requestedHeight: number;
+  readonly requestedDurationSeconds: number;
+  readonly workflowVersionId?: Uuid;
+  readonly workflowHash: string;
+  readonly correlationId: string;
+  readonly traceId?: string;
+  readonly scenario?: string;
+  readonly estimatedCostMicrousd: MicroUsd;
+  readonly sourceAttemptId?: Uuid;
+  readonly now: IsoUtcTimestamp;
+}
+
+export function createGenerationAttempt(
+  input: CreateGenerationAttemptInput,
+): GenerationAttempt {
+  const attempt: GenerationAttempt = {
+    id: input.id,
+    tenantId: input.tenantId,
+    projectId: input.projectId,
+    shotId: input.shotId,
+    idempotencyKey: input.idempotencyKey,
+    status: 'queued',
+    seed: input.seed,
+    steps: input.steps,
+    requestedWidth: input.requestedWidth,
+    requestedHeight: input.requestedHeight,
+    requestedDurationSeconds: input.requestedDurationSeconds,
+    workflowHash: input.workflowHash,
+    correlationId: input.correlationId,
+    estimatedCostMicrousd: assertMicrousd(input.estimatedCostMicrousd),
+    version: 1,
+    queuedAt: input.now,
+    createdAt: input.now,
+    updatedAt: input.now,
+    ...(input.workflowVersionId
+      ? { workflowVersionId: input.workflowVersionId }
+      : {}),
+    ...(input.traceId ? { traceId: input.traceId } : {}),
+    ...(input.scenario ? { scenario: input.scenario } : {}),
+    ...(input.sourceAttemptId
+      ? { sourceAttemptId: input.sourceAttemptId }
+      : {}),
+  };
+  assertAttempt(attempt);
+  return attempt;
+}
+
+export function assertGenerationAttempt(attempt: GenerationAttempt): void {
+  assertAttempt(attempt);
 }
 
 export interface CreateDomainEventInput {

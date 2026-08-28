@@ -119,7 +119,7 @@ CREATE TABLE IF NOT EXISTS generation_attempts (
   tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
   project_id UUID NOT NULL REFERENCES video_projects(id) ON DELETE RESTRICT,
   shot_id UUID NOT NULL REFERENCES shots(id) ON DELETE RESTRICT,
-  idempotency_key TEXT NOT NULL UNIQUE,
+  idempotency_key TEXT NOT NULL,
   status TEXT NOT NULL,
   seed BIGINT NOT NULL,
   steps INTEGER NOT NULL,

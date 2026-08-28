@@ -66,6 +66,7 @@ loadLocalEnvironment();
 
 try {
   await run('pnpm', ['prerequisites']);
+  await run('pnpm', ['media:fixture']);
   await run('pnpm', ['infra:up']);
   await run('pnpm', ['db:migrate']);
   await run('pnpm', ['build']);
