@@ -41,12 +41,18 @@ importers:
       '@h3/db':
         specifier: workspace:0.1.0
         version: link:../../packages/db
+      '@h3/domain':
+        specifier: workspace:0.1.0
+        version: link:../../packages/domain
       '@h3/telemetry':
         specifier: workspace:0.1.0
         version: link:../../packages/telemetry
       fastify:
         specifier: 5.12.1
         version: 5.12.1
+      zod:
+        specifier: 4.4.3
+        version: 4.4.3
 
   apps/fake-comfy:
     dependencies:
@@ -103,6 +109,9 @@ importers:
 
   packages/db:
     dependencies:
+      '@h3/domain':
+        specifier: workspace:0.1.0
+        version: link:../domain
       drizzle-orm:
         specifier: 0.45.2
         version: 0.45.2(@types/pg@8.23.1)(pg@8.23.0)

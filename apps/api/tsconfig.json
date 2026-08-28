@@ -9,13 +9,15 @@
     "paths": {
       "@h3/config": ["../../packages/config/src/index.ts"],
       "@h3/db": ["../../packages/db/src/index.ts"],
-      "@h3/telemetry": ["../../packages/telemetry/src/index.ts"]
+      "@h3/telemetry": ["../../packages/telemetry/src/index.ts"],
+      "@h3/domain": ["../../packages/domain/src/index.ts"]
     }
   },
   "references": [
     { "path": "../../packages/config/tsconfig.json" },
     { "path": "../../packages/db/tsconfig.json" },
+    { "path": "../../packages/domain/tsconfig.json" },
     { "path": "../../packages/telemetry/tsconfig.json" }
   ],
-  "include": ["src/app.ts", "src/main.ts"]
+  "include": ["src/app.ts", "src/application.ts", "src/main.ts"]
 }

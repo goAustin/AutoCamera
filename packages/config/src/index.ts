@@ -123,7 +123,9 @@ export function getApiConfig(raw: NodeJS.ProcessEnv = process.env): ApiConfig {
     apiPort: environment.API_PORT,
     webOrigin: environment.WEB_ORIGIN,
     databaseUrl: environment.DATABASE_URL,
-    devAuthToken: environment.DEV_AUTH_TOKEN ?? '',
+    devAuthToken:
+      environment.DEV_AUTH_TOKEN ??
+      (environment.NODE_ENV === 'test' ? 'test-token' : ''),
     artifactRoot: environment.ARTIFACT_ROOT,
     comfyBaseUrl: environment.COMFY_BASE_URL,
     comfyWsUrl: environment.COMFY_WS_URL,
