@@ -1,0 +1,1 @@
+-- Phase 1 migration marker. Domain tables begin in Phase 2.

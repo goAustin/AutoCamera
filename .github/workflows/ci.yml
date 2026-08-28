@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17.5-alpine
+        env:
+          POSTGRES_DB: h3_videoops
+          POSTGRES_USER: h3_videoops
+          POSTGRES_PASSWORD: h3_videoops
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U h3_videoops -d h3_videoops"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.x
+      - name: Enable pinned pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@9.15.0 --activate
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ffmpeg
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Verify ffmpeg
+        run: ffmpeg -version && ffprobe -version
+      - name: Check repository
+        env:
+          NODE_ENV: test
+          DATABASE_URL: postgres://h3_videoops:h3_videoops@127.0.0.1:5432/h3_videoops
+          DEV_AUTH_TOKEN: ci-local-token
+        run: pnpm check
+      - name: Run PostgreSQL readiness integration test
+        env:
+          NODE_ENV: test
+          DATABASE_URL: postgres://h3_videoops:h3_videoops@127.0.0.1:5432/h3_videoops
+          DEV_AUTH_TOKEN: ci-local-token
+        run: pnpm test:integration

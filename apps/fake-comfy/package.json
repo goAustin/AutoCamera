@@ -1,0 +1,22 @@
+{
+  "name": "@h3/fake-comfy",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/app.d.ts",
+      "import": "./dist/app.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx watch src/main.ts",
+    "start": "node dist/main.js"
+  },
+  "dependencies": {
+    "@h3/comfy-client": "workspace:0.1.0",
+    "@h3/config": "workspace:0.1.0",
+    "fastify": "5.12.1"
+  }
+}

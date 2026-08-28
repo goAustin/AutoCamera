@@ -1,0 +1,129 @@
+:root {
+  color: #e5edf7;
+  background: #07111f;
+  font-family:
+    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+    "Segoe UI", sans-serif;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  background:
+    radial-gradient(circle at 15% 10%, rgb(40 117 169 / 25%), transparent 35%),
+    radial-gradient(circle at 85% 75%, rgb(116 69 190 / 18%), transparent 35%),
+    #07111f;
+}
+
+button,
+a {
+  font: inherit;
+}
+
+.shell {
+  display: grid;
+  min-height: 100vh;
+  place-items: center;
+  padding: 2rem;
+}
+
+.hero {
+  width: min(100%, 720px);
+  padding: clamp(2rem, 6vw, 5rem);
+  border: 1px solid rgb(151 184 218 / 20%);
+  border-radius: 28px;
+  background: rgb(13 29 49 / 86%);
+  box-shadow: 0 24px 80px rgb(0 0 0 / 30%);
+}
+
+.eyebrow {
+  margin: 0 0 1rem;
+  color: #68d5c6;
+  font-size: 0.75rem;
+  font-weight: 800;
+  letter-spacing: 0.18em;
+}
+
+h1 {
+  margin: 0;
+  font-size: clamp(3rem, 10vw, 6.5rem);
+  letter-spacing: -0.07em;
+  line-height: 0.95;
+}
+
+.lede {
+  max-width: 50ch;
+  margin: 1.5rem 0 2.5rem;
+  color: #a8bad0;
+  font-size: 1.08rem;
+  line-height: 1.6;
+}
+
+.status-card {
+  display: flex;
+  align-items: center;
+  gap: 0.9rem;
+  padding: 1rem 1.1rem;
+  border: 1px solid rgb(151 184 218 / 18%);
+  border-radius: 16px;
+  background: rgb(4 13 25 / 65%);
+}
+
+.status-dot {
+  width: 0.75rem;
+  height: 0.75rem;
+  flex: 0 0 auto;
+  border-radius: 999px;
+  background: #f5b962;
+  box-shadow: 0 0 0 5px rgb(245 185 98 / 12%);
+}
+
+.status-dot--ready {
+  background: #68d5c6;
+  box-shadow: 0 0 0 5px rgb(104 213 198 / 12%);
+}
+
+.status-card > div {
+  display: grid;
+  gap: 0.2rem;
+}
+
+.status-label {
+  color: #8298b2;
+  font-size: 0.76rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.dependency {
+  margin-left: auto;
+  color: #9ab0c8;
+  font-size: 0.85rem;
+}
+
+@media (max-width: 560px) {
+  .shell {
+    padding: 1rem;
+  }
+
+  .hero {
+    padding: 2rem 1.4rem;
+  }
+
+  .status-card {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .dependency {
+    width: 100%;
+    margin-left: 1.65rem;
+  }
+}

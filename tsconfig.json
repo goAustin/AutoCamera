@@ -1,0 +1,17 @@
+{
+  "files": [],
+  "references": [
+    { "path": "./packages/domain/tsconfig.json" },
+    { "path": "./packages/db/tsconfig.json" },
+    { "path": "./packages/comfy-client/tsconfig.json" },
+    { "path": "./packages/workflow-compiler/tsconfig.json" },
+    { "path": "./packages/agent-tools/tsconfig.json" },
+    { "path": "./packages/evaluator/tsconfig.json" },
+    { "path": "./packages/object-store/tsconfig.json" },
+    { "path": "./packages/telemetry/tsconfig.json" },
+    { "path": "./packages/config/tsconfig.json" },
+    { "path": "./packages/test-support/tsconfig.json" },
+    { "path": "./apps/api/tsconfig.json" },
+    { "path": "./apps/fake-comfy/tsconfig.json" }
+  ]
+}
