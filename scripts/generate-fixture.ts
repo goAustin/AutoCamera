@@ -48,6 +48,8 @@ async function main(): Promise<void> {
       '-shortest',
       '-movflags',
       '+faststart',
+      '-f',
+      'mp4',
       temporaryPath,
     ]);
     await rename(temporaryPath, outputPath);
