@@ -22,6 +22,8 @@ import {
   type StoryboardShotDefinition,
   type Uuid,
   type VideoProject,
+  isUuidV7,
+  STORYBOARD_DURATION_TOLERANCE_SECONDS,
 } from '@h3/domain';
 import {
   type Repositories,
@@ -31,17 +33,72 @@ import {
 
 export const DEV_TENANT_ID = assertUuid('00000000-0000-7000-8000-000000000001');
 
-export interface StoryboardPlan {
-  readonly shots: readonly StoryboardShotDefinition[];
-  readonly durationToleranceSeconds: number;
+export interface PlanProjectInput {
+  readonly projectId: Uuid;
+  readonly tenantId: Uuid;
+  readonly project: VideoProject;
+}
+
+export interface PlanningShot {
+  readonly ordinal: 1 | 2 | 3;
+  readonly purpose: string;
+  readonly generationMode: 't2v';
+  readonly durationSeconds: number;
+  readonly visualDescription: string;
+  readonly cameraDirection: string;
+  readonly audioDirection: string;
+  readonly dialogue?: string;
+  readonly requiredAssetIds: readonly string[];
+  readonly acceptanceCriteria: readonly string[];
+}
+
+export interface PlannedStoryboard {
+  readonly projectId: Uuid;
+  readonly objective: string;
+  readonly assumptions: readonly string[];
+  readonly shots: readonly PlanningShot[];
+  readonly totalDurationSeconds: number;
+  readonly risks: readonly string[];
+}
+
+export interface AgentRunCorrelation {
+  readonly runId: string;
+  readonly sessionId: string;
+  readonly provider: string;
+  readonly model: string;
+  readonly inputTokens?: number;
+  readonly outputTokens?: number;
+  readonly totalTokens?: number;
+  readonly providerCostMicrousd?: number;
+}
+
+export interface PlanProjectResult {
+  readonly storyboard: PlannedStoryboard;
+  readonly agentRun?: AgentRunCorrelation;
 }
 
 export interface PlanningAgent {
-  plan(project: VideoProject): Promise<StoryboardPlan>;
+  planProject(
+    input: PlanProjectInput,
+    signal?: AbortSignal,
+  ): Promise<PlanProjectResult>;
 }
 
+/** A deterministic planner retained for direct application-service tests. */
 export class StaticStoryboardPlanner implements PlanningAgent {
-  async plan(project: VideoProject): Promise<StoryboardPlan> {
+  async planProject(
+    input: PlanProjectInput,
+    signal?: AbortSignal,
+  ): Promise<PlanProjectResult> {
+    if (signal?.aborted) {
+      throw new ApplicationError(
+        'PLANNING_ABORTED',
+        'Storyboard planning was aborted.',
+        499,
+        false,
+      );
+    }
+    const project = input.project;
     const durationMilliseconds = Math.round(
       project.targetDurationSeconds * 1000,
     );
@@ -64,33 +121,57 @@ export class StaticStoryboardPlanner implements PlanningAgent {
     const thirdDuration = durations[2] ?? 0;
     const brief = project.brief.replace(/\s+/g, ' ').trim();
     return {
-      durationToleranceSeconds: 0.05,
-      shots: [
-        {
-          ordinal: 1,
-          purpose: 'Establish the visual hook and setting.',
-          prompt: `A polished opening shot for ${project.title}: ${brief}.`,
-          durationSeconds: firstDuration,
-          mode: 't2v',
-          qualityTier: 'preview',
-        },
-        {
-          ordinal: 2,
-          purpose: 'Show the central product or story action.',
-          prompt: `A clear product-focused middle shot for ${project.title}: ${brief}.`,
-          durationSeconds: secondDuration,
-          mode: 't2v',
-          qualityTier: 'preview',
-        },
-        {
-          ordinal: 3,
-          purpose: 'Close with a memorable outcome and call to action.',
-          prompt: `A confident closing shot for ${project.title}: ${brief}.`,
-          durationSeconds: thirdDuration,
-          mode: 't2v',
-          qualityTier: 'preview',
-        },
-      ],
+      storyboard: {
+        projectId: input.projectId,
+        objective: 'Create a concise three-shot preview storyboard.',
+        assumptions: ['Preview generation is text-to-video only.'],
+        totalDurationSeconds: project.targetDurationSeconds,
+        risks: [],
+        shots: [
+          {
+            ordinal: 1,
+            purpose: 'Establish the visual hook and setting.',
+            visualDescription: `A polished opening shot for ${project.title}: ${brief}.`,
+            cameraDirection:
+              'Start with a steady wide shot and a gentle push-in.',
+            audioDirection: 'Use a clean, restrained opening sound bed.',
+            durationSeconds: firstDuration,
+            generationMode: 't2v',
+            requiredAssetIds: [],
+            acceptanceCriteria: [
+              'The setting and subject are immediately legible.',
+            ],
+          },
+          {
+            ordinal: 2,
+            purpose: 'Show the central product or story action.',
+            visualDescription: `A clear product-focused middle shot for ${project.title}: ${brief}.`,
+            cameraDirection: 'Track the subject with a smooth medium shot.',
+            audioDirection: 'Build the sound bed with a clear action accent.',
+            durationSeconds: secondDuration,
+            generationMode: 't2v',
+            requiredAssetIds: [],
+            acceptanceCriteria: [
+              'The central action reads without extra context.',
+            ],
+          },
+          {
+            ordinal: 3,
+            purpose: 'Close with a memorable outcome and call to action.',
+            visualDescription: `A confident closing shot for ${project.title}: ${brief}.`,
+            cameraDirection:
+              'End on a composed hero frame with a subtle pull-back.',
+            audioDirection:
+              'Resolve with a memorable but unobtrusive closing cue.',
+            durationSeconds: thirdDuration,
+            generationMode: 't2v',
+            requiredAssetIds: [],
+            acceptanceCriteria: [
+              'The outcome is clear and visually memorable.',
+            ],
+          },
+        ],
+      },
     };
   }
 }
@@ -99,6 +180,8 @@ export type ApplicationErrorCode =
   | 'PROJECT_NOT_FOUND'
   | 'STORYBOARD_NOT_FOUND'
   | 'PROJECT_DURATION_INVALID'
+  | 'PLANNING_ABORTED'
+  | 'INVALID_PLANNING_RESULT'
   | 'PROJECT_NOT_READY_FOR_PLANNING'
   | 'STORYBOARD_NOT_APPROVABLE'
   | 'STALE_STORYBOARD'
@@ -146,6 +229,7 @@ export interface CreateProjectCommand {
 export interface ProjectPlanResult {
   readonly project: VideoProject;
   readonly proposal: StoryboardProposal;
+  readonly agentRun?: AgentRunCorrelation;
 }
 
 export interface ApprovalResult {
@@ -221,31 +305,74 @@ export class ProjectApplicationService {
     return project;
   }
 
-  async planProject(projectId: Uuid): Promise<ProjectPlanResult> {
+  async planProject(
+    projectId: Uuid,
+    signal?: AbortSignal,
+  ): Promise<ProjectPlanResult> {
+    const project = await this.store.withTransaction((repositories) =>
+      this.requirePlanningProject(repositories, projectId),
+    );
+    const result = await this.planner.planProject(
+      { projectId, tenantId: this.tenantId, project },
+      signal,
+    );
     return this.store.withTransaction((repositories) =>
-      this.planProjectInTransaction(repositories, projectId),
+      this.persistPlanProjectInTransaction(repositories, projectId, result),
     );
   }
 
   async planProjectInTransaction(
     repositories: Repositories,
     projectId: Uuid,
+    signal?: AbortSignal,
   ): Promise<ProjectPlanResult> {
-    const project = await this.requireProject(repositories, projectId);
-    if (
-      project.status !== 'draft' &&
-      project.status !== 'planning' &&
-      project.status !== 'awaiting_storyboard_approval'
-    ) {
+    const project = await this.requirePlanningProject(repositories, projectId);
+    const result = await this.planner.planProject(
+      { projectId, tenantId: this.tenantId, project },
+      signal,
+    );
+    return this.persistPlanProjectInTransaction(
+      repositories,
+      projectId,
+      result,
+    );
+  }
+
+  async persistPlanProjectInTransaction(
+    repositories: Repositories,
+    projectId: Uuid,
+    result: PlanProjectResult,
+  ): Promise<ProjectPlanResult> {
+    const project = await this.requirePlanningProject(repositories, projectId);
+    if (result.storyboard.projectId !== projectId) {
       throw new ApplicationError(
-        'PROJECT_NOT_READY_FOR_PLANNING',
-        'The project is not available for storyboard planning.',
-        409,
+        'INVALID_PLANNING_RESULT',
+        'The planning agent returned a different project identifier.',
+        422,
         false,
       );
     }
-
-    const plan = await this.planner.plan(project);
+    const plan = result.storyboard;
+    const planOrdinals = plan.shots.map((shot) => shot.ordinal);
+    const planTotal = plan.shots.reduce(
+      (sum, shot) => sum + shot.durationSeconds,
+      0,
+    );
+    if (
+      plan.shots.length !== 3 ||
+      planOrdinals.join(',') !== '1,2,3' ||
+      Math.abs(planTotal - plan.totalDurationSeconds) >
+        STORYBOARD_DURATION_TOLERANCE_SECONDS ||
+      Math.abs(planTotal - project.targetDurationSeconds) >
+        STORYBOARD_DURATION_TOLERANCE_SECONDS
+    ) {
+      throw new ApplicationError(
+        'INVALID_PLANNING_RESULT',
+        'The planning agent returned an invalid storyboard proposal.',
+        422,
+        false,
+      );
+    }
     const now = toIsoUtc(this.clock.now());
     let workingProject = project;
     if (
@@ -282,12 +409,42 @@ export class ProjectApplicationService {
       });
     }
 
+    const shotDefinitions: readonly StoryboardShotDefinition[] = plan.shots.map(
+      (shot) => ({
+        ordinal: shot.ordinal,
+        purpose: shot.purpose,
+        prompt: [
+          shot.visualDescription,
+          `Camera: ${shot.cameraDirection}`,
+          `Audio: ${shot.audioDirection}`,
+          ...(shot.dialogue ? [`Dialogue: ${shot.dialogue}`] : []),
+          `Acceptance: ${shot.acceptanceCriteria.join('; ')}`,
+        ].join(' '),
+        durationSeconds: shot.durationSeconds,
+        mode: shot.generationMode,
+        qualityTier: 'preview',
+        visualDescription: shot.visualDescription,
+        cameraDirection: shot.cameraDirection,
+        audioDirection: shot.audioDirection,
+        ...(shot.dialogue ? { dialogue: shot.dialogue } : {}),
+        acceptanceCriteria: [...shot.acceptanceCriteria],
+        requiredAssetIds: [...shot.requiredAssetIds],
+      }),
+    );
+    const agentRunId =
+      result.agentRun && isUuidV7(result.agentRun.runId)
+        ? result.agentRun.runId
+        : undefined;
     const proposal = createStoryboardProposal({
       id: this.idGenerator.next(),
       projectId,
       revision: (latestProposal?.revision ?? 0) + 1,
-      shots: plan.shots,
-      durationToleranceSeconds: plan.durationToleranceSeconds,
+      shots: shotDefinitions,
+      durationToleranceSeconds: STORYBOARD_DURATION_TOLERANCE_SECONDS,
+      objective: plan.objective,
+      assumptions: plan.assumptions,
+      risks: plan.risks,
+      ...(agentRunId ? { agentRunId } : {}),
       now,
     });
     await repositories.storyboards.create(proposal);
@@ -314,7 +471,11 @@ export class ProjectApplicationService {
       projectId,
       payload: { status: awaitingApproval.status, revision: proposal.revision },
     });
-    return { project: awaitingApproval, proposal };
+    return {
+      project: awaitingApproval,
+      proposal,
+      ...(result.agentRun ? { agentRun: result.agentRun } : {}),
+    };
   }
 
   async approveStoryboard(
@@ -471,6 +632,26 @@ export class ProjectApplicationService {
         'PROJECT_NOT_FOUND',
         'The requested project was not found.',
         404,
+        false,
+      );
+    }
+    return project;
+  }
+
+  private async requirePlanningProject(
+    repositories: Repositories,
+    projectId: Uuid,
+  ): Promise<VideoProject> {
+    const project = await this.requireProject(repositories, projectId);
+    if (
+      project.status !== 'draft' &&
+      project.status !== 'planning' &&
+      project.status !== 'awaiting_storyboard_approval'
+    ) {
+      throw new ApplicationError(
+        'PROJECT_NOT_READY_FOR_PLANNING',
+        'The project is not available for storyboard planning.',
+        409,
         false,
       );
     }

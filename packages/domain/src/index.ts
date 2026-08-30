@@ -154,6 +154,12 @@ export interface StoryboardShotDefinition {
   readonly durationSeconds: number;
   readonly mode: 't2v';
   readonly qualityTier: 'preview';
+  readonly visualDescription?: string;
+  readonly cameraDirection?: string;
+  readonly audioDirection?: string;
+  readonly dialogue?: string;
+  readonly acceptanceCriteria?: readonly string[];
+  readonly requiredAssetIds?: readonly string[];
 }
 
 export interface StoryboardProposal {
@@ -164,6 +170,10 @@ export interface StoryboardProposal {
   readonly shots: readonly StoryboardShotDefinition[];
   readonly totalDurationSeconds: number;
   readonly durationToleranceSeconds: number;
+  readonly objective?: string;
+  readonly assumptions?: readonly string[];
+  readonly risks?: readonly string[];
+  readonly agentRunId?: Uuid;
   readonly version: number;
   readonly createdAt: IsoUtcTimestamp;
   readonly updatedAt: IsoUtcTimestamp;
@@ -181,6 +191,12 @@ export interface Shot {
   readonly durationSeconds: number;
   readonly mode: 't2v';
   readonly qualityTier: 'preview';
+  readonly visualDescription?: string;
+  readonly cameraDirection?: string;
+  readonly audioDirection?: string;
+  readonly dialogue?: string;
+  readonly acceptanceCriteria?: readonly string[];
+  readonly requiredAssetIds?: readonly string[];
   readonly status: ShotStatus;
   readonly acceptedAttemptId?: Uuid;
   readonly version: number;
@@ -656,6 +672,41 @@ function assertShotDefinition(definition: StoryboardShotDefinition): void {
       'Phase 2 supports preview T2V shots only.',
     );
   }
+  const optionalTextFields = [
+    definition.visualDescription,
+    definition.cameraDirection,
+    definition.audioDirection,
+    definition.dialogue,
+  ];
+  if (
+    optionalTextFields.some(
+      (value) => value !== undefined && (!value.trim() || value.length > 2_000),
+    )
+  ) {
+    throw new DomainError(
+      'INVALID_SHOT',
+      'Optional shot direction text must be non-empty and bounded.',
+    );
+  }
+  if (definition.acceptanceCriteria) {
+    if (
+      definition.acceptanceCriteria.length > 8 ||
+      definition.acceptanceCriteria.some(
+        (value) => !value.trim() || value.length > 280,
+      )
+    ) {
+      throw new DomainError(
+        'INVALID_SHOT',
+        'Shot acceptance criteria must be bounded.',
+      );
+    }
+  }
+  if (definition.requiredAssetIds?.length) {
+    throw new DomainError(
+      'INVALID_SHOT',
+      'T2V shots cannot contain asset references.',
+    );
+  }
 }
 
 function assertStoryboard(proposal: StoryboardProposal): void {
@@ -669,6 +720,30 @@ function assertStoryboard(proposal: StoryboardProposal): void {
       'INVALID_STORYBOARD',
       'Storyboard revision and version must be positive.',
     );
+  }
+  if (
+    proposal.objective !== undefined &&
+    (!proposal.objective.trim() || proposal.objective.length > 400)
+  ) {
+    throw new DomainError(
+      'INVALID_STORYBOARD',
+      'Storyboard objective must be non-empty and bounded.',
+    );
+  }
+  for (const values of [proposal.assumptions, proposal.risks]) {
+    if (
+      values &&
+      (values.length > 12 ||
+        values.some((value) => !value.trim() || value.length > 280))
+    ) {
+      throw new DomainError(
+        'INVALID_STORYBOARD',
+        'Storyboard assumptions and risks must be bounded.',
+      );
+    }
+  }
+  if (proposal.agentRunId) {
+    assertUuid(proposal.agentRunId);
   }
   if (proposal.shots.length !== STORYBOARD_SHOT_COUNT) {
     throw new DomainError(
@@ -1079,6 +1154,10 @@ export interface CreateStoryboardProposalInput {
   readonly revision: number;
   readonly shots: readonly StoryboardShotDefinition[];
   readonly durationToleranceSeconds?: number;
+  readonly objective?: string;
+  readonly assumptions?: readonly string[];
+  readonly risks?: readonly string[];
+  readonly agentRunId?: Uuid;
   readonly now: IsoUtcTimestamp;
 }
 
@@ -1098,6 +1177,12 @@ export function createStoryboardProposal(
     totalDurationSeconds,
     durationToleranceSeconds:
       input.durationToleranceSeconds ?? STORYBOARD_DURATION_TOLERANCE_SECONDS,
+    ...(input.objective !== undefined ? { objective: input.objective } : {}),
+    ...(input.assumptions !== undefined
+      ? { assumptions: [...input.assumptions] }
+      : {}),
+    ...(input.risks !== undefined ? { risks: [...input.risks] } : {}),
+    ...(input.agentRunId !== undefined ? { agentRunId: input.agentRunId } : {}),
     version: 1,
     createdAt: input.now,
     updatedAt: input.now,
@@ -1126,6 +1211,24 @@ export function createShot(input: CreateShotInput): Shot {
     mode: input.definition.mode,
     qualityTier: input.definition.qualityTier,
     status: 'approved_for_generation',
+    ...(input.definition.visualDescription !== undefined
+      ? { visualDescription: input.definition.visualDescription }
+      : {}),
+    ...(input.definition.cameraDirection !== undefined
+      ? { cameraDirection: input.definition.cameraDirection }
+      : {}),
+    ...(input.definition.audioDirection !== undefined
+      ? { audioDirection: input.definition.audioDirection }
+      : {}),
+    ...(input.definition.dialogue !== undefined
+      ? { dialogue: input.definition.dialogue }
+      : {}),
+    ...(input.definition.acceptanceCriteria !== undefined
+      ? { acceptanceCriteria: [...input.definition.acceptanceCriteria] }
+      : {}),
+    ...(input.definition.requiredAssetIds !== undefined
+      ? { requiredAssetIds: [...input.definition.requiredAssetIds] }
+      : {}),
     version: 1,
     createdAt: input.now,
     updatedAt: input.now,

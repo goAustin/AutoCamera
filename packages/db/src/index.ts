@@ -208,6 +208,59 @@ export interface EvaluationRepository {
   ): Promise<EvaluationResult | null>;
 }
 
+export const AGENT_RUN_STATUSES = [
+  'running',
+  'succeeded',
+  'failed',
+  'aborted',
+  'timed_out',
+] as const;
+export type AgentRunStatus = (typeof AGENT_RUN_STATUSES)[number];
+
+export const AGENT_RUN_FAILURE_CODES = [
+  'PROVIDER_ERROR',
+  'ABORTED',
+  'TIMEOUT',
+  'INVALID_STRUCTURED_OUTPUT',
+  'POLICY_DENIED',
+  'APPLICATION_ERROR',
+] as const;
+export type AgentRunFailureCode = (typeof AGENT_RUN_FAILURE_CODES)[number];
+
+export interface AgentRunRecord {
+  readonly id: Uuid;
+  readonly tenantId: Uuid;
+  readonly projectId: Uuid;
+  readonly runId: string;
+  readonly sessionId: string;
+  readonly objective: string;
+  readonly provider: string;
+  readonly model: string;
+  readonly status: AgentRunStatus;
+  readonly toolCalls: number;
+  readonly inputTokens: number;
+  readonly outputTokens: number;
+  readonly totalTokens: number;
+  readonly cacheReadTokens: number;
+  readonly cacheWriteTokens: number;
+  readonly providerCostMicrousd: number;
+  readonly startedAt: string;
+  readonly finishedAt?: string;
+  readonly failureCode?: AgentRunFailureCode;
+  readonly version: number;
+  readonly updatedAt: string;
+}
+
+export interface AgentRunRepository {
+  create(run: AgentRunRecord): Promise<void>;
+  findById(tenantId: Uuid, runId: Uuid): Promise<AgentRunRecord | null>;
+  listByProject(
+    tenantId: Uuid,
+    projectId: Uuid,
+  ): Promise<readonly AgentRunRecord[]>;
+  update(run: AgentRunRecord, expectedVersion: number): Promise<AgentRunRecord>;
+}
+
 export interface WorkflowVersionRecord {
   readonly id: Uuid;
   readonly version: string;
@@ -277,6 +330,7 @@ export interface IdempotencyRepository {
     body: unknown,
     completedAt: string,
   ): Promise<void>;
+  release(tenantId: Uuid, key: string): Promise<void>;
 }
 
 export interface Repositories {
@@ -287,6 +341,7 @@ export interface Repositories {
   readonly attempts: AttemptRepository;
   readonly artifacts: ArtifactRepository;
   readonly evaluations: EvaluationRepository;
+  readonly agentRuns: AgentRunRepository;
   readonly workflowVersions: WorkflowVersionRepository;
   readonly events: EventRepository;
   readonly outbox: OutboxRepository;
@@ -323,6 +378,10 @@ interface StoryboardRow extends QueryResultRow {
   shot_definitions: unknown;
   total_duration_seconds: string | number;
   duration_tolerance_seconds: string | number;
+  objective: string;
+  assumptions: unknown;
+  risks: unknown;
+  agent_run_id: string | null;
   version: number;
   created_at: DatabaseTimestamp;
   updated_at: DatabaseTimestamp;
@@ -403,6 +462,30 @@ interface EvaluationRow extends QueryResultRow {
   checks: unknown;
   details: unknown;
   evaluated_at: DatabaseTimestamp;
+}
+
+interface AgentRunRow extends QueryResultRow {
+  id: string;
+  tenant_id: string;
+  project_id: string;
+  run_id: string;
+  session_id: string;
+  objective: string;
+  provider: string;
+  model: string;
+  status: string;
+  tool_calls: number;
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  cache_read_tokens: number;
+  cache_write_tokens: number;
+  provider_cost_microusd: string | number;
+  started_at: DatabaseTimestamp;
+  finished_at: DatabaseTimestamp | null;
+  failure_code: string | null;
+  version: number;
+  updated_at: DatabaseTimestamp;
 }
 
 interface WorkflowVersionRow extends QueryResultRow {
@@ -486,6 +569,74 @@ function databaseJson(value: unknown): string {
   return serialized;
 }
 
+function databaseStringArray(
+  value: unknown,
+  fallback: readonly string[] = [],
+): string[] {
+  const parsed = typeof value === 'string' ? JSON.parse(value) : value;
+  if (
+    !Array.isArray(parsed) ||
+    parsed.some((item) => typeof item !== 'string')
+  ) {
+    return [...fallback];
+  }
+  return [...parsed];
+}
+
+function agentRunStatus(value: string): AgentRunStatus {
+  if (!AGENT_RUN_STATUSES.includes(value as AgentRunStatus)) {
+    throw new RepositoryError(
+      'DATABASE_ERROR',
+      'Database returned an unknown agent-run status.',
+    );
+  }
+  return value as AgentRunStatus;
+}
+
+function agentRunFailureCode(
+  value: string | null,
+): AgentRunFailureCode | undefined {
+  if (value === null) {
+    return undefined;
+  }
+  if (!AGENT_RUN_FAILURE_CODES.includes(value as AgentRunFailureCode)) {
+    throw new RepositoryError(
+      'DATABASE_ERROR',
+      'Database returned an unknown agent-run failure code.',
+    );
+  }
+  return value as AgentRunFailureCode;
+}
+
+function mapAgentRun(row: AgentRunRow): AgentRunRecord {
+  const failureCode = agentRunFailureCode(row.failure_code);
+  return {
+    id: assertUuid(row.id),
+    tenantId: assertUuid(row.tenant_id),
+    projectId: assertUuid(row.project_id),
+    runId: row.run_id,
+    sessionId: row.session_id,
+    objective: row.objective,
+    provider: row.provider,
+    model: row.model,
+    status: agentRunStatus(row.status),
+    toolCalls: row.tool_calls,
+    inputTokens: row.input_tokens,
+    outputTokens: row.output_tokens,
+    totalTokens: row.total_tokens,
+    cacheReadTokens: row.cache_read_tokens,
+    cacheWriteTokens: row.cache_write_tokens,
+    providerCostMicrousd: databaseNumber(row.provider_cost_microusd),
+    startedAt: databaseTimestamp(row.started_at),
+    ...(row.finished_at
+      ? { finishedAt: databaseTimestamp(row.finished_at) }
+      : {}),
+    ...(failureCode ? { failureCode } : {}),
+    version: row.version,
+    updatedAt: databaseTimestamp(row.updated_at),
+  };
+}
+
 function parseShotDefinitions(value: unknown): StoryboardProposal['shots'] {
   const parsed = typeof value === 'string' ? JSON.parse(value) : value;
   if (!Array.isArray(parsed)) {
@@ -518,6 +669,19 @@ function parseShotDefinitions(value: unknown): StoryboardProposal['shots'] {
         'Stored storyboard shot is invalid.',
       );
     }
+    const optionalText = [
+      'visualDescription',
+      'cameraDirection',
+      'audioDirection',
+      'dialogue',
+    ] as const;
+    const optional = Object.fromEntries(
+      optionalText.flatMap((key) =>
+        typeof valueRecord[key] === 'string' ? [[key, valueRecord[key]]] : [],
+      ),
+    );
+    const criteria = valueRecord.acceptanceCriteria;
+    const assetIds = valueRecord.requiredAssetIds;
     return {
       ordinal,
       purpose: valueRecord.purpose,
@@ -525,6 +689,15 @@ function parseShotDefinitions(value: unknown): StoryboardProposal['shots'] {
       durationSeconds: valueRecord.durationSeconds,
       mode: 't2v',
       qualityTier: 'preview',
+      ...optional,
+      ...(Array.isArray(criteria) &&
+      criteria.every((item) => typeof item === 'string')
+        ? { acceptanceCriteria: [...criteria] }
+        : {}),
+      ...(Array.isArray(assetIds) &&
+      assetIds.every((item) => typeof item === 'string')
+        ? { requiredAssetIds: [...assetIds] }
+        : {}),
     };
   });
 }
@@ -546,6 +719,9 @@ function mapProject(row: ProjectRow): VideoProject {
 }
 
 function mapStoryboard(row: StoryboardRow): StoryboardProposal {
+  const agentRunId = row.agent_run_id
+    ? assertUuid(row.agent_run_id)
+    : undefined;
   return {
     id: assertUuid(row.id),
     projectId: assertUuid(row.project_id),
@@ -554,6 +730,10 @@ function mapStoryboard(row: StoryboardRow): StoryboardProposal {
     shots: parseShotDefinitions(row.shot_definitions),
     totalDurationSeconds: databaseNumber(row.total_duration_seconds),
     durationToleranceSeconds: databaseNumber(row.duration_tolerance_seconds),
+    objective: row.objective,
+    assumptions: databaseStringArray(row.assumptions),
+    risks: databaseStringArray(row.risks),
+    ...(agentRunId ? { agentRunId } : {}),
     version: row.version,
     createdAt: databaseTimestamp(
       row.created_at,
@@ -923,9 +1103,10 @@ class PostgresStoryboardRepository implements StoryboardRepository {
     await this.executor.query(
       `INSERT INTO storyboard_proposals (
         id, project_id, revision, status, shot_definitions,
-        total_duration_seconds, duration_tolerance_seconds, version,
-        created_at, updated_at
-      ) VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, $10)`,
+        total_duration_seconds, duration_tolerance_seconds, objective,
+        assumptions, risks, agent_run_id, version, created_at, updated_at
+      ) VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9::jsonb, $10::jsonb,
+        $11, $12, $13, $14)`,
       [
         proposal.id,
         proposal.projectId,
@@ -934,6 +1115,10 @@ class PostgresStoryboardRepository implements StoryboardRepository {
         databaseJson(proposal.shots),
         proposal.totalDurationSeconds,
         proposal.durationToleranceSeconds,
+        proposal.objective ?? 'MVP storyboard proposal',
+        databaseJson(proposal.assumptions ?? []),
+        databaseJson(proposal.risks ?? []),
+        proposal.agentRunId ?? null,
         proposal.version,
         proposal.createdAt,
         proposal.updatedAt,
@@ -975,15 +1160,23 @@ class PostgresStoryboardRepository implements StoryboardRepository {
            shot_definitions = $2::jsonb,
            total_duration_seconds = $3,
            duration_tolerance_seconds = $4,
-           version = $5,
-           updated_at = $6
-       WHERE id = $7 AND project_id = $8 AND version = $9
+           objective = $5,
+           assumptions = $6::jsonb,
+           risks = $7::jsonb,
+           agent_run_id = $8,
+           version = $9,
+           updated_at = $10
+       WHERE id = $11 AND project_id = $12 AND version = $13
        RETURNING *`,
       [
         proposal.status,
         databaseJson(proposal.shots),
         proposal.totalDurationSeconds,
         proposal.durationToleranceSeconds,
+        proposal.objective ?? 'MVP storyboard proposal',
+        databaseJson(proposal.assumptions ?? []),
+        databaseJson(proposal.risks ?? []),
+        proposal.agentRunId ?? null,
         proposal.version,
         proposal.updatedAt,
         proposal.id,
@@ -1471,6 +1664,119 @@ class PostgresEvaluationRepository implements EvaluationRepository {
   }
 }
 
+class PostgresAgentRunRepository implements AgentRunRepository {
+  private readonly executor: SqlExecutor;
+
+  constructor(executor: SqlExecutor) {
+    this.executor = executor;
+  }
+
+  async create(run: AgentRunRecord): Promise<void> {
+    await this.executor.query(
+      `INSERT INTO agent_runs (
+        id, tenant_id, project_id, run_id, session_id, objective, provider,
+        model, status, tool_calls, input_tokens, output_tokens, total_tokens,
+        cache_read_tokens, cache_write_tokens, provider_cost_microusd,
+        started_at, finished_at, failure_code, version, updated_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+        $14, $15, $16, $17, $18, $19, $20, $21)`,
+      [
+        run.id,
+        run.tenantId,
+        run.projectId,
+        run.runId,
+        run.sessionId,
+        run.objective,
+        run.provider,
+        run.model,
+        run.status,
+        run.toolCalls,
+        run.inputTokens,
+        run.outputTokens,
+        run.totalTokens,
+        run.cacheReadTokens,
+        run.cacheWriteTokens,
+        run.providerCostMicrousd,
+        run.startedAt,
+        run.finishedAt ?? null,
+        run.failureCode ?? null,
+        run.version,
+        run.updatedAt,
+      ],
+    );
+  }
+
+  async findById(tenantId: Uuid, runId: Uuid): Promise<AgentRunRecord | null> {
+    const result = await this.executor.query<AgentRunRow>(
+      'SELECT * FROM agent_runs WHERE tenant_id = $1 AND id = $2',
+      [tenantId, runId],
+    );
+    const row = result.rows[0];
+    return row ? mapAgentRun(row) : null;
+  }
+
+  async listByProject(
+    tenantId: Uuid,
+    projectId: Uuid,
+  ): Promise<readonly AgentRunRecord[]> {
+    const result = await this.executor.query<AgentRunRow>(
+      `SELECT * FROM agent_runs
+       WHERE tenant_id = $1 AND project_id = $2
+       ORDER BY started_at, id`,
+      [tenantId, projectId],
+    );
+    return result.rows.map(mapAgentRun);
+  }
+
+  async update(
+    run: AgentRunRecord,
+    expectedVersion: number,
+  ): Promise<AgentRunRecord> {
+    const result = await this.executor.query<AgentRunRow>(
+      `UPDATE agent_runs
+       SET status = $1,
+           tool_calls = $2,
+           input_tokens = $3,
+           output_tokens = $4,
+           total_tokens = $5,
+           cache_read_tokens = $6,
+           cache_write_tokens = $7,
+           provider_cost_microusd = $8,
+           finished_at = $9,
+           failure_code = $10,
+           version = $11,
+           updated_at = $12
+       WHERE id = $13 AND tenant_id = $14 AND version = $15
+       RETURNING *`,
+      [
+        run.status,
+        run.toolCalls,
+        run.inputTokens,
+        run.outputTokens,
+        run.totalTokens,
+        run.cacheReadTokens,
+        run.cacheWriteTokens,
+        run.providerCostMicrousd,
+        run.finishedAt ?? null,
+        run.failureCode ?? null,
+        run.version,
+        run.updatedAt,
+        run.id,
+        run.tenantId,
+        expectedVersion,
+      ],
+    );
+    const row = result.rows[0];
+    if (!row) {
+      throw new RepositoryError(
+        'OPTIMISTIC_CONFLICT',
+        'The agent run was modified by another transaction.',
+      );
+    }
+    return mapAgentRun(row);
+  }
+}
+
 class PostgresWorkflowVersionRepository implements WorkflowVersionRepository {
   private readonly executor: SqlExecutor;
 
@@ -1706,6 +2012,15 @@ class PostgresIdempotencyRepository implements IdempotencyRepository {
       );
     }
   }
+
+  async release(tenantId: Uuid, key: string): Promise<void> {
+    await this.executor.query(
+      `DELETE FROM idempotency_records
+       WHERE tenant_id = $1 AND idempotency_key = $2
+         AND response_status IS NULL`,
+      [tenantId, key],
+    );
+  }
 }
 
 function createPostgresRepositories(executor: SqlExecutor): Repositories {
@@ -1717,6 +2032,7 @@ function createPostgresRepositories(executor: SqlExecutor): Repositories {
     attempts: new PostgresAttemptRepository(executor),
     artifacts: new PostgresArtifactRepository(executor),
     evaluations: new PostgresEvaluationRepository(executor),
+    agentRuns: new PostgresAgentRunRepository(executor),
     workflowVersions: new PostgresWorkflowVersionRepository(executor),
     events: new PostgresEventRepository(executor),
     outbox: new PostgresOutboxRepository(executor),
@@ -1774,6 +2090,7 @@ interface MemoryState {
   readonly attempts: Map<Uuid, GenerationAttempt>;
   readonly artifacts: Map<Uuid, ArtifactRecord>;
   readonly evaluations: Map<Uuid, EvaluationResult>;
+  readonly agentRuns: Map<Uuid, AgentRunRecord>;
   readonly workflowVersions: Map<Uuid, WorkflowVersionRecord>;
   readonly events: Map<Uuid, DomainEvent>;
   readonly outbox: Map<
@@ -1795,6 +2112,7 @@ function emptyMemoryState(): MemoryState {
     attempts: new Map(),
     artifacts: new Map(),
     evaluations: new Map(),
+    agentRuns: new Map(),
     workflowVersions: new Map(),
     events: new Map(),
     outbox: new Map(),
@@ -1829,6 +2147,9 @@ function cloneMemoryState(state: MemoryState): MemoryState {
         },
       ]),
     ),
+    agentRuns: new Map(
+      [...state.agentRuns].map(([id, run]) => [id, { ...run }]),
+    ),
     workflowVersions: new Map(
       [...state.workflowVersions].map(([id, version]) => [
         id,
@@ -1862,6 +2183,7 @@ class MemoryRepositories implements Repositories {
   readonly attempts: AttemptRepository;
   readonly artifacts: ArtifactRepository;
   readonly evaluations: EvaluationRepository;
+  readonly agentRuns: AgentRunRepository;
   readonly workflowVersions: WorkflowVersionRepository;
   readonly events: EventRepository;
   readonly outbox: OutboxRepository;
@@ -2315,6 +2637,48 @@ class MemoryRepositories implements Repositories {
           : null;
       },
     };
+    this.agentRuns = {
+      create: async (run) => {
+        if (
+          this.state.agentRuns.has(run.id) ||
+          [...this.state.agentRuns.values()].some(
+            (current) =>
+              current.tenantId === run.tenantId && current.runId === run.runId,
+          )
+        ) {
+          throw new RepositoryError(
+            'UNIQUE_VIOLATION',
+            'Agent run already exists.',
+          );
+        }
+        this.state.agentRuns.set(run.id, { ...run });
+      },
+      findById: async (tenantId, runId) => {
+        const run = this.state.agentRuns.get(runId);
+        return run && run.tenantId === tenantId ? { ...run } : null;
+      },
+      listByProject: async (tenantId, projectId) =>
+        [...this.state.agentRuns.values()]
+          .filter(
+            (run) => run.tenantId === tenantId && run.projectId === projectId,
+          )
+          .sort((left, right) => left.startedAt.localeCompare(right.startedAt))
+          .map((run) => ({ ...run })),
+      update: async (run, expectedVersion) => {
+        const current = this.state.agentRuns.get(run.id);
+        if (!current || current.tenantId !== run.tenantId) {
+          throw new RepositoryError('NOT_FOUND', 'Agent run not found.');
+        }
+        if (current.version !== expectedVersion) {
+          throw new RepositoryError(
+            'OPTIMISTIC_CONFLICT',
+            'Agent run was changed by another writer.',
+          );
+        }
+        this.state.agentRuns.set(run.id, { ...run });
+        return { ...run };
+      },
+    };
     this.workflowVersions = {
       findByHash: async (workflowHash) => {
         const version = [...this.state.workflowVersions.values()].find(
@@ -2474,6 +2838,13 @@ class MemoryRepositories implements Repositories {
           responseBody: body,
           completedAt,
         });
+      },
+      release: async (tenantId, key) => {
+        const recordKey = memoryIdempotencyKey(tenantId, key);
+        const existing = this.state.idempotency.get(recordKey);
+        if (existing?.responseStatus === null) {
+          this.state.idempotency.delete(recordKey);
+        }
       },
     };
   }

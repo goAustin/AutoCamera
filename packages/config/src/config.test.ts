@@ -13,6 +13,9 @@ describe('configuration', () => {
     expect(config.apiHost).toBe('127.0.0.1');
     expect(config.apiPort).toBe(3000);
     expect(config.projectDefaultBudgetUsd).toBe('25.00');
+    expect(config.piProvider).toBe('faux');
+    expect(config.piModel).toBe('h3-videoops-storyboard-v1');
+    expect(config.piMaxConcurrentRuns).toBe(1);
     expect(getWebConfig({ NODE_ENV: 'test' }).apiOrigin).toBe(
       'http://127.0.0.1:3000',
     );
@@ -49,5 +52,27 @@ describe('configuration', () => {
     expect(() => parseEnvironment({ NODE_ENV: 'development' })).toThrow(
       'DEV_AUTH_TOKEN',
     );
+  });
+
+  it('does not require hosted credentials in faux mode', () => {
+    expect(() =>
+      parseEnvironment({ NODE_ENV: 'development', DEV_AUTH_TOKEN: 'local' }),
+    ).not.toThrow();
+  });
+
+  it('requires credentials only for an explicitly selected hosted provider', () => {
+    expect(() =>
+      parseEnvironment({
+        NODE_ENV: 'test',
+        PI_PROVIDER: 'hosted',
+      }),
+    ).toThrowError('PI_API_KEY');
+    expect(
+      parseEnvironment({
+        NODE_ENV: 'test',
+        PI_PROVIDER: 'hosted',
+        PI_API_KEY: 'secret',
+      }).PI_PROVIDER,
+    ).toBe('hosted');
   });
 });

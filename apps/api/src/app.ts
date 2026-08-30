@@ -13,6 +13,8 @@ import {
   formatMicrousdToUsd,
   assertMicrousd,
   parseUsdToMicrousd,
+  systemClock,
+  systemIdGenerator,
   toIsoUtc,
   type Clock,
   type DomainEvent,
@@ -36,7 +38,11 @@ import {
   type TransactionalStore,
 } from '@h3/db';
 import { getApiConfig, type ApiConfig } from '@h3/config';
-import { createTraceId } from '@h3/telemetry';
+import {
+  createTraceId,
+  OpenTelemetryTelemetry,
+  type AgentTelemetry,
+} from '@h3/telemetry';
 import { createLocalArtifactStore, type ArtifactStore } from '@h3/object-store';
 import type { ComfyClient } from '@h3/comfy-client';
 import type { MediaEvaluator } from '@h3/evaluator';
@@ -44,9 +50,13 @@ import {
   ApplicationError,
   DEV_TENANT_ID,
   ProjectApplicationService,
-  StaticStoryboardPlanner,
   type PlanningAgent,
 } from './application.js';
+import {
+  PiPlanningAgent,
+  PlanningAgentError,
+  type FauxPlanningScript,
+} from './agent.js';
 import {
   GenerationApplicationService,
   GenerationApplicationError,
@@ -82,6 +92,8 @@ export interface ApiAppOptions {
   readonly databaseReady?: () => Promise<boolean>;
   readonly store?: TransactionalStore;
   readonly planner?: PlanningAgent;
+  readonly telemetry?: AgentTelemetry;
+  readonly planningScript?: FauxPlanningScript;
   readonly clock?: Clock;
   readonly idGenerator?: IdGenerator;
   readonly comfyClient?: ComfyClient;
@@ -213,6 +225,15 @@ const shotJsonSchema = {
     durationSeconds: { type: 'number', exclusiveMinimum: 0 },
     mode: { type: 'string', enum: ['t2v'] },
     qualityTier: { type: 'string', enum: ['preview'] },
+    visualDescription: { type: 'string' },
+    cameraDirection: { type: 'string' },
+    audioDirection: { type: 'string' },
+    dialogue: { type: 'string' },
+    acceptanceCriteria: { type: 'array', items: { type: 'string' } },
+    requiredAssetIds: {
+      type: 'array',
+      items: { type: 'string', maxLength: 0 },
+    },
     status: { type: 'string' },
     acceptedAttemptId: { type: 'string', format: 'uuid' },
     version: { type: 'integer' },
@@ -288,6 +309,15 @@ const proposalJsonSchema = {
           durationSeconds: { type: 'number', exclusiveMinimum: 0 },
           mode: { type: 'string', enum: ['t2v'] },
           qualityTier: { type: 'string', enum: ['preview'] },
+          visualDescription: { type: 'string' },
+          cameraDirection: { type: 'string' },
+          audioDirection: { type: 'string' },
+          dialogue: { type: 'string' },
+          acceptanceCriteria: { type: 'array', items: { type: 'string' } },
+          requiredAssetIds: {
+            type: 'array',
+            items: { type: 'string', maxLength: 0 },
+          },
         },
       },
     },
@@ -296,6 +326,10 @@ const proposalJsonSchema = {
     version: { type: 'integer' },
     createdAt: { type: 'string', format: 'date-time' },
     updatedAt: { type: 'string', format: 'date-time' },
+    objective: { type: 'string' },
+    assumptions: { type: 'array', items: { type: 'string' } },
+    risks: { type: 'array', items: { type: 'string' } },
+    agentRunId: { type: 'string', format: 'uuid' },
   },
 } as const;
 
@@ -427,6 +461,10 @@ function proposalResponse(
     shots: proposal.shots,
     totalDurationSeconds: proposal.totalDurationSeconds,
     durationToleranceSeconds: proposal.durationToleranceSeconds,
+    ...(proposal.objective ? { objective: proposal.objective } : {}),
+    ...(proposal.assumptions ? { assumptions: proposal.assumptions } : {}),
+    ...(proposal.risks ? { risks: proposal.risks } : {}),
+    ...(proposal.agentRunId ? { agentRunId: proposal.agentRunId } : {}),
     version: proposal.version,
     createdAt: proposal.createdAt,
     updatedAt: proposal.updatedAt,
@@ -449,6 +487,17 @@ function shotResponse(shot: Shot): Record<string, unknown> {
     createdAt: shot.createdAt,
     updatedAt: shot.updatedAt,
   };
+  for (const key of [
+    'visualDescription',
+    'cameraDirection',
+    'audioDirection',
+    'dialogue',
+    'acceptanceCriteria',
+    'requiredAssetIds',
+  ] as const) {
+    const value = shot[key];
+    if (value !== undefined) response[key] = value;
+  }
   if (shot.acceptedAttemptId) {
     response.acceptedAttemptId = shot.acceptedAttemptId;
   }
@@ -748,6 +797,63 @@ async function executeIdempotent(
   });
 }
 
+async function executeAsyncIdempotent(
+  request: FastifyRequest,
+  service: ProjectApplicationService,
+  operation: string,
+  body: unknown,
+  mutation: () => Promise<IdempotentResponse>,
+): Promise<IdempotentResponse> {
+  const key = idempotencyKey(request);
+  const hash = requestHash(operation, body);
+  const reservation = await service.withTransaction((repositories) =>
+    repositories.idempotency.reserve(
+      service.tenantId,
+      key,
+      operation,
+      hash,
+      toIsoUtc(service.clock.now()),
+    ),
+  );
+  if (reservation.kind === 'conflict') {
+    throw new HttpProblemError(
+      'IDEMPOTENCY_KEY_REUSED',
+      'The Idempotency-Key was already used for a different request.',
+      409,
+      false,
+    );
+  }
+  if (reservation.kind === 'in_progress') {
+    throw new HttpProblemError(
+      'IDEMPOTENCY_IN_PROGRESS',
+      'The original request is still being processed.',
+      409,
+      true,
+    );
+  }
+  if (reservation.kind === 'replay') {
+    return { status: reservation.status, body: reservation.body };
+  }
+  try {
+    const response = await mutation();
+    await service.withTransaction((repositories) =>
+      repositories.idempotency.complete(
+        service.tenantId,
+        key,
+        response.status,
+        response.body,
+        toIsoUtc(service.clock.now()),
+      ),
+    );
+    return response;
+  } catch (error) {
+    await service.withTransaction((repositories) =>
+      repositories.idempotency.release(service.tenantId, key),
+    );
+    throw error;
+  }
+}
+
 function problemTitle(code: string): string {
   return code
     .toLowerCase()
@@ -784,6 +890,11 @@ function sendProblem(
     retryable = error.retryable;
     detail = error.message;
   } else if (error instanceof GenerationApplicationError) {
+    status = error.status;
+    code = error.code;
+    retryable = error.retryable;
+    detail = error.message;
+  } else if (error instanceof PlanningAgentError) {
     status = error.status;
     code = error.code;
     retryable = error.retryable;
@@ -910,23 +1021,62 @@ export function buildApiApp(options: ApiAppOptions = {}): FastifyInstance {
   } catch {
     defaultBudgetMicrousd = parseUsdToMicrousd('25.00');
   }
-  const service = new ProjectApplicationService({
-    store,
-    planner: options.planner ?? new StaticStoryboardPlanner(),
-    defaultBudgetMicrousd,
-    ...(options.clock ? { clock: options.clock } : {}),
-    ...(options.idGenerator ? { idGenerator: options.idGenerator } : {}),
-  });
+  const clock = options.clock ?? systemClock;
+  const idGenerator = options.idGenerator ?? systemIdGenerator;
   const generationService = new GenerationApplicationService({
     store,
-    tenantId: service.tenantId,
-    idGenerator: service.idGenerator,
+    tenantId: DEV_TENANT_ID,
+    idGenerator,
+    clock,
     ...(options.comfyClient ? { comfyClient: options.comfyClient } : {}),
     artifactStore:
       options.artifactStore ?? createLocalArtifactStore(config.artifactRoot),
     ...(options.evaluator ? { evaluator: options.evaluator } : {}),
-    ...(options.clock ? { clock: options.clock } : {}),
   });
+  let projectService: ProjectApplicationService | undefined;
+  const telemetry = options.telemetry ?? new OpenTelemetryTelemetry();
+  const planner =
+    options.planner ??
+    new PiPlanningAgent({
+      store,
+      tenantId: DEV_TENANT_ID,
+      clock,
+      idGenerator,
+      provider: config.piProvider,
+      model: config.piModel,
+      maxConcurrentRuns: config.piMaxConcurrentRuns,
+      telemetry,
+      ...(config.piApiKey ? { apiKey: config.piApiKey } : {}),
+      ...(config.piBaseUrl ? { baseUrl: config.piBaseUrl } : {}),
+      ...(options.planningScript ? { script: options.planningScript } : {}),
+      projectService: {
+        approveStoryboard: (projectId, proposalId) => {
+          if (!projectService) throw new Error('project service unavailable');
+          return projectService.approveStoryboard(projectId, proposalId);
+        },
+        getProject: (projectId) => {
+          if (!projectService) throw new Error('project service unavailable');
+          return projectService.getProject(projectId);
+        },
+        listEvents: (projectId) => {
+          if (!projectService) throw new Error('project service unavailable');
+          return projectService.listEvents(projectId);
+        },
+        listShots: (projectId) => {
+          if (!projectService) throw new Error('project service unavailable');
+          return projectService.listShots(projectId);
+        },
+      },
+      generationService,
+    });
+  const service = new ProjectApplicationService({
+    store,
+    planner,
+    defaultBudgetMicrousd,
+    clock,
+    idGenerator,
+  });
+  projectService = service;
   const generationWorker =
     options.generationWorker ??
     new GenerationWorker({
@@ -959,8 +1109,9 @@ export function buildApiApp(options: ApiAppOptions = {}): FastifyInstance {
     openapi: {
       info: {
         title: 'H3 VideoOps API',
-        description: 'Phase 3 durable fake-generation and review API.',
-        version: '0.3.0',
+        description:
+          'Phase 4 Pi planning, policy tools, and durable preview API.',
+        version: '0.4.0',
       },
       tags: [
         { name: 'projects', description: 'Project and storyboard operations' },
@@ -980,6 +1131,9 @@ export function buildApiApp(options: ApiAppOptions = {}): FastifyInstance {
       await generationWorker.stop();
     });
   }
+  app.addHook('onClose', async () => {
+    await telemetry.flush();
+  });
   void app.register(swaggerUi, { routePrefix: '/documentation' });
 
   app.addHook('onRequest', async (request) => {
@@ -1131,7 +1285,7 @@ export function buildApiApp(options: ApiAppOptions = {}): FastifyInstance {
       {
         schema: {
           tags: ['projects'],
-          summary: 'Generate a deterministic storyboard proposal',
+          summary: 'Generate a Pi-planned storyboard proposal',
           params: {
             type: 'object',
             required: ['projectId'],
@@ -1143,16 +1297,13 @@ export function buildApiApp(options: ApiAppOptions = {}): FastifyInstance {
       async (request, reply) => {
         const projectId = parseProjectId(request);
         const body = request.body ?? {};
-        const response = await executeIdempotent(
+        const response = await executeAsyncIdempotent(
           request,
           service,
           `project.plan:${projectId}`,
           body,
-          async (repositories) => {
-            const result = await service.planProjectInTransaction(
-              repositories,
-              projectId,
-            );
+          async () => {
+            const result = await service.planProject(projectId);
             return {
               status: 200,
               body: {

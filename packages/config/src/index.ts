@@ -43,6 +43,14 @@ export const environmentSchema = z.object({
   COMFY_WS_URL: z.string().url().default('ws://127.0.0.1:8188/ws'),
   COMFY_CLIENT_ID_PREFIX: z.string().trim().min(1).default('h3-dev'),
   GPU_WORKER_ID: z.string().trim().min(1).default('local-worker-1'),
+  PI_PROVIDER: z.string().trim().min(1).default('faux'),
+  PI_MODEL: z.string().trim().min(1).default('h3-videoops-storyboard-v1'),
+  PI_MAX_CONCURRENT_RUNS: positiveInteger.default(1),
+  PI_API_KEY: z.preprocess(
+    (value: unknown) => (value === '' ? undefined : value),
+    z.string().trim().min(1).optional(),
+  ),
+  PI_BASE_URL: optionalUrl,
   ATTEMPT_LEASE_SECONDS: positiveInteger.default(60),
   ATTEMPT_TIMEOUT_SECONDS: positiveInteger.default(300),
   PROJECT_DEFAULT_BUDGET_USD: z
@@ -92,6 +100,10 @@ export function parseEnvironment(raw: NodeJS.ProcessEnv): Environment {
     throw new ConfigurationError(['DEV_AUTH_TOKEN']);
   }
 
+  if (result.data.PI_PROVIDER !== 'faux' && !result.data.PI_API_KEY) {
+    throw new ConfigurationError(['PI_API_KEY']);
+  }
+
   return result.data;
 }
 
@@ -108,6 +120,11 @@ export interface ApiConfig {
   readonly comfyWsUrl: string;
   readonly comfyClientIdPrefix: string;
   readonly gpuWorkerId: string;
+  readonly piProvider: string;
+  readonly piModel: string;
+  readonly piMaxConcurrentRuns: number;
+  readonly piApiKey?: string;
+  readonly piBaseUrl?: string;
   readonly attemptLeaseSeconds: number;
   readonly attemptTimeoutSeconds: number;
   readonly projectDefaultBudgetUsd: string;
@@ -131,15 +148,28 @@ export function getApiConfig(raw: NodeJS.ProcessEnv = process.env): ApiConfig {
     comfyWsUrl: environment.COMFY_WS_URL,
     comfyClientIdPrefix: environment.COMFY_CLIENT_ID_PREFIX,
     gpuWorkerId: environment.GPU_WORKER_ID,
+    piProvider: environment.PI_PROVIDER,
+    piModel: environment.PI_MODEL,
+    piMaxConcurrentRuns: environment.PI_MAX_CONCURRENT_RUNS,
     attemptLeaseSeconds: environment.ATTEMPT_LEASE_SECONDS,
     attemptTimeoutSeconds: environment.ATTEMPT_TIMEOUT_SECONDS,
     projectDefaultBudgetUsd: environment.PROJECT_DEFAULT_BUDGET_USD,
   };
 
-  if (environment.OTEL_EXPORTER_OTLP_ENDPOINT) {
+  if (
+    environment.PI_API_KEY ||
+    environment.PI_BASE_URL ||
+    environment.OTEL_EXPORTER_OTLP_ENDPOINT
+  ) {
     return {
       ...config,
-      otelExporterOtlpEndpoint: environment.OTEL_EXPORTER_OTLP_ENDPOINT,
+      ...(environment.PI_API_KEY ? { piApiKey: environment.PI_API_KEY } : {}),
+      ...(environment.PI_BASE_URL
+        ? { piBaseUrl: environment.PI_BASE_URL }
+        : {}),
+      ...(environment.OTEL_EXPORTER_OTLP_ENDPOINT
+        ? { otelExporterOtlpEndpoint: environment.OTEL_EXPORTER_OTLP_ENDPOINT }
+        : {}),
     };
   }
 

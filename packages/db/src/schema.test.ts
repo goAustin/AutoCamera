@@ -55,4 +55,26 @@ describe('Phase 2 migration contract', () => {
     expect(sql).toContain('generation_attempts_queue_idx');
     expect(sql).toContain('generation_attempts_failure_message_bounded');
   });
+
+  it('declares the Phase 4 agent-run and storyboard metadata contract', () => {
+    const sql = readFileSync(
+      join(migrationsDirectory, '0003_phase4_agent.sql'),
+      'utf8',
+    );
+    for (const column of [
+      'run_id',
+      'session_id',
+      'objective',
+      'provider',
+      'model',
+      'total_tokens',
+      'provider_cost_microusd',
+      'agent_run_id',
+    ]) {
+      expect(sql).toContain(column);
+    }
+    expect(sql).toContain("'timed_out'");
+    expect(sql).toContain('agent_runs_tenant_run_id_unique');
+    expect(sql).toContain('storyboard_proposals_assumptions_array');
+  });
 });

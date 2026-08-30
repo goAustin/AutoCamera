@@ -8,6 +8,7 @@
     "declarationMap": true,
     "paths": {
       "@h3/config": ["../../packages/config/src/index.ts"],
+      "@h3/agent-tools": ["../../packages/agent-tools/src/index.ts"],
       "@h3/db": ["../../packages/db/src/index.ts"],
       "@h3/comfy-client": ["../../packages/comfy-client/src/index.ts"],
       "@h3/evaluator": ["../../packages/evaluator/src/index.ts"],
@@ -19,6 +20,7 @@
   },
   "references": [
     { "path": "../../packages/config/tsconfig.json" },
+    { "path": "../../packages/agent-tools/tsconfig.json" },
     { "path": "../../packages/db/tsconfig.json" },
     { "path": "../../packages/domain/tsconfig.json" },
     { "path": "../../packages/telemetry/tsconfig.json" },
