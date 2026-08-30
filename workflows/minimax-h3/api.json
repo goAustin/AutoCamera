@@ -1,0 +1,151 @@
+{
+  "92": {
+    "class_type": "SaveVideo",
+    "inputs": {
+      "video": ["130", 0],
+      "filename_prefix": "video/MiniMax_H3",
+      "format": "auto",
+      "codec": "auto"
+    },
+    "_meta": {
+      "title": "SaveVideo"
+    }
+  },
+  "119": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "minimax_h3_video_vae_fp16.safetensors"
+    },
+    "_meta": {
+      "title": "VAELoader"
+    }
+  },
+  "120": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "minimax_h3_audio_vae_fp32.safetensors"
+    },
+    "_meta": {
+      "title": "VAELoader"
+    }
+  },
+  "121": {
+    "class_type": "VAEDecodeAudio",
+    "inputs": {
+      "samples": ["125", 0],
+      "vae": ["120", 0]
+    },
+    "_meta": {
+      "title": "VAEDecodeAudio"
+    }
+  },
+  "122": {
+    "class_type": "VAEDecode",
+    "inputs": {
+      "samples": ["125", 0],
+      "vae": ["119", 0]
+    },
+    "_meta": {
+      "title": "VAEDecode"
+    }
+  },
+  "123": {
+    "class_type": "KSamplerSelect",
+    "inputs": {
+      "sampler_name": "res_multistep"
+    },
+    "_meta": {
+      "title": "KSamplerSelect"
+    }
+  },
+  "124": {
+    "class_type": "BasicScheduler",
+    "inputs": {
+      "model": ["127", 0],
+      "steps": 20,
+      "scheduler": "simple",
+      "denoise": 1
+    },
+    "_meta": {
+      "title": "BasicScheduler"
+    }
+  },
+  "125": {
+    "class_type": "SamplerCustomAdvanced",
+    "inputs": {
+      "noise": ["129", 0],
+      "guider": ["126", 0],
+      "sampler": ["123", 0],
+      "sigmas": ["124", 0],
+      "latent_image": ["131", 1]
+    },
+    "_meta": {
+      "title": "SamplerCustomAdvanced"
+    }
+  },
+  "126": {
+    "class_type": "BasicGuider",
+    "inputs": {
+      "model": ["127", 0],
+      "conditioning": ["131", 0]
+    },
+    "_meta": {
+      "title": "BasicGuider"
+    }
+  },
+  "127": {
+    "class_type": "UNETLoader",
+    "inputs": {
+      "unet_name": "minimax_h3_fl2va_pruned_int8_convrot.safetensors"
+    },
+    "_meta": {
+      "title": "UNETLoader"
+    }
+  },
+  "128": {
+    "class_type": "CLIPLoader",
+    "inputs": {
+      "clip_name": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+      "type": "minimax",
+      "device": "default"
+    },
+    "_meta": {
+      "title": "CLIPLoader"
+    }
+  },
+  "129": {
+    "class_type": "RandomNoise",
+    "inputs": {
+      "noise_seed": 42
+    },
+    "_meta": {
+      "title": "RandomNoise"
+    }
+  },
+  "130": {
+    "class_type": "CreateVideo",
+    "inputs": {
+      "images": ["122", 0],
+      "audio": ["121", 0],
+      "fps": 24,
+      "bit_depth": 8
+    },
+    "_meta": {
+      "title": "CreateVideo"
+    }
+  },
+  "131": {
+    "class_type": "MiniMaxH3ImageToVideo",
+    "inputs": {
+      "clip": ["128", 0],
+      "vae": ["119", 0],
+      "prompt": "A polished product moves through a cool blue studio with natural stereo sound, smooth camera motion, and a confident premium finish.",
+      "width": 960,
+      "height": 544,
+      "length": 124
+    },
+    "_meta": {
+      "title": "MiniMaxH3ImageToVideo"
+    }
+  }
+}

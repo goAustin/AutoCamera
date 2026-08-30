@@ -1,6 +1,15 @@
 import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
+import { canonicalizeJson } from './canonical.js';
+
+export {
+  canonicalizeJson,
+  canonicalizeWorkflowExecutionEnvelope,
+  hashWorkflowExecutionEnvelope,
+  jsonByteLength,
+  WorkflowCanonicalizationError,
+} from './canonical.js';
 
 export const MVP_PREVIEW_WIDTH = 960;
 export const MVP_PREVIEW_HEIGHT = 544;
@@ -155,20 +164,6 @@ export const FIXTURE_MANIFEST: WorkflowManifest = {
     },
   ],
 };
-
-function canonicalize(value: unknown): string {
-  if (value === null || typeof value !== 'object') {
-    return JSON.stringify(value) ?? 'null';
-  }
-  if (Array.isArray(value)) {
-    return `[${value.map(canonicalize).join(',')}]`;
-  }
-  const record = value as Record<string, unknown>;
-  return `{${Object.keys(record)
-    .sort()
-    .map((key) => `${JSON.stringify(key)}:${canonicalize(record[key])}`)
-    .join(',')}}`;
-}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -453,7 +448,7 @@ export function compileWorkflow(
     setBinding(compiled, binding, values[binding.name]);
   }
   const workflowHash = createHash('sha256')
-    .update(canonicalize(compiled))
+    .update(canonicalizeJson(compiled), 'utf8')
     .digest('hex');
   return {
     family: manifest.family,
@@ -536,6 +531,8 @@ export const PHASE_3_WORKFLOW_FIXTURE = {
   version: FIXTURE_MANIFEST.version,
   name: FIXTURE_MANIFEST.family,
   hash: createHash('sha256')
-    .update(canonicalize(FIXTURE_WORKFLOW))
+    .update(canonicalizeJson(FIXTURE_WORKFLOW), 'utf8')
     .digest('hex'),
 } as const;
+
+export * from './minimax-h3.js';

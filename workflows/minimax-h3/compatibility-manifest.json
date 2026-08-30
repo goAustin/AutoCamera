@@ -1,0 +1,96 @@
+{
+  "profileId": "minimax-h3-t2va-preview",
+  "profileVersion": "1",
+  "sourceTemplate": {
+    "repository": "Comfy-Org/workflow_templates",
+    "ref": "d3b4a9e89573162b005961865164c18c8ae2206b",
+    "path": "templates/video_minimax_h3_t2v.json"
+  },
+  "sourceBackend": {
+    "repository": "Comfy-Org/ComfyUI",
+    "ref": "8a33128f2f8c5585c57486c07de481241e70a39c"
+  },
+  "sourceFrontend": {
+    "repository": "Comfy-Org/ComfyUI_frontend",
+    "ref": "3697a1bc3ba7f6b98a1ead888721f7676b536eb5"
+  },
+  "sourceModel": {
+    "repository": "MiniMax-AI/MiniMax-H3",
+    "ref": "d21241f0a4b3acbb34c97dae47fa417b7065e438"
+  },
+  "editorSubgraphId": "79dd8a95-ce9d-4c14-b264-2162e8bec5ce",
+  "mode": "t2va",
+  "defaults": {
+    "width": 960,
+    "height": 544,
+    "fps": 24,
+    "durationSeconds": 5,
+    "steps": 20,
+    "turbo": false,
+    "audioSampleRate": 32000,
+    "audioChannels": 2
+  },
+  "modelFiles": {
+    "diffusionModel": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+    "textEncoder": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+    "videoVae": "minimax_h3_video_vae_fp16.safetensors",
+    "audioVae": "minimax_h3_audio_vae_fp32.safetensors",
+    "turboLora": "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors"
+  },
+  "requiredApiNodeClasses": [
+    "UNETLoader",
+    "CLIPLoader",
+    "VAELoader",
+    "MiniMaxH3ImageToVideo",
+    "RandomNoise",
+    "BasicScheduler",
+    "KSamplerSelect",
+    "BasicGuider",
+    "SamplerCustomAdvanced",
+    "VAEDecode",
+    "VAEDecodeAudio",
+    "CreateVideo",
+    "SaveVideo"
+  ],
+  "allowedApiNodeClasses": [
+    "UNETLoader",
+    "CLIPLoader",
+    "VAELoader",
+    "MiniMaxH3ImageToVideo",
+    "RandomNoise",
+    "BasicScheduler",
+    "KSamplerSelect",
+    "BasicGuider",
+    "SamplerCustomAdvanced",
+    "VAEDecode",
+    "VAEDecodeAudio",
+    "CreateVideo",
+    "SaveVideo",
+    "LoraLoaderModelOnly"
+  ],
+  "allowedEditorNodeTypes": [
+    "UNETLoader",
+    "CLIPLoader",
+    "VAELoader",
+    "MiniMaxH3ImageToVideo",
+    "RandomNoise",
+    "BasicScheduler",
+    "KSamplerSelect",
+    "BasicGuider",
+    "SamplerCustomAdvanced",
+    "VAEDecode",
+    "VAEDecodeAudio",
+    "CreateVideo",
+    "SaveVideo",
+    "ResolutionSelector",
+    "MarkdownNote",
+    "ComfyMathExpression",
+    "PrimitiveFloat",
+    "ComfySwitchNode",
+    "PrimitiveInt",
+    "PrimitiveBoolean",
+    "LoraLoaderModelOnly",
+    "79dd8a95-ce9d-4c14-b264-2162e8bec5ce"
+  ],
+  "outputPrefixPolicy": "attempt-scoped-server-normalized"
+}
