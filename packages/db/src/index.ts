@@ -67,6 +67,14 @@ export async function runMigrations(pool: Pool): Promise<void> {
 
   try {
     await client.query('BEGIN');
+    // Integration workers and application instances can start together. Keep
+    // migration discovery and application single-writer so a new migration is
+    // never executed concurrently by two transactions.
+    await client.query(
+      `SELECT pg_advisory_xact_lock(
+         hashtextextended('h3-videoops-schema-migrations', 0)
+       )`,
+    );
     await client.query(`
       CREATE TABLE IF NOT EXISTS h3_schema_migrations (
         migration_id TEXT PRIMARY KEY,
@@ -179,6 +187,12 @@ export interface AttemptRepository {
     expectedVersion: number,
   ): Promise<GenerationAttempt>;
   claimNext(
+    workerId: string,
+    now: string,
+    leaseExpiresAt: string,
+  ): Promise<GenerationAttempt | null>;
+  /** Claim an in-flight attempt for reconciliation without resubmitting it. */
+  claimForRecovery(
     workerId: string,
     now: string,
     leaseExpiresAt: string,
@@ -427,6 +441,8 @@ export interface WorkflowRevisionRecord {
   readonly profileId: string;
   readonly profileVersion: string;
   readonly source: WorkflowRevisionSource;
+  readonly frontendVersion?: string;
+  readonly frontendCommit?: string;
   readonly authorType: string;
   readonly authorId: string;
   readonly editorGraphJson: Readonly<Record<string, unknown>>;
@@ -456,6 +472,10 @@ export interface WorkflowRevisionRepository {
     tenantId: Uuid,
     projectId: Uuid,
     shotId: Uuid,
+    revisionId: Uuid,
+  ): Promise<WorkflowRevisionRecord | null>;
+  findByIdAny(
+    tenantId: Uuid,
     revisionId: Uuid,
   ): Promise<WorkflowRevisionRecord | null>;
   listByShot(
@@ -804,6 +824,8 @@ interface WorkflowRevisionRow extends QueryResultRow {
   profile_id: string;
   profile_version: string;
   source: string;
+  frontend_version: string | null;
+  frontend_commit: string | null;
   author_type: string;
   author_id: string;
   editor_graph_json: unknown;
@@ -1054,6 +1076,20 @@ function assertWorkflowRevisionRecord(revision: WorkflowRevisionRecord): void {
     throw new RepositoryError(
       'INVALID_ARGUMENT',
       'Workflow revision source is unknown.',
+    );
+  }
+  if (revision.frontendVersion !== undefined) {
+    assertBoundedText(
+      revision.frontendVersion,
+      'Workflow revision frontend version',
+      128,
+    );
+  }
+  if (revision.frontendCommit !== undefined) {
+    assertBoundedText(
+      revision.frontendCommit,
+      'Workflow revision frontend commit',
+      128,
     );
   }
   assertBoundedText(revision.authorType, 'Workflow revision author type', 64);
@@ -1686,6 +1722,8 @@ function mapWorkflowRevision(row: WorkflowRevisionRow): WorkflowRevisionRecord {
     profileId: row.profile_id,
     profileVersion: row.profile_version,
     source: row.source as WorkflowRevisionSource,
+    ...(row.frontend_version ? { frontendVersion: row.frontend_version } : {}),
+    ...(row.frontend_commit ? { frontendCommit: row.frontend_commit } : {}),
     authorType: row.author_type,
     authorId: row.author_id,
     editorGraphJson: databaseJsonRecord(
@@ -1794,6 +1832,9 @@ function mapEvent(row: EventRow): DomainEvent {
   const traceId = row.trace_id ?? undefined;
   const event: DomainEvent = {
     id: assertUuid(row.id),
+    ...(row.event_sequence !== undefined
+      ? { eventSequence: Number(row.event_sequence) }
+      : {}),
     type: parseDomainEventType(row.type),
     version: row.version,
     occurredAt: databaseTimestamp(row.occurred_at) as DomainEvent['occurredAt'],
@@ -2504,6 +2545,46 @@ class PostgresAttemptRepository implements AttemptRepository {
     return row ? mapAttempt(row) : null;
   }
 
+  async claimForRecovery(
+    workerId: string,
+    now: string,
+    leaseExpiresAt: string,
+  ): Promise<GenerationAttempt | null> {
+    const result = await this.executor.query<AttemptRow>(
+      `WITH candidate AS (
+        SELECT id
+        FROM generation_attempts
+        WHERE status IN ('submitting', 'submitted', 'running', 'generated', 'evaluating')
+          AND (lease_expires_at IS NULL OR lease_expires_at < $2)
+          AND NOT EXISTS (
+            SELECT 1
+            FROM generation_attempts active
+            WHERE active.lease_owner = $1
+              AND active.lease_expires_at IS NOT NULL
+              AND active.lease_expires_at >= $2
+              AND active.status IN (
+                'claimed', 'submitting', 'submitted', 'running',
+                'generated', 'evaluating'
+              )
+          )
+        ORDER BY updated_at, id
+        FOR UPDATE SKIP LOCKED
+        LIMIT 1
+      )
+      UPDATE generation_attempts attempt
+      SET lease_owner = $1,
+          lease_expires_at = $3,
+          version = attempt.version + 1,
+          updated_at = $2
+      FROM candidate
+      WHERE attempt.id = candidate.id
+      RETURNING attempt.*`,
+      [workerId, now, leaseExpiresAt],
+    );
+    const row = result.rows[0];
+    return row ? mapAttempt(row) : null;
+  }
+
   async heartbeat(
     attemptId: Uuid,
     workerId: string,
@@ -2530,7 +2611,10 @@ class PostgresAttemptRepository implements AttemptRepository {
   ): Promise<GenerationAttempt | null> {
     const result = await this.executor.query<AttemptRow>(
       `UPDATE generation_attempts
-       SET status = 'queued',
+       SET status = CASE
+         WHEN status = 'claimed' THEN 'queued'
+         ELSE status
+       END,
            lease_owner = NULL,
            lease_expires_at = NULL,
            version = version + 1,
@@ -2554,7 +2638,7 @@ class PostgresAttemptRepository implements AttemptRepository {
            updated_at = $1
        WHERE lease_expires_at IS NOT NULL
          AND lease_expires_at < $1
-         AND status IN ('claimed', 'submitting', 'submitted', 'running', 'generated', 'evaluating')
+         AND status = 'claimed'
        RETURNING *`,
       [now],
     );
@@ -3059,6 +3143,17 @@ class PostgresWorkflowRevisionRepository implements WorkflowRevisionRepository {
       return existing;
     }
     try {
+      // Serialize revision-number allocation per shot. The unique constraint
+      // remains a final guard, while the advisory lock prevents concurrent
+      // transactions from selecting the same MAX(revision_number) + 1.
+      await this.executor.query(
+        `SELECT pg_advisory_xact_lock(
+           hashtextextended($1, 0)
+         )`,
+        [
+          `workflow-revision:${revision.tenantId}:${revision.projectId}:${revision.shotId}`,
+        ],
+      );
       const nextNumber = await this.executor.query<{ revision_number: number }>(
         `SELECT COALESCE(MAX(revision_number), 0) + 1 AS revision_number
          FROM workflow_revisions
@@ -3078,9 +3173,11 @@ class PostgresWorkflowRevisionRepository implements WorkflowRevisionRepository {
           parent_revision_id, profile_id, profile_version, source, author_type,
           author_id, editor_graph_json, api_graph_json, execution_hash,
           execution_parameters_json, validation_status, validation_errors_json,
-          validated_at, executor_fingerprint, created_at
+          validated_at, executor_fingerprint, frontend_version, frontend_commit,
+          created_at
         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb,
-          $13::jsonb, $14, $15::jsonb, $16, $17::jsonb, $18, $19, $20)
+          $13::jsonb, $14, $15::jsonb, $16, $17::jsonb, $18, $19, $20, $21,
+          $22)
         RETURNING *`,
         [
           revision.id,
@@ -3102,6 +3199,8 @@ class PostgresWorkflowRevisionRepository implements WorkflowRevisionRepository {
           databaseJson(revision.validationErrorsJson),
           revision.validatedAt ?? null,
           revision.executorFingerprint ?? null,
+          revision.frontendVersion ?? null,
+          revision.frontendCommit ?? null,
           revision.createdAt,
         ],
       );
@@ -3141,6 +3240,19 @@ class PostgresWorkflowRevisionRepository implements WorkflowRevisionRepository {
       `SELECT * FROM workflow_revisions
        WHERE tenant_id = $1 AND project_id = $2 AND shot_id = $3 AND id = $4`,
       [tenantId, projectId, shotId, revisionId],
+    );
+    const row = result.rows[0];
+    return row ? mapWorkflowRevision(row) : null;
+  }
+
+  async findByIdAny(
+    tenantId: Uuid,
+    revisionId: Uuid,
+  ): Promise<WorkflowRevisionRecord | null> {
+    const result = await this.executor.query<WorkflowRevisionRow>(
+      `SELECT * FROM workflow_revisions
+       WHERE tenant_id = $1 AND id = $2`,
+      [tenantId, revisionId],
     );
     const row = result.rows[0];
     return row ? mapWorkflowRevision(row) : null;
@@ -3614,6 +3726,7 @@ interface MemoryState {
   readonly workflowRevisions: Map<Uuid, WorkflowRevisionRecord>;
   readonly recommendations: Map<Uuid, OperationalRecommendationRecord>;
   readonly events: Map<Uuid, DomainEvent>;
+  nextEventSequence: number;
   readonly outbox: Map<
     Uuid,
     OutboxMessage & {
@@ -3639,6 +3752,7 @@ function emptyMemoryState(): MemoryState {
     workflowRevisions: new Map(),
     recommendations: new Map(),
     events: new Map(),
+    nextEventSequence: 1,
     outbox: new Map(),
     idempotency: new Map(),
   };
@@ -3724,6 +3838,7 @@ function cloneMemoryState(state: MemoryState): MemoryState {
         { ...event, payload: { ...event.payload } },
       ]),
     ),
+    nextEventSequence: state.nextEventSequence,
     outbox: new Map(
       [...state.outbox].map(([id, message]) => [id, { ...message }]),
     ),
@@ -4100,6 +4215,54 @@ class MemoryRepositories implements Repositories {
         this.state.attempts.set(candidate.id, claimed);
         return { ...claimed };
       },
+      claimForRecovery: async (workerId, now, leaseExpiresAt) => {
+        const activeStatuses = new Set([
+          'claimed',
+          'submitting',
+          'submitted',
+          'running',
+          'generated',
+          'evaluating',
+        ]);
+        const hasActiveClaim = [...this.state.attempts.values()].some(
+          (attempt) =>
+            attempt.leaseOwner === workerId &&
+            attempt.leaseExpiresAt !== undefined &&
+            attempt.leaseExpiresAt >= now &&
+            activeStatuses.has(attempt.status),
+        );
+        if (hasActiveClaim) return null;
+        const candidate = [...this.state.attempts.values()]
+          .filter(
+            (attempt) =>
+              [
+                'submitting',
+                'submitted',
+                'running',
+                'generated',
+                'evaluating',
+              ].includes(attempt.status) &&
+              (attempt.leaseExpiresAt === undefined ||
+                attempt.leaseExpiresAt < now),
+          )
+          .sort(
+            (left, right) =>
+              left.updatedAt.localeCompare(right.updatedAt) ||
+              left.id.localeCompare(right.id),
+          )[0];
+        if (!candidate) return null;
+        const recovered: GenerationAttempt = {
+          ...candidate,
+          leaseOwner: workerId,
+          leaseExpiresAt: leaseExpiresAt as NonNullable<
+            GenerationAttempt['leaseExpiresAt']
+          >,
+          version: candidate.version + 1,
+          updatedAt: now as GenerationAttempt['updatedAt'],
+        };
+        this.state.attempts.set(candidate.id, recovered);
+        return { ...recovered };
+      },
       heartbeat: async (attemptId, workerId, leaseExpiresAt) => {
         const current = this.state.attempts.get(attemptId);
         if (
@@ -4150,7 +4313,7 @@ class MemoryRepositories implements Repositories {
         } = current;
         const released: GenerationAttempt = {
           ...withoutLease,
-          status: 'queued',
+          ...(current.status === 'claimed' ? { status: 'queued' } : {}),
           version: current.version + 1,
           updatedAt: updatedAt as GenerationAttempt['updatedAt'],
         };
@@ -4158,20 +4321,12 @@ class MemoryRepositories implements Repositories {
         return { ...released };
       },
       recoverStale: async (now) => {
-        const activeStatuses = new Set([
-          'claimed',
-          'submitting',
-          'submitted',
-          'running',
-          'generated',
-          'evaluating',
-        ]);
         const recovered: GenerationAttempt[] = [];
         for (const current of this.state.attempts.values()) {
           if (
             !current.leaseExpiresAt ||
             current.leaseExpiresAt >= now ||
-            !activeStatuses.has(current.status)
+            current.status !== 'claimed'
           ) {
             continue;
           }
@@ -4638,6 +4793,12 @@ class MemoryRepositories implements Repositories {
           ? copyRevision(revision)
           : null;
       },
+      findByIdAny: async (tenantId, revisionId) => {
+        const revision = this.state.workflowRevisions.get(revisionId);
+        return revision && revision.tenantId === tenantId
+          ? copyRevision(revision)
+          : null;
+      },
       listByShot: async (tenantId, projectId, shotId) =>
         [...this.state.workflowRevisions.values()]
           .filter(
@@ -4836,12 +4997,18 @@ class MemoryRepositories implements Repositories {
         }
         this.state.events.set(event.id, {
           ...event,
+          eventSequence: this.state.nextEventSequence,
           payload: { ...event.payload },
         });
+        this.state.nextEventSequence += 1;
       },
       listByProject: async (projectId) =>
         [...this.state.events.values()]
           .filter((event) => event.projectId === projectId)
+          .sort(
+            (left, right) =>
+              (left.eventSequence ?? 0) - (right.eventSequence ?? 0),
+          )
           .map((event) => ({ ...event, payload: { ...event.payload } })),
       listOrphans: async (tenantId) =>
         [...this.state.events.values()]
@@ -4850,6 +5017,10 @@ class MemoryRepositories implements Repositories {
               event.tenantId === tenantId &&
               event.projectId === undefined &&
               event.type === 'orphan.event',
+          )
+          .sort(
+            (left, right) =>
+              (left.eventSequence ?? 0) - (right.eventSequence ?? 0),
           )
           .map((event) => ({ ...event, payload: { ...event.payload } })),
     };

@@ -35,7 +35,10 @@ import {
   RepositoryError,
   runMigrations,
   type Repositories,
+  type OperationalRecommendationRecord,
   type TransactionalStore,
+  type WorkflowDraftRecord,
+  type WorkflowRevisionRecord,
 } from '@h3/db';
 import { getApiConfig, type ApiConfig } from '@h3/config';
 import {
@@ -44,8 +47,13 @@ import {
   type AgentTelemetry,
 } from '@h3/telemetry';
 import { createLocalArtifactStore, type ArtifactStore } from '@h3/object-store';
-import type { ComfyClient } from '@h3/comfy-client';
+import {
+  type ComfyClient,
+  type ComfyQueueResponse,
+  type ComfyReadiness,
+} from '@h3/comfy-client';
 import type { MediaEvaluator } from '@h3/evaluator';
+import { MINIMAX_H3_PROFILE_ID } from '@h3/workflow-compiler';
 import {
   ApplicationError,
   DEV_TENANT_ID,
@@ -62,7 +70,14 @@ import {
   GenerationApplicationError,
   GenerationWorker,
   type CreateAttemptCommand,
+  type CreateManagedAttemptCommand,
+  type RetryAttemptCommand,
 } from './generation.js';
+import {
+  WorkflowApplicationError,
+  WorkflowApplicationService,
+  type WorkflowGraph,
+} from './workflow.js';
 
 export interface ApiLiveResponse {
   readonly service: 'api';
@@ -160,8 +175,59 @@ const rejectAttemptBodySchema = z
   .object({ reasonCode: z.string().trim().min(1).max(64) })
   .strict();
 
+const workflowDraftBodySchema = z
+  .object({
+    editorGraph: z.unknown().optional(),
+    editorGraphJson: z.unknown().optional(),
+    lastApiGraph: z.unknown().nullable().optional(),
+    lastApiGraphJson: z.unknown().nullable().optional(),
+    baseRevisionId: z.string().uuid().nullable().optional(),
+    profileId: z.string().trim().min(1).max(128).optional(),
+    profileVersion: z.string().trim().min(1).max(64).optional(),
+    authorType: z.string().trim().min(1).max(64).optional(),
+    authorId: z.string().trim().min(1).max(200).optional(),
+    expectedVersion: z.number().int().positive().optional(),
+  })
+  .strict();
+
+const workflowRevisionBodySchema = z
+  .object({
+    editorGraph: z.unknown().optional(),
+    editorGraphJson: z.unknown().optional(),
+    apiGraph: z.unknown().optional(),
+    apiGraphJson: z.unknown().optional(),
+    parentRevisionId: z.string().uuid().nullable().optional(),
+    profileId: z.string().trim().min(1).max(128).optional(),
+    profileVersion: z.string().trim().min(1).max(64).optional(),
+    source: z.enum(['comfy_editor', 'official_template', 'system']).optional(),
+    frontendVersion: z.string().trim().min(1).max(128).optional(),
+    frontendCommit: z.string().trim().min(1).max(128).optional(),
+    authorType: z.string().trim().min(1).max(64).optional(),
+    authorId: z.string().trim().min(1).max(200).optional(),
+  })
+  .strict();
+
+const managedAttemptBodySchema = z
+  .object({ workflowRevisionId: z.string().uuid() })
+  .strict();
+
+const retryAttemptBodySchema = z
+  .object({ resolveUncertain: z.literal(true).optional() })
+  .strict();
+
+const recommendationActionBodySchema = z
+  .object({ expectedVersion: z.number().int().positive().optional() })
+  // Action and execution fields in the body are deliberately ignored; the
+  // persisted recommendation is the only source of truth for the operation.
+  .passthrough();
+
 type CreateAttemptBody = z.infer<typeof createAttemptBodySchema>;
 type RejectAttemptBody = z.infer<typeof rejectAttemptBodySchema>;
+type WorkflowDraftBody = z.infer<typeof workflowDraftBodySchema>;
+type WorkflowRevisionBody = z.infer<typeof workflowRevisionBodySchema>;
+type ManagedAttemptBody = z.infer<typeof managedAttemptBodySchema>;
+type RetryAttemptBody = z.infer<typeof retryAttemptBodySchema>;
+type RecommendationActionBody = z.infer<typeof recommendationActionBodySchema>;
 
 type CreateProjectBody = z.infer<typeof createProjectBodySchema>;
 type ApproveStoryboardBody = z.infer<typeof approveStoryboardBodySchema>;
@@ -256,6 +322,7 @@ const eventJsonSchema = {
   ],
   properties: {
     id: { type: 'string', format: 'uuid' },
+    eventSequence: { type: 'integer', minimum: 1 },
     type: { type: 'string' },
     version: { type: 'integer' },
     occurredAt: { type: 'string', format: 'date-time' },
@@ -368,6 +435,7 @@ const attemptJsonSchema = {
     requestedHeight: { type: 'integer' },
     requestedDurationSeconds: { type: 'number' },
     workflowVersionId: { type: 'string', format: 'uuid' },
+    workflowRevisionId: { type: 'string', format: 'uuid' },
     workflowHash: { type: 'string' },
     correlationId: { type: 'string' },
     traceId: { type: 'string' },
@@ -528,6 +596,7 @@ function attemptResponse(attempt: GenerationAttempt): Record<string, unknown> {
   };
   const optional: ReadonlyArray<[string, unknown]> = [
     ['workflowVersionId', attempt.workflowVersionId],
+    ['workflowRevisionId', attempt.workflowRevisionId],
     ['traceId', attempt.traceId],
     ['scenario', attempt.scenario],
     ['comfyPromptId', attempt.comfyPromptId],
@@ -573,12 +642,267 @@ function eventResponse(event: DomainEvent): Record<string, unknown> {
     tenantId: event.tenantId,
     payload: event.payload,
   };
+  if (event.eventSequence !== undefined) {
+    response.eventSequence = event.eventSequence;
+  }
   if (event.projectId) response.projectId = event.projectId;
   if (event.shotId) response.shotId = event.shotId;
   if (event.attemptId) response.attemptId = event.attemptId;
   if (event.promptId) response.promptId = event.promptId;
   if (event.traceId) response.traceId = event.traceId;
   return response;
+}
+
+function workflowDraftResponse(
+  draft: WorkflowDraftRecord | null,
+): Record<string, unknown> {
+  if (!draft) return { draft: null };
+  return {
+    draft: {
+      id: draft.id,
+      tenantId: draft.tenantId,
+      projectId: draft.projectId,
+      shotId: draft.shotId,
+      ...(draft.baseRevisionId ? { baseRevisionId: draft.baseRevisionId } : {}),
+      profileId: draft.profileId,
+      profileVersion: draft.profileVersion,
+      editorGraph: draft.editorGraphJson,
+      editorGraphJson: draft.editorGraphJson,
+      ...(draft.lastApiGraphJson
+        ? {
+            lastApiGraph: draft.lastApiGraphJson,
+            lastApiGraphJson: draft.lastApiGraphJson,
+          }
+        : {}),
+      authorType: draft.authorType,
+      authorId: draft.authorId,
+      version: draft.version,
+      createdAt: draft.createdAt,
+      updatedAt: draft.updatedAt,
+    },
+  };
+}
+
+function workflowRevisionResponse(
+  revision: WorkflowRevisionRecord,
+): Record<string, unknown> {
+  return {
+    id: revision.id,
+    tenantId: revision.tenantId,
+    projectId: revision.projectId,
+    shotId: revision.shotId,
+    revisionNumber: revision.revisionNumber,
+    ...(revision.parentRevisionId
+      ? { parentRevisionId: revision.parentRevisionId }
+      : {}),
+    profileId: revision.profileId,
+    profileVersion: revision.profileVersion,
+    source: revision.source,
+    ...(revision.frontendVersion
+      ? { frontendVersion: revision.frontendVersion }
+      : {}),
+    ...(revision.frontendCommit
+      ? { frontendCommit: revision.frontendCommit }
+      : {}),
+    authorType: revision.authorType,
+    authorId: revision.authorId,
+    editorGraph: revision.editorGraphJson,
+    editorGraphJson: revision.editorGraphJson,
+    apiGraph: revision.apiGraphJson,
+    apiGraphJson: revision.apiGraphJson,
+    executionHash: revision.executionHash,
+    executionParameters: revision.executionParametersJson,
+    validationStatus: revision.validationStatus,
+    validationErrors: revision.validationErrorsJson,
+    ...(revision.validatedAt ? { validatedAt: revision.validatedAt } : {}),
+    ...(revision.executorFingerprint
+      ? { executorFingerprint: revision.executorFingerprint }
+      : {}),
+    createdAt: revision.createdAt,
+  };
+}
+
+function validationResponse(validation: unknown): Record<string, unknown> {
+  if (typeof validation !== 'object' || validation === null) {
+    return { valid: false, errors: [] };
+  }
+  const value = validation as Record<string, unknown>;
+  return {
+    valid: value.valid === true,
+    profileId: value.profileId,
+    profileVersion: value.profileVersion,
+    errors: Array.isArray(value.errors)
+      ? value.errors.map((issue) => {
+          if (typeof issue !== 'object' || issue === null) {
+            return {
+              code: 'INVALID_VALIDATION',
+              message: 'Invalid validation issue.',
+            };
+          }
+          const record = issue as Record<string, unknown>;
+          return {
+            code:
+              typeof record.code === 'string'
+                ? record.code
+                : 'INVALID_VALIDATION',
+            message:
+              typeof record.message === 'string'
+                ? record.message
+                : 'The workflow validation issue is invalid.',
+          };
+        })
+      : [],
+    ...(typeof value.executorFingerprint === 'string'
+      ? { executorFingerprint: value.executorFingerprint }
+      : {}),
+  };
+}
+
+function recommendationResponse(
+  recommendation: OperationalRecommendationRecord,
+): Record<string, unknown> {
+  return {
+    id: recommendation.id,
+    projectId: recommendation.projectId,
+    ...(recommendation.shotId ? { shotId: recommendation.shotId } : {}),
+    ...(recommendation.attemptId
+      ? { attemptId: recommendation.attemptId }
+      : {}),
+    triggerEventId: recommendation.triggerEventId,
+    severity: recommendation.severity,
+    recommendationCode: recommendation.recommendationCode,
+    title: recommendation.title,
+    detail: recommendation.detail,
+    evidenceReferences: recommendation.evidenceReferencesJson,
+    proposedActionType: recommendation.proposedActionType,
+    proposedResourceIds: recommendation.proposedResourceIdsJson,
+    status: recommendation.status,
+    version: recommendation.version,
+    createdAt: recommendation.createdAt,
+    updatedAt: recommendation.updatedAt,
+  };
+}
+
+function safeReadinessResponse(
+  readiness: ComfyReadiness,
+): Record<string, unknown> {
+  return {
+    ready: readiness.ready,
+    checkedAt: readiness.checkedAt,
+    ...(readiness.apiVersion ? { apiVersion: readiness.apiVersion } : {}),
+    ...(readiness.capabilityFingerprint
+      ? { capabilityFingerprint: readiness.capabilityFingerprint }
+      : {}),
+    ...(readiness.errorCode ? { errorCode: readiness.errorCode } : {}),
+  };
+}
+
+function safeQueueCounts(queue: ComfyQueueResponse): {
+  pending: number;
+  running: number;
+} {
+  return {
+    pending: queue.queuePending.length,
+    running: queue.queueRunning.length,
+  };
+}
+
+const SSE_PAYLOAD_KEYS = new Set([
+  'status',
+  'code',
+  'recoverable',
+  'value',
+  'max',
+  'artifactId',
+  'evaluationId',
+  'evaluatorVersion',
+  'reasonCode',
+  'workflowRevisionId',
+  'sourceAttemptId',
+  'estimatedCostMicrousd',
+  'acceptedShotCount',
+  'shotCount',
+  'ordinal',
+]);
+
+function sanitizedEventSummary(event: DomainEvent): Record<string, unknown> {
+  const payload: Record<string, unknown> = {};
+  for (const key of SSE_PAYLOAD_KEYS) {
+    const value = event.payload[key];
+    if (
+      typeof value === 'string' ||
+      typeof value === 'number' ||
+      typeof value === 'boolean'
+    ) {
+      payload[key] = value;
+    }
+  }
+  return {
+    id: event.id,
+    ...(event.eventSequence !== undefined
+      ? { eventSequence: event.eventSequence }
+      : {}),
+    type: event.type,
+    version: event.version,
+    occurredAt: event.occurredAt,
+    ...(event.projectId ? { projectId: event.projectId } : {}),
+    ...(event.shotId ? { shotId: event.shotId } : {}),
+    ...(event.attemptId ? { attemptId: event.attemptId } : {}),
+    payload,
+  };
+}
+
+interface ByteRange {
+  readonly start: number;
+  readonly end: number;
+}
+
+function parseByteRange(
+  header: string | undefined,
+  byteSize: number,
+): ByteRange | undefined {
+  if (header === undefined) return undefined;
+  const match = /^bytes=(\d*)-(\d*)$/.exec(header.trim());
+  if (!match || byteSize <= 0) return undefined;
+  const [, startText, endText] = match;
+  if (!startText && !endText) return undefined;
+  if (!startText) {
+    const suffixLength = Number(endText);
+    if (!Number.isSafeInteger(suffixLength) || suffixLength <= 0)
+      return undefined;
+    const length = Math.min(suffixLength, byteSize);
+    return { start: byteSize - length, end: byteSize - 1 };
+  }
+  const start = Number(startText);
+  if (!Number.isSafeInteger(start) || start < 0 || start >= byteSize) {
+    return undefined;
+  }
+  const requestedEnd = endText ? Number(endText) : byteSize - 1;
+  if (!Number.isSafeInteger(requestedEnd) || requestedEnd < start) {
+    return undefined;
+  }
+  return { start, end: Math.min(requestedEnd, byteSize - 1) };
+}
+
+function rangeProblem(
+  request: FastifyRequest,
+  reply: FastifyReply,
+  byteSize: number,
+): FastifyReply {
+  const problem: ProblemDetails = {
+    type: 'https://h3.videoops/problems/range_not_satisfiable',
+    title: 'Range Not Satisfiable',
+    status: 416,
+    code: 'RANGE_NOT_SATISFIABLE',
+    traceId: traceIdFor(request),
+    retryable: false,
+    detail: 'The requested byte range is invalid or cannot be satisfied.',
+  };
+  return reply
+    .code(416)
+    .header('content-range', `bytes */${byteSize}`)
+    .type('application/problem+json')
+    .send(problem);
 }
 
 function params(request: FastifyRequest): { readonly projectId: string } {
@@ -596,7 +920,12 @@ function params(request: FastifyRequest): { readonly projectId: string } {
 
 function resourceParam(
   request: FastifyRequest,
-  name: 'shotId' | 'attemptId' | 'artifactId',
+  name:
+    | 'shotId'
+    | 'attemptId'
+    | 'artifactId'
+    | 'revisionId'
+    | 'recommendationId',
 ): Uuid {
   const candidate = request.params as Record<string, unknown>;
   if (typeof candidate[name] !== 'string') {
@@ -614,6 +943,52 @@ function resourceParam(
       'INVALID_PATH_PARAMETER',
       'The resource identifier is invalid.',
       400,
+      false,
+    );
+  }
+}
+
+function bodyGraph(
+  body: WorkflowDraftBody | WorkflowRevisionBody,
+  primary: 'editorGraph' | 'apiGraph',
+  legacy: 'editorGraphJson' | 'apiGraphJson',
+  label: string,
+): WorkflowGraph {
+  const record = body as Record<string, unknown>;
+  const value = record[primary] ?? record[legacy];
+  if (value === undefined) {
+    throw new HttpProblemError(
+      'INVALID_REQUEST',
+      `${label} is required.`,
+      422,
+      false,
+    );
+  }
+  return value as WorkflowGraph;
+}
+
+function bodyOptionalGraph(
+  body: WorkflowDraftBody,
+): WorkflowGraph | null | undefined {
+  return body.lastApiGraph !== undefined
+    ? (body.lastApiGraph as WorkflowGraph | null)
+    : body.lastApiGraphJson !== undefined
+      ? (body.lastApiGraphJson as WorkflowGraph | null)
+      : undefined;
+}
+
+function bodyUuid(
+  value: string | null | undefined,
+  label: string,
+): Uuid | null | undefined {
+  if (value === undefined || value === null) return value;
+  try {
+    return assertProjectUuid(value);
+  } catch {
+    throw new HttpProblemError(
+      'INVALID_REQUEST',
+      `${label} is invalid.`,
+      422,
       false,
     );
   }
@@ -894,6 +1269,11 @@ function sendProblem(
     code = error.code;
     retryable = error.retryable;
     detail = error.message;
+  } else if (error instanceof WorkflowApplicationError) {
+    status = error.status;
+    code = error.code;
+    retryable = error.retryable;
+    detail = error.message;
   } else if (error instanceof PlanningAgentError) {
     status = error.status;
     code = error.code;
@@ -942,6 +1322,60 @@ function sendProblem(
 }
 
 function baseRouteSchemas() {
+  const workflowGraphJson = {
+    type: 'object',
+    additionalProperties: true,
+  } as const;
+  const workflowDraft = {
+    type: 'object',
+    properties: {
+      id: { type: 'string', format: 'uuid' },
+      tenantId: { type: 'string', format: 'uuid' },
+      projectId: { type: 'string', format: 'uuid' },
+      shotId: { type: 'string', format: 'uuid' },
+      baseRevisionId: { type: 'string', format: 'uuid' },
+      profileId: { type: 'string' },
+      profileVersion: { type: 'string' },
+      editorGraph: workflowGraphJson,
+      editorGraphJson: workflowGraphJson,
+      lastApiGraph: workflowGraphJson,
+      lastApiGraphJson: workflowGraphJson,
+      authorType: { type: 'string' },
+      authorId: { type: 'string' },
+      version: { type: 'integer' },
+      createdAt: { type: 'string', format: 'date-time' },
+      updatedAt: { type: 'string', format: 'date-time' },
+    },
+  } as const;
+  const workflowRevision = {
+    type: 'object',
+    properties: {
+      id: { type: 'string', format: 'uuid' },
+      tenantId: { type: 'string', format: 'uuid' },
+      projectId: { type: 'string', format: 'uuid' },
+      shotId: { type: 'string', format: 'uuid' },
+      revisionNumber: { type: 'integer' },
+      parentRevisionId: { type: 'string', format: 'uuid' },
+      profileId: { type: 'string' },
+      profileVersion: { type: 'string' },
+      source: { type: 'string' },
+      frontendVersion: { type: 'string' },
+      frontendCommit: { type: 'string' },
+      authorType: { type: 'string' },
+      authorId: { type: 'string' },
+      editorGraph: workflowGraphJson,
+      editorGraphJson: workflowGraphJson,
+      apiGraph: workflowGraphJson,
+      apiGraphJson: workflowGraphJson,
+      executionHash: { type: 'string' },
+      executionParameters: workflowGraphJson,
+      validationStatus: { type: 'string' },
+      validationErrors: { type: 'array' },
+      validatedAt: { type: 'string', format: 'date-time' },
+      executorFingerprint: { type: 'string' },
+      createdAt: { type: 'string', format: 'date-time' },
+    },
+  } as const;
   return {
     projectResponse: {
       type: 'object',
@@ -1008,6 +1442,59 @@ function baseRouteSchemas() {
         project: projectJsonSchema,
       },
     },
+    executorResponse: {
+      type: 'object',
+      properties: {
+        mode: { type: 'string', enum: ['fake', 'remote'] },
+        readiness: { type: 'object', additionalProperties: true },
+        frontendUrl: { type: 'string', format: 'uri' },
+        activeProfileIds: { type: 'array', items: { type: 'string' } },
+        capabilityFingerprint: { type: 'string' },
+        capabilityValidatedAt: { type: 'string', format: 'date-time' },
+        worker: { type: 'object', additionalProperties: true },
+      },
+    },
+    workflowDraftResponse: {
+      type: 'object',
+      required: ['draft'],
+      properties: { draft: { anyOf: [workflowDraft, { type: 'null' }] } },
+    },
+    workflowRevisionResponse: {
+      type: 'object',
+      required: ['revision'],
+      properties: { revision: workflowRevision },
+    },
+    workflowRevisionsResponse: {
+      type: 'object',
+      required: ['revisions'],
+      properties: { revisions: { type: 'array', items: workflowRevision } },
+    },
+    workflowValidationResponse: {
+      type: 'object',
+      required: ['revision', 'validation'],
+      properties: {
+        revision: workflowRevision,
+        validation: { type: 'object', additionalProperties: true },
+      },
+    },
+    recommendationsResponse: {
+      type: 'object',
+      required: ['recommendations'],
+      properties: {
+        recommendations: {
+          type: 'array',
+          items: { type: 'object', additionalProperties: true },
+        },
+      },
+    },
+    recommendationResponse: {
+      type: 'object',
+      required: ['recommendation'],
+      properties: {
+        recommendation: { type: 'object', additionalProperties: true },
+        attempt: attemptJsonSchema,
+      },
+    },
   } as const;
 }
 
@@ -1032,6 +1519,14 @@ export function buildApiApp(options: ApiAppOptions = {}): FastifyInstance {
     artifactStore:
       options.artifactStore ?? createLocalArtifactStore(config.artifactRoot),
     ...(options.evaluator ? { evaluator: options.evaluator } : {}),
+  });
+  const workflowService = new WorkflowApplicationService({
+    store,
+    tenantId: DEV_TENANT_ID,
+    idGenerator,
+    clock,
+    executor: generationService.comfyClient,
+    requireExecutor: true,
   });
   let projectService: ProjectApplicationService | undefined;
   const telemetry = options.telemetry ?? new OpenTelemetryTelemetry();
@@ -1124,6 +1619,7 @@ export function buildApiApp(options: ApiAppOptions = {}): FastifyInstance {
   });
 
   app.decorate('generationService', generationService);
+  app.decorate('workflowService', workflowService);
   app.decorate('generationWorker', generationWorker);
   if (options.startGenerationWorker) {
     void generationWorker.run();
@@ -1194,6 +1690,59 @@ export function buildApiApp(options: ApiAppOptions = {}): FastifyInstance {
               dependencies: { postgres: 'unavailable' },
             };
         return ready ? response : reply.code(503).send(response);
+      },
+    );
+
+    routes.get(
+      '/v1/executor',
+      {
+        schema: {
+          tags: ['generation'],
+          summary: 'Get safe executor readiness and worker state',
+          response: { 200: schemas.executorResponse },
+        },
+      },
+      async () => {
+        let readiness: ComfyReadiness;
+        try {
+          readiness = await generationService.comfyClient.checkReady();
+        } catch {
+          readiness = {
+            ready: false,
+            checkedAt: toIsoUtc(clock.now()),
+            errorCode: 'COMFY_UNAVAILABLE',
+          };
+        }
+        let queue: { pending: number; running: number } = {
+          pending: 0,
+          running: 0,
+        };
+        if (readiness.ready) {
+          try {
+            queue = safeQueueCounts(
+              await generationService.comfyClient.getQueue(),
+            );
+          } catch {
+            queue = { pending: 0, running: 0 };
+          }
+        }
+        return {
+          mode: config.comfyMode,
+          readiness: safeReadinessResponse(readiness),
+          ...(config.comfyMode === 'remote'
+            ? { frontendUrl: config.comfyFrontendUrl }
+            : {}),
+          activeProfileIds: [MINIMAX_H3_PROFILE_ID],
+          ...(readiness.capabilityFingerprint
+            ? { capabilityFingerprint: readiness.capabilityFingerprint }
+            : {}),
+          capabilityValidatedAt: readiness.checkedAt,
+          worker: {
+            state: options.startGenerationWorker ? 'running' : 'idle',
+            queuePending: queue.pending,
+            queueRunning: queue.running,
+          },
+        };
       },
     );
 
@@ -1385,6 +1934,237 @@ export function buildApiApp(options: ApiAppOptions = {}): FastifyInstance {
     );
 
     routes.get(
+      '/v1/projects/:projectId/shots/:shotId/workflow-draft',
+      {
+        schema: {
+          tags: ['generation'],
+          summary: 'Get the editable workflow draft for a shot',
+          response: { 200: schemas.workflowDraftResponse },
+        },
+      },
+      async (request) => ({
+        ...(await workflowDraftResponse(
+          await workflowService.getWorkflowDraft(
+            parseProjectId(request),
+            resourceParam(request, 'shotId'),
+          ),
+        )),
+      }),
+    );
+
+    routes.put(
+      '/v1/projects/:projectId/shots/:shotId/workflow-draft',
+      {
+        schema: {
+          tags: ['generation'],
+          summary: 'Create or update a scoped workflow draft',
+          body: {
+            type: 'object',
+            additionalProperties: true,
+          },
+          response: { 200: schemas.workflowDraftResponse },
+        },
+      },
+      async (request, reply) => {
+        const projectId = parseProjectId(request);
+        const shotId = resourceParam(request, 'shotId');
+        const body = parseBody(
+          workflowDraftBodySchema,
+          request.body,
+        ) as WorkflowDraftBody;
+        const key = idempotencyKey(request);
+        const editorGraphJson = bodyGraph(
+          body,
+          'editorGraph',
+          'editorGraphJson',
+          'editorGraph',
+        );
+        const lastApiGraphJson = bodyOptionalGraph(body);
+        const baseRevisionId = bodyUuid(body.baseRevisionId, 'baseRevisionId');
+        const command = {
+          idempotencyKey: key,
+          editorGraphJson,
+          ...(lastApiGraphJson !== undefined ? { lastApiGraphJson } : {}),
+          ...(baseRevisionId !== undefined ? { baseRevisionId } : {}),
+          ...(body.profileId !== undefined
+            ? { profileId: body.profileId }
+            : {}),
+          ...(body.profileVersion !== undefined
+            ? { profileVersion: body.profileVersion }
+            : {}),
+          authorType: body.authorType ?? 'development_user',
+          authorId: body.authorId ?? 'development-user',
+          ...(body.expectedVersion !== undefined
+            ? { expectedVersion: body.expectedVersion }
+            : {}),
+        };
+        const draft = await workflowService.saveWorkflowDraft(
+          projectId,
+          shotId,
+          command,
+        );
+        return reply.code(200).send(workflowDraftResponse(draft));
+      },
+    );
+
+    routes.post(
+      '/v1/projects/:projectId/shots/:shotId/workflow-revisions',
+      {
+        schema: {
+          tags: ['generation'],
+          summary: 'Create an immutable workflow revision',
+          body: {
+            type: 'object',
+            additionalProperties: true,
+          },
+          response: { 201: schemas.workflowValidationResponse },
+        },
+      },
+      async (request, reply) => {
+        const projectId = parseProjectId(request);
+        const shotId = resourceParam(request, 'shotId');
+        const body = parseBody(
+          workflowRevisionBodySchema,
+          request.body,
+        ) as WorkflowRevisionBody;
+        const parentRevisionId =
+          body.parentRevisionId === undefined
+            ? undefined
+            : bodyUuid(body.parentRevisionId, 'parentRevisionId');
+        const result = await workflowService.createWorkflowRevision(
+          projectId,
+          shotId,
+          {
+            idempotencyKey: idempotencyKey(request),
+            editorGraphJson: bodyGraph(
+              body,
+              'editorGraph',
+              'editorGraphJson',
+              'editorGraph',
+            ),
+            apiGraphJson: bodyGraph(
+              body,
+              'apiGraph',
+              'apiGraphJson',
+              'apiGraph',
+            ),
+            ...(parentRevisionId !== undefined ? { parentRevisionId } : {}),
+            ...(body.profileId !== undefined
+              ? { profileId: body.profileId }
+              : {}),
+            ...(body.profileVersion !== undefined
+              ? { profileVersion: body.profileVersion }
+              : {}),
+            ...(body.source !== undefined ? { source: body.source } : {}),
+            ...(body.frontendVersion !== undefined
+              ? { frontendVersion: body.frontendVersion }
+              : {}),
+            ...(body.frontendCommit !== undefined
+              ? { frontendCommit: body.frontendCommit }
+              : {}),
+            authorType: body.authorType ?? 'development_user',
+            authorId: body.authorId ?? 'development-user',
+          },
+        );
+        return reply.code(201).send({
+          revision: workflowRevisionResponse(result.revision),
+          validation: validationResponse(result.validation),
+        });
+      },
+    );
+
+    routes.get(
+      '/v1/projects/:projectId/shots/:shotId/workflow-revisions',
+      {
+        schema: {
+          tags: ['generation'],
+          summary: 'List immutable workflow revisions for a shot',
+          response: { 200: schemas.workflowRevisionsResponse },
+        },
+      },
+      async (request) => ({
+        revisions: (
+          await workflowService.listWorkflowRevisions(
+            parseProjectId(request),
+            resourceParam(request, 'shotId'),
+          )
+        ).map(workflowRevisionResponse),
+      }),
+    );
+
+    routes.get(
+      '/v1/workflow-revisions/:revisionId',
+      {
+        schema: {
+          tags: ['generation'],
+          summary: 'Get an immutable workflow revision',
+          response: { 200: schemas.workflowRevisionResponse },
+        },
+      },
+      async (request) => {
+        const revision = await workflowService.getWorkflowRevisionById(
+          resourceParam(request, 'revisionId'),
+        );
+        if (!revision) {
+          throw new WorkflowApplicationError(
+            'WORKFLOW_REVISION_NOT_FOUND',
+            'The workflow revision was not found.',
+            404,
+          );
+        }
+        return { revision: workflowRevisionResponse(revision) };
+      },
+    );
+
+    routes.post(
+      '/v1/workflow-revisions/:revisionId/validate',
+      {
+        schema: {
+          tags: ['generation'],
+          summary: 'Revalidate a workflow revision against the executor',
+          body: { type: 'object', additionalProperties: false },
+          response: { 200: schemas.workflowValidationResponse },
+        },
+      },
+      async (request, reply) => {
+        const revisionId = resourceParam(request, 'revisionId');
+        parseBody(z.object({}).strict(), request.body);
+        const existing =
+          await workflowService.getWorkflowRevisionById(revisionId);
+        if (!existing) {
+          throw new WorkflowApplicationError(
+            'WORKFLOW_REVISION_NOT_FOUND',
+            'The workflow revision was not found.',
+            404,
+          );
+        }
+        const response = await executeIdempotent(
+          request,
+          service,
+          `workflow.revision.validate:${revisionId}`,
+          {},
+          async (repositories) => {
+            const result =
+              await workflowService.validateWorkflowRevisionInTransaction(
+                repositories,
+                existing.projectId,
+                existing.shotId,
+                revisionId,
+              );
+            return {
+              status: 200,
+              body: {
+                revision: workflowRevisionResponse(result.revision),
+                validation: validationResponse(result.validation),
+              },
+            };
+          },
+        );
+        return reply.code(response.status as 200).send(response.body);
+      },
+    );
+
+    routes.get(
       '/v1/projects/:projectId/events',
       {
         schema: {
@@ -1403,6 +2183,315 @@ export function buildApiApp(options: ApiAppOptions = {}): FastifyInstance {
           eventResponse,
         ),
       }),
+    );
+
+    routes.get(
+      '/v1/projects/:projectId/events/stream',
+      {
+        schema: {
+          tags: ['projects'],
+          summary: 'Replay sanitized project events over SSE',
+        },
+      },
+      async (request, reply) => {
+        const rawLastEventId = headerValue(request, 'last-event-id');
+        let lastEventId = 0;
+        if (rawLastEventId !== undefined) {
+          if (!/^\d+$/.test(rawLastEventId.trim())) {
+            throw new HttpProblemError(
+              'INVALID_LAST_EVENT_ID',
+              'Last-Event-ID must be a durable numeric event sequence.',
+              400,
+              false,
+            );
+          }
+          lastEventId = Number(rawLastEventId);
+          if (!Number.isSafeInteger(lastEventId)) {
+            throw new HttpProblemError(
+              'INVALID_LAST_EVENT_ID',
+              'Last-Event-ID is outside the supported sequence range.',
+              400,
+              false,
+            );
+          }
+        }
+        const events = await service.listEvents(parseProjectId(request));
+        const frames = events
+          .map((event, index) => ({
+            event,
+            sequence: event.eventSequence ?? index + 1,
+          }))
+          .filter(({ sequence }) => sequence > lastEventId)
+          .map(
+            ({ event, sequence }) =>
+              `id: ${sequence}\nevent: ${event.type}\ndata: ${JSON.stringify(
+                sanitizedEventSummary(event),
+              )}\n\n`,
+          )
+          .join('');
+        return reply
+          .code(200)
+          .headers({
+            'cache-control': 'no-cache, no-transform',
+            connection: 'keep-alive',
+            'content-type': 'text/event-stream; charset=utf-8',
+            'x-content-type-options': 'nosniff',
+          })
+          .send(`${frames}: heartbeat\n\n`);
+      },
+    );
+
+    routes.route({
+      method: ['GET', 'HEAD'],
+      url: '/v1/artifacts/:artifactId/content',
+      schema: {
+        tags: ['generation'],
+        summary: 'Stream an authenticated artifact with optional byte range',
+      },
+      handler: async (request, reply) => {
+        const artifactId = resourceParam(request, 'artifactId');
+        const artifact = await store.withTransaction((repositories) =>
+          repositories.artifacts.findById(service.tenantId, artifactId),
+        );
+        if (!artifact) {
+          throw new HttpProblemError(
+            'ARTIFACT_NOT_FOUND',
+            'The requested artifact was not found.',
+            404,
+            false,
+          );
+        }
+        const rangeHeader = headerValue(request, 'range');
+        const range = parseByteRange(rangeHeader, artifact.byteSize);
+        if (rangeHeader !== undefined && !range) {
+          return rangeProblem(request, reply, artifact.byteSize);
+        }
+        const start = range?.start ?? 0;
+        const end = range?.end ?? artifact.byteSize - 1;
+        const contentLength = end - start + 1;
+        const headers: Record<string, string> = {
+          'accept-ranges': 'bytes',
+          'cache-control': 'private, no-transform',
+          'content-disposition': `inline; filename="artifact-${artifact.id}"`,
+          'content-length': String(contentLength),
+          'content-type': artifact.mimeType,
+          etag: `"${artifact.sha256}"`,
+          'x-content-type-options': 'nosniff',
+        };
+        if (range) {
+          headers['content-range'] =
+            `bytes ${range.start}-${range.end}/${artifact.byteSize}`;
+        }
+        if (request.method === 'HEAD') {
+          return reply
+            .code(range ? 206 : 200)
+            .headers(headers)
+            .send();
+        }
+        try {
+          if (range && generationService.artifactStore.openRange) {
+            const stream = await generationService.artifactStore.openRange(
+              artifact.id,
+              range.start,
+              range.end,
+            );
+            return reply.code(206).headers(headers).send(stream);
+          }
+          if (range) {
+            const bytes = await generationService.artifactStore.read(
+              artifact.id,
+            );
+            return reply
+              .code(206)
+              .headers(headers)
+              .send(Buffer.from(bytes.subarray(start, end + 1)));
+          }
+          const stream = await generationService.artifactStore.open(
+            artifact.id,
+          );
+          return reply.code(200).headers(headers).send(stream);
+        } catch {
+          throw new HttpProblemError(
+            'ARTIFACT_UNAVAILABLE',
+            'The artifact content is temporarily unavailable.',
+            404,
+            true,
+            false,
+          );
+        }
+      },
+    });
+
+    routes.get(
+      '/v1/projects/:projectId/operator/recommendations',
+      {
+        schema: {
+          tags: ['projects'],
+          summary: 'List persisted operator recommendations',
+          response: { 200: schemas.recommendationsResponse },
+        },
+      },
+      async (request) => {
+        const projectId = parseProjectId(request);
+        await service.getProject(projectId);
+        const recommendations = await store.withTransaction((repositories) =>
+          repositories.operationalRecommendations.listByProject(
+            service.tenantId,
+            projectId,
+          ),
+        );
+        return { recommendations: recommendations.map(recommendationResponse) };
+      },
+    );
+
+    routes.post(
+      '/v1/projects/:projectId/operator/recommendations/:recommendationId/apply',
+      {
+        schema: {
+          tags: ['projects'],
+          summary: 'Apply a persisted recommendation after human approval',
+          body: {
+            type: 'object',
+            properties: { expectedVersion: { type: 'integer', minimum: 1 } },
+            additionalProperties: true,
+          },
+          response: { 200: schemas.recommendationResponse },
+        },
+      },
+      async (request, reply) => {
+        const projectId = parseProjectId(request);
+        const recommendationId = resourceParam(request, 'recommendationId');
+        const body = parseBody(
+          recommendationActionBodySchema,
+          request.body,
+        ) as RecommendationActionBody;
+        const key = idempotencyKey(request);
+        const response = await executeIdempotent(
+          request,
+          service,
+          `recommendation.apply:${projectId}:${recommendationId}`,
+          body,
+          async (repositories) => {
+            const recommendation =
+              await repositories.operationalRecommendations.findById(
+                service.tenantId,
+                projectId,
+                recommendationId,
+              );
+            if (!recommendation) {
+              throw new HttpProblemError(
+                'RECOMMENDATION_NOT_FOUND',
+                'The operator recommendation was not found.',
+                404,
+                false,
+              );
+            }
+            if (recommendation.status !== 'pending') {
+              throw new HttpProblemError(
+                'RECOMMENDATION_NOT_PENDING',
+                'Only a pending recommendation can be applied.',
+                409,
+                false,
+              );
+            }
+            const expectedVersion =
+              body.expectedVersion ?? recommendation.version;
+            let attempt: GenerationAttempt | undefined;
+            if (recommendation.proposedActionType === 'retry_attempt') {
+              if (!recommendation.attemptId) {
+                throw new HttpProblemError(
+                  'RECOMMENDATION_ACTION_INVALID',
+                  'The retry recommendation does not identify an attempt.',
+                  409,
+                  false,
+                );
+              }
+              attempt = await generationService.retryAttemptInTransaction(
+                repositories,
+                recommendation.attemptId,
+                { idempotencyKey: key },
+              );
+            }
+            const updated =
+              await repositories.operationalRecommendations.updateStatus(
+                service.tenantId,
+                projectId,
+                recommendationId,
+                'applied',
+                expectedVersion,
+                toIsoUtc(clock.now()),
+              );
+            return {
+              status: 200,
+              body: {
+                recommendation: recommendationResponse(updated),
+                ...(attempt ? { attempt: attemptResponse(attempt) } : {}),
+              },
+            };
+          },
+        );
+        return reply.code(response.status as 200).send(response.body);
+      },
+    );
+
+    routes.post(
+      '/v1/projects/:projectId/operator/recommendations/:recommendationId/dismiss',
+      {
+        schema: {
+          tags: ['projects'],
+          summary: 'Dismiss a persisted operator recommendation',
+          body: {
+            type: 'object',
+            properties: { expectedVersion: { type: 'integer', minimum: 1 } },
+            additionalProperties: true,
+          },
+          response: { 200: schemas.recommendationResponse },
+        },
+      },
+      async (request, reply) => {
+        const projectId = parseProjectId(request);
+        const recommendationId = resourceParam(request, 'recommendationId');
+        const body = parseBody(
+          recommendationActionBodySchema,
+          request.body,
+        ) as RecommendationActionBody;
+        const response = await executeIdempotent(
+          request,
+          service,
+          `recommendation.dismiss:${projectId}:${recommendationId}`,
+          body,
+          async (repositories) => {
+            const recommendation =
+              await repositories.operationalRecommendations.findById(
+                service.tenantId,
+                projectId,
+                recommendationId,
+              );
+            if (!recommendation) {
+              throw new HttpProblemError(
+                'RECOMMENDATION_NOT_FOUND',
+                'The operator recommendation was not found.',
+                404,
+                false,
+              );
+            }
+            const updated =
+              await repositories.operationalRecommendations.updateStatus(
+                service.tenantId,
+                projectId,
+                recommendationId,
+                'dismissed',
+                body.expectedVersion ?? recommendation.version,
+                toIsoUtc(clock.now()),
+              );
+            return {
+              status: 200,
+              body: { recommendation: recommendationResponse(updated) },
+            };
+          },
+        );
+        return reply.code(response.status as 200).send(response.body);
+      },
     );
 
     routes.get(
@@ -1429,6 +2518,90 @@ export function buildApiApp(options: ApiAppOptions = {}): FastifyInstance {
           remainingMicrousd: cost.remainingMicrousd,
           remainingUsd: formatMicrousdToUsd(cost.remainingMicrousd),
         };
+      },
+    );
+
+    routes.get(
+      '/v1/projects/:projectId/attempts',
+      {
+        schema: {
+          tags: ['generation'],
+          summary: 'List all generation attempts for a project',
+          response: { 200: schemas.attemptsResponse },
+        },
+      },
+      async (request) => ({
+        attempts: (
+          await generationService.listProjectAttempts(parseProjectId(request))
+        ).map(attemptResponse),
+      }),
+    );
+
+    routes.post(
+      '/v1/projects/:projectId/shots/:shotId/managed-attempts',
+      {
+        schema: {
+          tags: ['generation'],
+          summary: 'Queue generation from an exact validated workflow revision',
+          body: {
+            type: 'object',
+            required: ['workflowRevisionId'],
+            properties: {
+              workflowRevisionId: { type: 'string', format: 'uuid' },
+            },
+            // Zod performs the strict rejection so Fastify does not silently
+            // strip execution override fields before the application sees them.
+            additionalProperties: true,
+          },
+          response: { 201: schemas.attemptResponse },
+        },
+      },
+      async (request, reply) => {
+        const projectId = parseProjectId(request);
+        const shotId = resourceParam(request, 'shotId');
+        const body = parseBody(
+          managedAttemptBodySchema,
+          request.body,
+        ) as ManagedAttemptBody;
+        const workflowRevisionId = bodyUuid(
+          body.workflowRevisionId,
+          'workflowRevisionId',
+        );
+        if (!workflowRevisionId) {
+          throw new HttpProblemError(
+            'INVALID_REQUEST',
+            'workflowRevisionId is required.',
+            422,
+            false,
+          );
+        }
+        const key = idempotencyKey(request);
+        const traceId = headerValue(request, 'x-trace-id');
+        const command: CreateManagedAttemptCommand = {
+          idempotencyKey: key,
+          workflowRevisionId,
+          ...(traceId ? { traceId } : {}),
+        };
+        const response = await executeIdempotent(
+          request,
+          service,
+          `managed-attempt.create:${projectId}:${shotId}`,
+          body,
+          async (repositories) => ({
+            status: 201,
+            body: {
+              attempt: attemptResponse(
+                await generationService.createManagedAttemptInTransaction(
+                  repositories,
+                  projectId,
+                  shotId,
+                  command,
+                ),
+              ),
+            },
+          }),
+        );
+        return reply.code(response.status as 201).send(response.body);
       },
     );
 
@@ -1703,6 +2876,60 @@ export function buildApiApp(options: ApiAppOptions = {}): FastifyInstance {
             body: {
               attempt: attemptResponse(
                 await generationService.regenerateAttemptInTransaction(
+                  repositories,
+                  attemptId,
+                  command,
+                ),
+              ),
+            },
+          }),
+        );
+        return reply.code(response.status as 201).send(response.body);
+      },
+    );
+
+    routes.post(
+      '/v1/attempts/:attemptId/retry',
+      {
+        schema: {
+          tags: ['generation'],
+          summary: 'Create a derived retry attempt',
+          params: {
+            type: 'object',
+            required: ['attemptId'],
+            properties: { attemptId: { type: 'string', format: 'uuid' } },
+          },
+          body: {
+            type: 'object',
+            properties: { resolveUncertain: { type: 'boolean', const: true } },
+            additionalProperties: true,
+          },
+          response: { 201: schemas.attemptResponse },
+        },
+      },
+      async (request, reply) => {
+        const attemptId = resourceParam(request, 'attemptId');
+        const body = parseBody(
+          retryAttemptBodySchema,
+          request.body,
+        ) as RetryAttemptBody;
+        const key = idempotencyKey(request);
+        const traceId = headerValue(request, 'x-trace-id');
+        const command: RetryAttemptCommand = {
+          idempotencyKey: key,
+          ...(traceId ? { traceId } : {}),
+          ...(body.resolveUncertain ? { resolveUncertain: true } : {}),
+        };
+        const response = await executeIdempotent(
+          request,
+          service,
+          `attempt.retry:${attemptId}`,
+          body,
+          async (repositories) => ({
+            status: 201,
+            body: {
+              attempt: attemptResponse(
+                await generationService.retryAttemptInTransaction(
                   repositories,
                   attemptId,
                   command,

@@ -210,6 +210,7 @@ export const ATTEMPT_FAILURE_CODES = [
   'COMFY_UNAVAILABLE',
   'COMFY_SUBMISSION_UNCERTAIN',
   'COMFY_EXECUTION_FAILED',
+  'CAPABILITY_DRIFT',
   'COMFY_INTERRUPTED',
   'GENERATION_TIMEOUT',
   'ARTIFACT_DOWNLOAD_FAILED',
@@ -300,6 +301,8 @@ export interface EvaluationResult {
 
 export interface DomainEvent {
   readonly id: Uuid;
+  /** Durable PostgreSQL identity sequence, when read back from persistence. */
+  readonly eventSequence?: number;
   readonly type: DomainEventType;
   readonly version: number;
   readonly occurredAt: IsoUtcTimestamp;

@@ -120,6 +120,8 @@ function revisionFor(
     profileId: 'minimax-h3-t2va-preview',
     profileVersion: '1',
     source: 'comfy_editor',
+    frontendVersion: 'postgres-test-frontend',
+    frontendCommit: 'postgres-test-commit',
     authorType: 'development_user',
     authorId: 'postgres-test-user',
     editorGraphJson: { nodes: [{ id: 17 }] },
@@ -257,6 +259,8 @@ describe.skipIf(!databaseAvailable)('Phase 5 PostgreSQL persistence', () => {
         `pg-revision-${revision.id}`,
       );
       expect(createdRevision.revisionNumber).toBe(1);
+      expect(createdRevision.frontendVersion).toBe('postgres-test-frontend');
+      expect(createdRevision.frontendCommit).toBe('postgres-test-commit');
       const validatedRevision =
         await repositories.workflowRevisions.updateValidation(
           context.tenantId,

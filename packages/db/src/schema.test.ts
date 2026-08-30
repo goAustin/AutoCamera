@@ -114,4 +114,18 @@ describe('Phase 2 migration contract', () => {
     expect(sql).toContain("'needs_attention'");
     expect(sql).toContain("'retryable'");
   });
+
+  it('declares the Phase 5 Checkpoint 4 workflow frontend provenance contract', () => {
+    const sql = readFileSync(
+      join(
+        migrationsDirectory,
+        '0005_phase5_checkpoint4_frontend_metadata.sql',
+      ),
+      'utf8',
+    );
+    expect(sql).toContain('ADD COLUMN frontend_version TEXT');
+    expect(sql).toContain('ADD COLUMN frontend_commit TEXT');
+    expect(sql).toContain('workflow_revisions_frontend_version_bounded');
+    expect(sql).toContain('workflow_revisions_frontend_commit_bounded');
+  });
 });

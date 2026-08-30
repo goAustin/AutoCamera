@@ -26,6 +26,8 @@ export interface ArtifactStore {
     mimeType?: string,
   ): Promise<StoredArtifactObject>;
   open(artifactId: string): Promise<Readable>;
+  /** Open an inclusive byte range without exposing the backing object path. */
+  openRange?(artifactId: string, start: number, end: number): Promise<Readable>;
   read(artifactId: string): Promise<Uint8Array>;
   metadata(artifactId: string): Promise<StoredArtifactObject | null>;
   exists(artifactId: string): Promise<boolean>;
@@ -156,6 +158,24 @@ export class LocalArtifactStore implements ArtifactStore {
     const destination = this.pathFor(artifactId);
     await access(destination);
     return createReadStream(destination);
+  }
+
+  async openRange(
+    artifactId: string,
+    start: number,
+    end: number,
+  ): Promise<Readable> {
+    if (
+      !Number.isSafeInteger(start) ||
+      !Number.isSafeInteger(end) ||
+      start < 0 ||
+      end < start
+    ) {
+      throw new Error('Artifact byte range is invalid.');
+    }
+    const destination = this.pathFor(artifactId);
+    await access(destination);
+    return createReadStream(destination, { start, end });
   }
 
   async read(artifactId: string): Promise<Uint8Array> {

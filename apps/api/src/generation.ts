@@ -27,6 +27,7 @@ import type {
   AttemptRepository,
   Repositories,
   TransactionalStore,
+  WorkflowRevisionRecord,
 } from '@h3/db';
 import {
   ComfyStreamDisconnectedError,
@@ -38,7 +39,11 @@ import {
   type ComfyScenario,
 } from '@h3/comfy-client';
 import { MediaEvaluator } from '@h3/evaluator';
-import { compileAndPersistWorkflow } from '@h3/workflow-compiler';
+import {
+  compileAndPersistWorkflow,
+  normalizeAttemptOutputPrefix,
+  validateMinimaxH3T2vaPreview,
+} from '@h3/workflow-compiler';
 import { createLocalArtifactStore, type ArtifactStore } from '@h3/object-store';
 
 export const PREVIEW_WIDTH = 960 as const;
@@ -52,6 +57,7 @@ const RECOVERABLE_FAILURE_CODES: ReadonlySet<AttemptFailureCode> = new Set([
   'COMFY_UNAVAILABLE',
   'COMFY_SUBMISSION_UNCERTAIN',
   'COMFY_EXECUTION_FAILED',
+  'CAPABILITY_DRIFT',
   'GENERATION_TIMEOUT',
   'ARTIFACT_DOWNLOAD_FAILED',
   'ARTIFACT_STORAGE_FAILED',
@@ -67,6 +73,9 @@ export type GenerationApplicationErrorCode =
   | 'EVALUATION_REQUIRED'
   | 'EVALUATION_FAILED'
   | 'ATTEMPT_NOT_REJECTED'
+  | 'WORKFLOW_REVISION_NOT_FOUND'
+  | 'WORKFLOW_REVISION_INVALID'
+  | 'SUBMISSION_UNCERTAIN'
   | 'INVALID_REVIEW_REASON'
   | 'PERSISTENCE_UNAVAILABLE'
   | 'GENERATION_FAILED';
@@ -96,6 +105,19 @@ export interface CreateAttemptCommand {
   readonly steps?: number;
   readonly scenario?: ComfyScenario;
   readonly traceId?: string;
+}
+
+export interface CreateManagedAttemptCommand {
+  readonly idempotencyKey: string;
+  readonly workflowRevisionId: Uuid;
+  readonly traceId?: string;
+}
+
+export interface RetryAttemptCommand {
+  readonly idempotencyKey: string;
+  readonly traceId?: string;
+  /** Explicit human resolution for an unresolved submission outcome. */
+  readonly resolveUncertain?: boolean;
 }
 
 export interface AttemptReviewResult {
@@ -179,6 +201,83 @@ export function redactFailureMessage(message: string): string {
 function hashSeed(attemptId: Uuid): number {
   const value = createHash('sha256').update(attemptId).digest().readUInt32BE(0);
   return value & 0x7fffffff;
+}
+
+interface ManagedExecutionParameters {
+  readonly width: number;
+  readonly height: number;
+  readonly requestedDurationSeconds: number;
+  readonly seed: number;
+  readonly steps: number;
+}
+
+function managedExecutionParameters(
+  revision: WorkflowRevisionRecord,
+): ManagedExecutionParameters {
+  const value = revision.executionParametersJson;
+  const numberValue = (name: string): number => {
+    const candidate = value[name];
+    if (typeof candidate !== 'number' || !Number.isFinite(candidate)) {
+      throw new GenerationApplicationError(
+        'WORKFLOW_REVISION_INVALID',
+        `The validated workflow revision has invalid ${name} execution data.`,
+        409,
+      );
+    }
+    return candidate;
+  };
+  const width = numberValue('width');
+  const height = numberValue('height');
+  const requestedDurationSeconds = numberValue('requestedDurationSeconds');
+  const seed = numberValue('seed');
+  const steps = numberValue('steps');
+  if (
+    !Number.isSafeInteger(width) ||
+    width <= 0 ||
+    !Number.isSafeInteger(height) ||
+    height <= 0 ||
+    !Number.isSafeInteger(seed) ||
+    seed < 0 ||
+    !Number.isSafeInteger(steps) ||
+    steps <= 0 ||
+    requestedDurationSeconds <= 0
+  ) {
+    throw new GenerationApplicationError(
+      'WORKFLOW_REVISION_INVALID',
+      'The validated workflow revision has unsafe execution data.',
+      409,
+    );
+  }
+  return { width, height, requestedDurationSeconds, seed, steps };
+}
+
+function normalizeManagedWorkflow(
+  workflow: Readonly<Record<string, unknown>>,
+  attemptId: Uuid,
+): Readonly<Record<string, unknown>> {
+  const normalized = structuredClone(workflow) as Record<string, unknown>;
+  for (const [nodeId, rawNode] of Object.entries(normalized)) {
+    if (
+      typeof rawNode !== 'object' ||
+      rawNode === null ||
+      Array.isArray(rawNode)
+    )
+      continue;
+    const node = rawNode as Record<string, unknown>;
+    if (node.class_type !== 'SaveVideo') continue;
+    if (
+      typeof node.inputs !== 'object' ||
+      node.inputs === null ||
+      Array.isArray(node.inputs)
+    )
+      continue;
+    node.inputs = {
+      ...(node.inputs as Record<string, unknown>),
+      filename_prefix: normalizeAttemptOutputPrefix(attemptId),
+    };
+    normalized[nodeId] = node;
+  }
+  return normalized;
 }
 
 function validScenario(value: string | undefined): ComfyScenario {
@@ -361,6 +460,175 @@ export class GenerationApplicationService {
     );
   }
 
+  async createManagedAttempt(
+    projectId: Uuid,
+    shotId: Uuid,
+    command: CreateManagedAttemptCommand,
+  ): Promise<GenerationAttempt> {
+    return this.store.withTransaction((repositories) =>
+      this.createManagedAttemptInTransaction(
+        repositories,
+        projectId,
+        shotId,
+        command,
+      ),
+    );
+  }
+
+  async createManagedAttemptInTransaction(
+    repositories: Repositories,
+    projectId: Uuid,
+    shotId: Uuid,
+    command: CreateManagedAttemptCommand,
+    sourceAttemptId?: Uuid,
+  ): Promise<GenerationAttempt> {
+    const project = await repositories.projects.findById(
+      this.tenantId,
+      projectId,
+    );
+    const shot = await repositories.shots.findById(projectId, shotId);
+    if (!project || !shot) {
+      throw new GenerationApplicationError(
+        'SHOT_NOT_FOUND',
+        'The requested shot was not found in the project.',
+        404,
+      );
+    }
+    if (
+      shot.status !== 'approved_for_generation' &&
+      shot.status !== 'rejected' &&
+      shot.status !== 'retryable'
+    ) {
+      throw new GenerationApplicationError(
+        'SHOT_NOT_READY_FOR_GENERATION',
+        'The shot is not approved or eligible for regeneration.',
+      );
+    }
+    const revision = await repositories.workflowRevisions.findById(
+      this.tenantId,
+      projectId,
+      shotId,
+      command.workflowRevisionId,
+    );
+    if (!revision) {
+      throw new GenerationApplicationError(
+        'WORKFLOW_REVISION_NOT_FOUND',
+        'The requested workflow revision was not found in the project and shot.',
+        404,
+      );
+    }
+    if (revision.validationStatus !== 'validated') {
+      throw new GenerationApplicationError(
+        'WORKFLOW_REVISION_INVALID',
+        'Managed generation requires a validated workflow revision.',
+        409,
+      );
+    }
+    const execution = managedExecutionParameters(revision);
+    const attempts = await repositories.attempts.listByShot(
+      this.tenantId,
+      shotId,
+    );
+    if (attempts.length >= this.maxAttemptsPerShot) {
+      await this.appendEvent(repositories, {
+        type: 'project.budget_denied',
+        projectId: project.id,
+        shotId,
+        payload: { reason: 'attempt_limit', shotId },
+      });
+      throw new GenerationApplicationError(
+        'ATTEMPT_LIMIT_REACHED',
+        'The shot has reached its maximum preview-attempt count.',
+      );
+    }
+    const nextSpend = addMicrousd(
+      project.spentMicrousd,
+      this.estimatedAttemptCostMicrousd,
+    );
+    if (nextSpend > project.budgetMicrousd) {
+      await this.appendEvent(repositories, {
+        type: 'project.budget_denied',
+        projectId: project.id,
+        shotId,
+        payload: {
+          reason: 'budget',
+          estimatedCostMicrousd: this.estimatedAttemptCostMicrousd,
+        },
+      });
+      throw new GenerationApplicationError(
+        'BUDGET_EXCEEDED',
+        'The project budget cannot cover another preview attempt.',
+      );
+    }
+    const now = toIsoUtc(this.clock.now());
+    const attemptId = this.idGenerator.next();
+    const attempt = createGenerationAttempt({
+      id: attemptId,
+      tenantId: this.tenantId,
+      projectId,
+      shotId,
+      idempotencyKey: command.idempotencyKey,
+      seed: execution.seed,
+      steps: execution.steps,
+      requestedWidth: execution.width,
+      requestedHeight: execution.height,
+      requestedDurationSeconds: execution.requestedDurationSeconds,
+      workflowRevisionId: revision.id,
+      workflowHash: revision.executionHash,
+      correlationId: `h3-${attemptId}`,
+      ...(command.traceId ? { traceId: command.traceId } : {}),
+      estimatedCostMicrousd: this.estimatedAttemptCostMicrousd,
+      ...(sourceAttemptId ? { sourceAttemptId } : {}),
+      now,
+    });
+    await repositories.attempts.create(attempt);
+    await repositories.shots.update(
+      updatedAt(transitionShot(shot, 'queued'), this.clock),
+      shot.version,
+    );
+    let updatedProject = project;
+    if (
+      project.status === 'ready_for_generation' ||
+      project.status === 'awaiting_final_review' ||
+      project.status === 'needs_attention'
+    ) {
+      updatedProject = transitionProject(project, 'generating');
+    } else if (project.status !== 'generating') {
+      throw new GenerationApplicationError(
+        'SHOT_NOT_READY_FOR_GENERATION',
+        'The project is not ready to generate this shot.',
+      );
+    }
+    updatedProject = {
+      ...updatedProject,
+      spentMicrousd: nextSpend,
+      updatedAt: now,
+    };
+    await repositories.projects.update(updatedProject, project.version);
+    await this.appendEvent(repositories, {
+      type: 'attempt.queued',
+      projectId,
+      shotId,
+      attemptId: attempt.id,
+      payload: {
+        status: attempt.status,
+        workflowRevisionId: revision.id,
+        workflowHash: revision.executionHash,
+        estimatedCostMicrousd: attempt.estimatedCostMicrousd,
+      },
+    });
+    if (sourceAttemptId) {
+      await this.appendEvent(repositories, {
+        type: 'attempt.regenerated',
+        projectId: project.id,
+        shotId,
+        attemptId: attempt.id,
+        payload: { sourceAttemptId },
+      });
+    }
+    return attempt;
+  }
+
   async createAttemptInTransaction(
     repositories: Repositories,
     shotId: Uuid,
@@ -504,6 +772,15 @@ export class GenerationApplicationService {
         estimatedCostMicrousd: attempt.estimatedCostMicrousd,
       },
     });
+    if (sourceAttemptId) {
+      await this.appendEvent(repositories, {
+        type: 'attempt.regenerated',
+        projectId: project.id,
+        shotId,
+        attemptId: attempt.id,
+        payload: { sourceAttemptId },
+      });
+    }
     return attempt;
   }
 
@@ -711,6 +988,66 @@ export class GenerationApplicationService {
     });
   }
 
+  async retryAttempt(
+    attemptId: Uuid,
+    command: RetryAttemptCommand,
+  ): Promise<GenerationAttempt> {
+    return this.store.withTransaction((repositories) =>
+      this.retryAttemptInTransaction(repositories, attemptId, command),
+    );
+  }
+
+  async retryAttemptInTransaction(
+    repositories: Repositories,
+    attemptId: Uuid,
+    command: RetryAttemptCommand,
+  ): Promise<GenerationAttempt> {
+    const source = await this.requireAttempt(repositories, attemptId);
+    if (
+      source.status !== 'rejected' &&
+      source.status !== 'failed' &&
+      source.status !== 'timed_out'
+    ) {
+      throw new GenerationApplicationError(
+        'ATTEMPT_NOT_REJECTED',
+        'Retry requires a failed, timed-out, or rejected source attempt.',
+      );
+    }
+    if (
+      source.failureCode === 'COMFY_SUBMISSION_UNCERTAIN' &&
+      !command.resolveUncertain
+    ) {
+      throw new GenerationApplicationError(
+        'SUBMISSION_UNCERTAIN',
+        'The original submission outcome is unresolved; reconcile it or explicitly resolve the uncertainty before retrying.',
+        409,
+        true,
+      );
+    }
+    if (source.workflowRevisionId) {
+      return this.createManagedAttemptInTransaction(
+        repositories,
+        source.projectId,
+        source.shotId,
+        {
+          idempotencyKey: command.idempotencyKey,
+          workflowRevisionId: source.workflowRevisionId,
+          ...(command.traceId ? { traceId: command.traceId } : {}),
+        },
+        source.id,
+      );
+    }
+    return this.createAttemptInTransaction(
+      repositories,
+      source.shotId,
+      {
+        idempotencyKey: command.idempotencyKey,
+        ...(command.traceId ? { traceId: command.traceId } : {}),
+      },
+      source.id,
+    );
+  }
+
   async regenerateAttemptInTransaction(
     repositories: Repositories,
     attemptId: Uuid,
@@ -727,6 +1064,27 @@ export class GenerationApplicationService {
         'Retry requires a failed, timed-out, or rejected source attempt.',
       );
     }
+    if (source.failureCode === 'COMFY_SUBMISSION_UNCERTAIN') {
+      throw new GenerationApplicationError(
+        'SUBMISSION_UNCERTAIN',
+        'The original submission outcome is unresolved; reconcile it before regenerating.',
+        409,
+        true,
+      );
+    }
+    if (source.workflowRevisionId) {
+      return this.createManagedAttemptInTransaction(
+        repositories,
+        source.projectId,
+        source.shotId,
+        {
+          idempotencyKey: command.idempotencyKey,
+          workflowRevisionId: source.workflowRevisionId,
+          ...(command.traceId ? { traceId: command.traceId } : {}),
+        },
+        source.id,
+      );
+    }
     return this.createAttemptInTransaction(
       repositories,
       source.shotId,
@@ -738,9 +1096,20 @@ export class GenerationApplicationService {
   async listProjectAttempts(
     projectId: Uuid,
   ): Promise<readonly GenerationAttempt[]> {
-    return this.store.withTransaction((repositories) =>
-      repositories.attempts.listByProject(this.tenantId, projectId),
-    );
+    return this.store.withTransaction(async (repositories) => {
+      const project = await repositories.projects.findById(
+        this.tenantId,
+        projectId,
+      );
+      if (!project) {
+        throw new GenerationApplicationError(
+          'ATTEMPT_NOT_FOUND',
+          'The requested project was not found.',
+          404,
+        );
+      }
+      return repositories.attempts.listByProject(this.tenantId, projectId);
+    });
   }
 
   async recordOrphanComfyMessage(message: ComfyMessage): Promise<boolean> {
@@ -860,8 +1229,14 @@ export class GenerationWorker {
     const leaseExpiresAt = toIsoUtc(
       new Date(this.service.clock.now().getTime() + this.leaseSeconds * 1000),
     );
-    const attempt = await this.service.store.withTransaction((repositories) =>
-      repositories.attempts.claimNext(this.workerId, now, leaseExpiresAt),
+    const attempt = await this.service.store.withTransaction(
+      async (repositories) =>
+        (await repositories.attempts.claimForRecovery(
+          this.workerId,
+          now,
+          leaseExpiresAt,
+        )) ??
+        repositories.attempts.claimNext(this.workerId, now, leaseExpiresAt),
     );
     if (!attempt) return false;
     this.currentAttemptId = attempt.id;
@@ -933,12 +1308,40 @@ export class GenerationWorker {
         );
         return;
       }
-      const workflowHash = attempt.workflowHash;
-      const workflow = await this.service.store.withTransaction(
-        (repositories) =>
-          repositories.workflowVersions.findByHash(workflowHash),
-      );
-      if (!workflow) {
+      const managedRevision = attempt.workflowRevisionId
+        ? await this.service.store.withTransaction((repositories) =>
+            repositories.workflowRevisions.findById(
+              this.service.tenantId,
+              attempt.projectId,
+              attempt.shotId,
+              attempt.workflowRevisionId as Uuid,
+            ),
+          )
+        : undefined;
+      if (attempt.workflowRevisionId && !managedRevision) {
+        await this.failAttempt(
+          claimed.id,
+          'failed',
+          'CAPABILITY_DRIFT',
+          'The managed workflow revision is missing from the attempt scope.',
+        );
+        return;
+      }
+      if (managedRevision && managedRevision.validationStatus !== 'validated') {
+        await this.failAttempt(
+          claimed.id,
+          'failed',
+          'CAPABILITY_DRIFT',
+          'The managed workflow revision is no longer validated.',
+        );
+        return;
+      }
+      const workflow = managedRevision
+        ? undefined
+        : await this.service.store.withTransaction((repositories) =>
+            repositories.workflowVersions.findByHash(attempt.workflowHash),
+          );
+      if (!workflow && !managedRevision) {
         await this.failAttempt(
           claimed.id,
           'failed',
@@ -947,43 +1350,45 @@ export class GenerationWorker {
         );
         return;
       }
-      const submissionIntent = await this.service.store.withTransaction(
-        async (repositories) => {
-          const current = await repositories.attempts.findById(
-            this.service.tenantId,
-            claimed.id,
-          );
-          if (!current || isTerminalGenerationAttempt(current.status))
-            return current;
-          const next = clearLease(
-            updatedAt(
-              transitionGenerationAttempt(current, 'submitting'),
-              this.service.clock,
-            ),
-          );
-          const leased: GenerationAttempt = {
-            ...next,
-            leaseOwner: this.workerId,
-            leaseExpiresAt: toIsoUtc(
-              new Date(
-                this.service.clock.now().getTime() + this.leaseSeconds * 1000,
-              ),
-            ),
-          };
-          await repositories.attempts.update(leased, current.version);
-          await this.service.appendEvent(repositories, {
-            type: 'attempt.submitted',
-            projectId: current.projectId,
-            shotId: current.shotId,
-            attemptId: current.id,
-            payload: {
-              status: 'submitting',
-              correlationId: current.correlationId,
-            },
-          });
-          return leased;
-        },
-      );
+      const submissionIntent =
+        attempt.status === 'claimed'
+          ? await this.service.store.withTransaction(async (repositories) => {
+              const current = await repositories.attempts.findById(
+                this.service.tenantId,
+                claimed.id,
+              );
+              if (!current || isTerminalGenerationAttempt(current.status))
+                return current;
+              const next = clearLease(
+                updatedAt(
+                  transitionGenerationAttempt(current, 'submitting'),
+                  this.service.clock,
+                ),
+              );
+              const leased: GenerationAttempt = {
+                ...next,
+                leaseOwner: this.workerId,
+                leaseExpiresAt: toIsoUtc(
+                  new Date(
+                    this.service.clock.now().getTime() +
+                      this.leaseSeconds * 1000,
+                  ),
+                ),
+              };
+              await repositories.attempts.update(leased, current.version);
+              await this.service.appendEvent(repositories, {
+                type: 'attempt.submitted',
+                projectId: current.projectId,
+                shotId: current.shotId,
+                attemptId: current.id,
+                payload: {
+                  status: 'submitting',
+                  correlationId: current.correlationId,
+                },
+              });
+              return leased;
+            })
+          : attempt;
       if (!submissionIntent) return;
       attempt = submissionIntent;
       let history = attempt.comfyPromptId
@@ -992,19 +1397,45 @@ export class GenerationWorker {
             attempt.correlationId,
           );
       if (!history) {
+        if (claimed.status !== 'claimed') {
+          await this.failAttempt(
+            attempt.id,
+            'failed',
+            'COMFY_SUBMISSION_UNCERTAIN',
+            'An in-flight submission has no reconciled ComfyUI history.',
+          );
+          return;
+        }
+        if (
+          managedRevision &&
+          !(await this.revalidateManagedRevision(managedRevision, attempt))
+        ) {
+          return;
+        }
         try {
           const response = await this.service.comfyClient.submitPrompt({
-            workflow: workflow.workflowJson,
+            workflow: managedRevision
+              ? normalizeManagedWorkflow(
+                  managedRevision.apiGraphJson,
+                  attempt.id,
+                )
+              : (workflow?.workflowJson ?? {}),
             extraData: {
               attempt_id: attempt.id,
               workflow_hash: attempt.workflowHash,
               trace_id: attempt.traceId ?? '',
               correlation_id: attempt.correlationId,
               seed: attempt.seed,
-              scenario: validScenario(attempt.scenario),
+              ...(attempt.scenario
+                ? { scenario: validScenario(attempt.scenario) }
+                : {}),
             },
-            scenario: validScenario(attempt.scenario),
-            seed: attempt.seed,
+            ...(managedRevision
+              ? {}
+              : {
+                  scenario: validScenario(attempt.scenario),
+                  seed: attempt.seed,
+                }),
           });
           history = await this.service.comfyClient.getHistory(
             response.promptId,
@@ -1044,6 +1475,67 @@ export class GenerationWorker {
     } finally {
       clearInterval(heartbeat);
     }
+  }
+
+  private async revalidateManagedRevision(
+    revision: WorkflowRevisionRecord | undefined,
+    attempt: GenerationAttempt,
+  ): Promise<boolean> {
+    if (!revision) return true;
+    let objectInfo: unknown;
+    try {
+      objectInfo = await this.service.comfyClient.getObjectInfo();
+    } catch {
+      objectInfo = null;
+    }
+    const validation = validateMinimaxH3T2vaPreview({
+      editorGraph: revision.editorGraphJson,
+      apiGraph: revision.apiGraphJson,
+      profileId: revision.profileId,
+      profileVersion: revision.profileVersion,
+      objectInfo,
+      requireExecutor: true,
+    });
+    const fingerprintDrifted =
+      revision.executorFingerprint !== undefined &&
+      validation.executorFingerprint !== revision.executorFingerprint;
+    const errors = fingerprintDrifted
+      ? [
+          ...validation.errors,
+          {
+            code: 'CAPABILITY_DRIFT' as const,
+            message:
+              'Executor capability fingerprint changed since the revision was validated.',
+          },
+        ]
+      : validation.errors;
+    await this.service.store.withTransaction(async (repositories) => {
+      await repositories.workflowRevisions.updateValidation(
+        this.service.tenantId,
+        revision.projectId,
+        revision.shotId,
+        revision.id,
+        {
+          validationStatus: errors.length === 0 ? 'validated' : 'invalid',
+          validationErrorsJson: errors.map(({ code, message }) => ({
+            code,
+            message,
+          })),
+          validatedAt: toIsoUtc(this.service.clock.now()),
+          executorFingerprint: validation.executorFingerprint ?? null,
+        },
+      );
+    });
+    if (errors.length > 0) {
+      await this.failAttempt(
+        attempt.id,
+        'failed',
+        'CAPABILITY_DRIFT',
+        'Executor capabilities no longer satisfy the validated workflow revision.',
+      );
+      return false;
+    }
+    return true;
   }
 
   private async reconcileOrObserve(

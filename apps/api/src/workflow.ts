@@ -15,6 +15,7 @@ import type {
   WorkflowRevisionRecord,
   WorkflowRevisionSource,
 } from '@h3/db';
+import { RepositoryError } from '@h3/db';
 import {
   canonicalizeJson,
   hashWorkflowExecutionEnvelope,
@@ -100,6 +101,8 @@ export interface CreateWorkflowRevisionCommand {
   readonly profileId?: string;
   readonly profileVersion?: string;
   readonly source?: WorkflowRevisionSource;
+  readonly frontendVersion?: string;
+  readonly frontendCommit?: string;
   readonly authorType: string;
   readonly authorId: string;
   /** Used by deterministic tests; production callers use the capability provider. */
@@ -620,11 +623,29 @@ export class WorkflowApplicationService {
       );
     }
     if (command.expectedVersion === undefined) {
-      throw new WorkflowApplicationError(
-        'INVALID_DRAFT_VERSION',
-        'Updating an existing workflow draft requires expectedVersion.',
-        422,
-      );
+      // Re-run the create path so an identical retry of the initial PUT can
+      // replay its application idempotency result. A new key against an
+      // existing draft is still an optimistic-version error.
+      try {
+        return await this.createWorkflowDraftInTransaction(
+          repositories,
+          projectId,
+          shotId,
+          command,
+        );
+      } catch (error) {
+        if (
+          error instanceof RepositoryError &&
+          error.code === 'UNIQUE_VIOLATION'
+        ) {
+          throw new WorkflowApplicationError(
+            'INVALID_DRAFT_VERSION',
+            'Updating an existing workflow draft requires expectedVersion.',
+            422,
+          );
+        }
+        throw error;
+      }
     }
     return this.updateWorkflowDraftInTransaction(
       repositories,
@@ -648,6 +669,14 @@ export class WorkflowApplicationService {
         revisionId,
       );
     });
+  }
+
+  async getWorkflowRevisionById(
+    revisionId: Uuid,
+  ): Promise<WorkflowRevisionRecord | null> {
+    return this.store.withTransaction((repositories) =>
+      repositories.workflowRevisions.findByIdAny(this.tenantId, revisionId),
+    );
   }
 
   async listWorkflowRevisions(
@@ -731,6 +760,12 @@ export class WorkflowApplicationService {
       profileId,
       profileVersion,
       source: command.source ?? 'comfy_editor',
+      ...(command.frontendVersion
+        ? { frontendVersion: command.frontendVersion }
+        : {}),
+      ...(command.frontendCommit
+        ? { frontendCommit: command.frontendCommit }
+        : {}),
       authorType: command.authorType,
       authorId: command.authorId,
       editorGraphJson,
@@ -761,6 +796,8 @@ export class WorkflowApplicationService {
         profileId,
         profileVersion,
         source: command.source ?? 'comfy_editor',
+        frontendVersion: command.frontendVersion ?? null,
+        frontendCommit: command.frontendCommit ?? null,
         authorType: command.authorType,
         authorId: command.authorId,
         editorGraphJson,
