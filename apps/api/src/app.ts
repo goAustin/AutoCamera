@@ -32,6 +32,7 @@ import {
   createDatabasePool,
   createInMemoryStore,
   createPostgresStore,
+  OutboxDispatcher,
   RepositoryError,
   runMigrations,
   type Repositories,
@@ -41,6 +42,7 @@ import {
   type WorkflowRevisionRecord,
 } from '@h3/db';
 import { getApiConfig, type ApiConfig } from '@h3/config';
+import type { OperationalExecutorToolView } from '@h3/agent-tools';
 import {
   createTraceId,
   OpenTelemetryTelemetry,
@@ -78,6 +80,12 @@ import {
   WorkflowApplicationService,
   type WorkflowGraph,
 } from './workflow.js';
+import {
+  createOperationalToolServices,
+  OperationalOutboxConsumer,
+  OperationalOutboxWorker,
+  OperationalPiAdapter,
+} from './operator.js';
 
 export interface ApiLiveResponse {
   readonly service: 'api';
@@ -1580,6 +1588,62 @@ export function buildApiApp(options: ApiAppOptions = {}): FastifyInstance {
       leaseSeconds: config.attemptLeaseSeconds,
       timeoutSeconds: config.attemptTimeoutSeconds,
     });
+  const operationalAdapter =
+    options.operationalAdapter ??
+    new OperationalPiAdapter({
+      store,
+      tenantId: DEV_TENANT_ID,
+      clock,
+      idGenerator,
+      // The operational loop is always safe to run offline. A hosted provider
+      // may be used by the separate planning adapter, but it is not required
+      // to produce a bounded operational recommendation.
+      provider: 'faux',
+      model: 'h3-videoops-operator-v1',
+      telemetry,
+      services: (repositories) =>
+        createOperationalToolServices(repositories, DEV_TENANT_ID, {
+          mode: config.comfyMode,
+          getExecutorReadiness:
+            async (): Promise<OperationalExecutorToolView> => {
+              const checkedAt = toIsoUtc(clock.now());
+              try {
+                const readiness =
+                  await generationService.comfyClient.checkReady();
+                return {
+                  mode: config.comfyMode,
+                  ready: readiness.ready,
+                  checkedAt: readiness.checkedAt,
+                  ...(readiness.capabilityFingerprint
+                    ? {
+                        capabilityFingerprint: readiness.capabilityFingerprint,
+                      }
+                    : {}),
+                  ...(readiness.errorCode
+                    ? { errorCode: readiness.errorCode }
+                    : {}),
+                };
+              } catch {
+                return {
+                  mode: config.comfyMode,
+                  ready: false,
+                  checkedAt,
+                  errorCode: 'EXECUTOR_UNAVAILABLE',
+                };
+              }
+            },
+        }),
+    });
+  const operationalDispatcher =
+    options.operationalDispatcher ??
+    new OutboxDispatcher(
+      store,
+      new OperationalOutboxConsumer(operationalAdapter),
+      clock,
+    );
+  const operationalWorker = new OperationalOutboxWorker({
+    dispatcher: operationalDispatcher,
+  });
   const authToken =
     config.devAuthToken || (config.nodeEnv === 'test' ? 'test-token' : '');
   const schemas = baseRouteSchemas();
@@ -1621,10 +1685,19 @@ export function buildApiApp(options: ApiAppOptions = {}): FastifyInstance {
   app.decorate('generationService', generationService);
   app.decorate('workflowService', workflowService);
   app.decorate('generationWorker', generationWorker);
+  app.decorate('operationalPiAdapter', operationalAdapter);
+  app.decorate('operationalDispatcher', operationalDispatcher);
+  app.decorate('operationalWorker', operationalWorker);
   if (options.startGenerationWorker) {
     void generationWorker.run();
     app.addHook('onClose', async () => {
       await generationWorker.stop();
+    });
+  }
+  if (options.startOperationalWorker) {
+    void operationalWorker.run();
+    app.addHook('onClose', async () => {
+      await operationalWorker.stop();
     });
   }
   app.addHook('onClose', async () => {
@@ -2397,8 +2470,10 @@ export function buildApiApp(options: ApiAppOptions = {}): FastifyInstance {
             const expectedVersion =
               body.expectedVersion ?? recommendation.version;
             let attempt: GenerationAttempt | undefined;
+            let retryAttemptId: Uuid | undefined;
             if (recommendation.proposedActionType === 'retry_attempt') {
-              if (!recommendation.attemptId) {
+              const recommendationAttemptId = recommendation.attemptId;
+              if (!recommendationAttemptId) {
                 throw new HttpProblemError(
                   'RECOMMENDATION_ACTION_INVALID',
                   'The retry recommendation does not identify an attempt.',
@@ -2406,11 +2481,52 @@ export function buildApiApp(options: ApiAppOptions = {}): FastifyInstance {
                   false,
                 );
               }
-              attempt = await generationService.retryAttemptInTransaction(
-                repositories,
-                recommendation.attemptId,
-                { idempotencyKey: key },
+              const sourceAttempt = await repositories.attempts.findById(
+                service.tenantId,
+                recommendationAttemptId,
               );
+              if (!sourceAttempt || sourceAttempt.projectId !== projectId) {
+                throw new HttpProblemError(
+                  'ATTEMPT_NOT_FOUND',
+                  'The recommendation source attempt was not found.',
+                  404,
+                  false,
+                );
+              }
+              let executorReady = false;
+              try {
+                executorReady = (
+                  await generationService.comfyClient.checkReady()
+                ).ready;
+              } catch {
+                executorReady = false;
+              }
+              if (!executorReady) {
+                throw new HttpProblemError(
+                  'EXECUTOR_UNAVAILABLE',
+                  'The execution service is not ready for a retry.',
+                  503,
+                  true,
+                );
+              }
+              if (sourceAttempt.workflowRevisionId) {
+                const validation =
+                  await workflowService.validateWorkflowRevisionInTransaction(
+                    repositories,
+                    projectId,
+                    sourceAttempt.shotId,
+                    sourceAttempt.workflowRevisionId,
+                  );
+                if (validation.validation.errors.length > 0) {
+                  throw new HttpProblemError(
+                    'WORKFLOW_REVISION_INVALID',
+                    'The managed workflow revision is no longer valid.',
+                    409,
+                    false,
+                  );
+                }
+              }
+              retryAttemptId = recommendationAttemptId;
             }
             const updated =
               await repositories.operationalRecommendations.updateStatus(
@@ -2421,6 +2537,13 @@ export function buildApiApp(options: ApiAppOptions = {}): FastifyInstance {
                 expectedVersion,
                 toIsoUtc(clock.now()),
               );
+            if (retryAttemptId) {
+              attempt = await generationService.retryAttemptInTransaction(
+                repositories,
+                retryAttemptId,
+                { idempotencyKey: key },
+              );
+            }
             return {
               status: 200,
               body: {
@@ -2961,6 +3084,7 @@ export async function startApi(
     databaseReady: () => checkDatabaseReady(pool),
     store,
     startGenerationWorker: true,
+    startOperationalWorker: true,
   });
 
   app.addHook('onClose', async () => {

@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import {
   assertUuid,
+  createDomainEvent,
   systemClock,
   systemIdGenerator,
   toIsoUtc,
@@ -825,6 +826,15 @@ export class WorkflowApplicationService {
         revision,
         resourceMutationKey('revision.create', reservation.key),
       );
+      if (validation.errors.length > 0) {
+        await this.appendValidationEvents(
+          repositories,
+          projectId,
+          shotId,
+          created.id,
+          validation.errors.map((issue) => issue.code),
+        );
+      }
       await completeApplicationMutation(
         repositories,
         this.tenantId,
@@ -899,7 +909,53 @@ export class WorkflowApplicationService {
         executorFingerprint: validation.executorFingerprint ?? null,
       },
     );
+    if (validation.errors.length > 0) {
+      await this.appendValidationEvents(
+        repositories,
+        projectId,
+        shotId,
+        updated.id,
+        validation.errors.map((issue) => issue.code),
+      );
+    }
     return { revision: updated, validation };
+  }
+
+  private async appendValidationEvents(
+    repositories: Repositories,
+    projectId: Uuid,
+    shotId: Uuid,
+    revisionId: Uuid,
+    validationCodes: readonly string[],
+  ): Promise<void> {
+    const now = toIsoUtc(this.clock.now());
+    const append = async (
+      type: 'workflow.revision.invalid' | 'executor.unavailable',
+      payload: Readonly<Record<string, unknown>>,
+    ): Promise<void> => {
+      const event = createDomainEvent({
+        id: this.idGenerator.next(),
+        type,
+        producer: 'h3-workflow',
+        tenantId: this.tenantId,
+        projectId,
+        shotId,
+        clock: { now: () => new Date(now) },
+        payload,
+      });
+      await repositories.events.append(event);
+      await repositories.outbox.enqueue(event);
+    };
+    await append('workflow.revision.invalid', {
+      workflowRevisionId: revisionId,
+      validationCodes: validationCodes.slice(0, 16),
+    });
+    if (validationCodes.includes('EXECUTOR_UNAVAILABLE')) {
+      await append('executor.unavailable', {
+        workflowRevisionId: revisionId,
+        reasonCode: 'EXECUTOR_UNAVAILABLE',
+      });
+    }
   }
 
   private profile(

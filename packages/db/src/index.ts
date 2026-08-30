@@ -545,6 +545,11 @@ export interface OperationalRecommendationRecord {
 
 export interface OperationalRecommendationRepository {
   create(recommendation: OperationalRecommendationRecord): Promise<void>;
+  findByTriggerEventAndCode(
+    tenantId: Uuid,
+    triggerEventId: Uuid,
+    recommendationCode: string,
+  ): Promise<OperationalRecommendationRecord | null>;
   findById(
     tenantId: Uuid,
     projectId: Uuid,
@@ -3370,6 +3375,22 @@ class PostgresOperationalRecommendationRepository
     );
   }
 
+  async findByTriggerEventAndCode(
+    tenantId: Uuid,
+    triggerEventId: Uuid,
+    recommendationCode: string,
+  ): Promise<OperationalRecommendationRecord | null> {
+    const result = await this.executor.query<RecommendationRow>(
+      `SELECT * FROM operational_recommendations
+       WHERE tenant_id = $1
+         AND trigger_event_id = $2
+         AND recommendation_code = $3`,
+      [tenantId, triggerEventId, recommendationCode],
+    );
+    const row = result.rows[0];
+    return row ? mapRecommendation(row) : null;
+  }
+
   async findById(
     tenantId: Uuid,
     projectId: Uuid,
@@ -4928,6 +4949,19 @@ class MemoryRepositories implements Repositories {
           copyRecommendation(recommendation),
         );
       },
+      findByTriggerEventAndCode: async (
+        tenantId,
+        triggerEventId,
+        recommendationCode,
+      ) => {
+        const recommendation = [...this.state.recommendations.values()].find(
+          (current) =>
+            current.tenantId === tenantId &&
+            current.triggerEventId === triggerEventId &&
+            current.recommendationCode === recommendationCode,
+        );
+        return recommendation ? copyRecommendation(recommendation) : null;
+      },
       findById: async (tenantId, projectId, recommendationId) => {
         const recommendation = this.state.recommendations.get(recommendationId);
         return recommendation &&
@@ -5172,7 +5206,8 @@ export function createInMemoryStore(): InMemoryStore {
 }
 
 export interface OutboxConsumer {
-  consume(message: OutboxMessage): Promise<void>;
+  /** The repositories are from the claim transaction when supplied. */
+  consume(message: OutboxMessage, repositories?: Repositories): Promise<void>;
 }
 
 export class NoopOutboxConsumer implements OutboxConsumer {
@@ -5203,7 +5238,7 @@ export class OutboxDispatcher {
         return;
       }
       try {
-        await this.consumer.consume(message);
+        await this.consumer.consume(message, repositories);
         await repositories.outbox.markDelivered(message.id, now);
         dispatched = true;
       } catch (error) {
