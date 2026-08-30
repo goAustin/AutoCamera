@@ -77,4 +77,41 @@ describe('Phase 2 migration contract', () => {
     expect(sql).toContain('agent_runs_tenant_run_id_unique');
     expect(sql).toContain('storyboard_proposals_assumptions_array');
   });
+
+  it('declares the Phase 5 Checkpoint 1 persistence and recovery contract', () => {
+    const sql = readFileSync(
+      join(migrationsDirectory, '0004_phase5_project_studio.sql'),
+      'utf8',
+    );
+    for (const table of [
+      'workflow_drafts',
+      'workflow_revisions',
+      'operational_recommendations',
+    ]) {
+      expect(sql).toContain(`CREATE TABLE ${table}`);
+    }
+    for (const column of [
+      'visual_description',
+      'camera_direction',
+      'audio_direction',
+      'dialogue',
+      'acceptance_criteria',
+      'required_asset_ids',
+      'workflow_revision_id',
+      'parent_revision_id',
+      'execution_hash',
+      'validation_errors_json',
+      'trigger_event_id',
+      'proposed_action_type',
+    ]) {
+      expect(sql).toContain(column);
+    }
+    expect(sql).toContain("proposal.status = 'approved'");
+    expect(sql).toContain("definition.value->>'ordinal' = s.ordinal::text");
+    expect(sql).toContain('workflow_revisions_immutable_trigger');
+    expect(sql).toContain('workflow_revisions_profile_hash_scope_unique');
+    expect(sql).toContain('operational_recommendations_event_code_unique');
+    expect(sql).toContain("'needs_attention'");
+    expect(sql).toContain("'retryable'");
+  });
 });

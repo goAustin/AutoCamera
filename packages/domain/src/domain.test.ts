@@ -190,6 +190,24 @@ describe('domain transitions', () => {
       'UNKNOWN_SHOT_STATUS',
     );
   });
+
+  it('models recoverable attention states without reopening terminal attempts', () => {
+    const projectNeedsAttention = transitionProject(
+      projectWithStatus('generating'),
+      'needs_attention',
+    );
+    expect(projectNeedsAttention.status).toBe('needs_attention');
+    expect(transitionProject(projectNeedsAttention, 'generating').status).toBe(
+      'generating',
+    );
+
+    const shotRetryable = transitionShot(
+      shotWithStatus('generating'),
+      'retryable',
+    );
+    expect(shotRetryable.status).toBe('retryable');
+    expect(transitionShot(shotRetryable, 'queued').status).toBe('queued');
+  });
 });
 
 describe('domain money, identity, and constructors', () => {

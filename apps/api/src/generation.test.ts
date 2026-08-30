@@ -323,6 +323,45 @@ describe('Phase 3 durable generation worker', () => {
     }
   });
 
+  it('moves recoverable infrastructure failures to attention states and derives a retry', async () => {
+    const context = await setupProject();
+    cleanups.push(context.root);
+    const attempt = await context.generation.createAttempt(
+      context.shots[0]?.id as Uuid,
+      {
+        idempotencyKey: 'recoverable-failure',
+        scenario: 'execution-failure',
+      },
+    );
+    await context.worker.processOnce();
+
+    expect((await context.generation.getAttempt(attempt.id)).status).toBe(
+      'failed',
+    );
+    expect(
+      (await context.projectService.listShots(attempt.projectId)).find(
+        (shot) => shot.id === attempt.shotId,
+      )?.status,
+    ).toBe('retryable');
+    expect(
+      (await context.projectService.getProject(attempt.projectId)).status,
+    ).toBe('needs_attention');
+
+    const retry = await context.generation.regenerateAttempt(attempt.id, {
+      idempotencyKey: 'recoverable-failure-retry',
+    });
+    expect(retry.status).toBe('queued');
+    expect(retry.sourceAttemptId).toBe(attempt.id);
+    expect(
+      (await context.projectService.getProject(attempt.projectId)).status,
+    ).toBe('generating');
+    expect(
+      (await context.projectService.listShots(attempt.projectId)).find(
+        (shot) => shot.id === attempt.shotId,
+      )?.status,
+    ).toBe('queued');
+  });
+
   it('accepts one validated attempt per shot and completes the project atomically', async () => {
     const context = await setupProject();
     cleanups.push(context.root);

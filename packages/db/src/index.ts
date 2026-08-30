@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { readFile, readdir } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -16,6 +17,7 @@ import {
   parseShotStatus,
   parseStoryboardStatus,
   toIsoUtc,
+  isTerminalGenerationAttempt,
   type ArtifactRecord,
   type AttemptFailureCode,
   type EvaluationResult,
@@ -106,6 +108,9 @@ export type RepositoryErrorCode =
   | 'NOT_FOUND'
   | 'OPTIMISTIC_CONFLICT'
   | 'UNIQUE_VIOLATION'
+  | 'SCOPE_VIOLATION'
+  | 'IDEMPOTENCY_CONFLICT'
+  | 'INVALID_ARGUMENT'
   | 'DATABASE_ERROR';
 
 export class RepositoryError extends Error {
@@ -274,6 +279,271 @@ export interface WorkflowVersionRepository {
   create(version: WorkflowVersionRecord): Promise<void>;
 }
 
+export interface WorkflowExecutionEnvelope {
+  readonly profileId: string;
+  readonly profileVersion: string;
+  readonly apiGraph: Readonly<Record<string, unknown>>;
+  readonly parameters: Readonly<Record<string, unknown>>;
+}
+
+/**
+ * Canonical JSON used for execution identity and idempotency request hashes.
+ * Object keys are sorted recursively; array order is intentionally retained.
+ */
+export function canonicalizeJson(value: unknown): string {
+  if (value === null) return 'null';
+  if (typeof value === 'string' || typeof value === 'boolean') {
+    return JSON.stringify(value);
+  }
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) {
+      throw new RepositoryError(
+        'INVALID_ARGUMENT',
+        'Canonical JSON cannot contain a non-finite number.',
+      );
+    }
+    return JSON.stringify(value);
+  }
+  if (typeof value !== 'object' || value === undefined) {
+    throw new RepositoryError(
+      'INVALID_ARGUMENT',
+      'Canonical JSON contains a non-JSON value.',
+    );
+  }
+  if (Array.isArray(value)) {
+    return `[${Array.from({ length: value.length }, (_, index) => {
+      if (!(index in value)) {
+        throw new RepositoryError(
+          'INVALID_ARGUMENT',
+          'Canonical JSON cannot contain sparse arrays.',
+        );
+      }
+      return canonicalizeJson(value[index]);
+    }).join(',')}]`;
+  }
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new RepositoryError(
+      'INVALID_ARGUMENT',
+      'Canonical JSON only accepts plain objects and arrays.',
+    );
+  }
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record)
+    .sort()
+    .map((key) => {
+      const candidate = record[key];
+      if (candidate === undefined) {
+        throw new RepositoryError(
+          'INVALID_ARGUMENT',
+          'Canonical JSON cannot contain undefined object values.',
+        );
+      }
+      return `${JSON.stringify(key)}:${canonicalizeJson(candidate)}`;
+    })
+    .join(',')}}`;
+}
+
+export function canonicalizeWorkflowExecutionEnvelope(
+  envelope: WorkflowExecutionEnvelope,
+): string {
+  return canonicalizeJson({
+    profileId: envelope.profileId,
+    profileVersion: envelope.profileVersion,
+    apiGraph: envelope.apiGraph,
+    parameters: envelope.parameters,
+  });
+}
+
+export function hashWorkflowExecutionEnvelope(
+  envelope: WorkflowExecutionEnvelope,
+): string {
+  return createHash('sha256')
+    .update(canonicalizeWorkflowExecutionEnvelope(envelope), 'utf8')
+    .digest('hex');
+}
+
+export const WORKFLOW_REVISION_SOURCES = [
+  'comfy_editor',
+  'official_template',
+  'system',
+] as const;
+export type WorkflowRevisionSource = (typeof WORKFLOW_REVISION_SOURCES)[number];
+
+export const WORKFLOW_REVISION_VALIDATION_STATUSES = [
+  'pending',
+  'validated',
+  'invalid',
+] as const;
+export type WorkflowRevisionValidationStatus =
+  (typeof WORKFLOW_REVISION_VALIDATION_STATUSES)[number];
+
+export interface WorkflowValidationError {
+  readonly code: string;
+  readonly message: string;
+}
+
+export interface WorkflowDraftRecord {
+  readonly id: Uuid;
+  readonly tenantId: Uuid;
+  readonly projectId: Uuid;
+  readonly shotId: Uuid;
+  readonly baseRevisionId?: Uuid;
+  readonly profileId: string;
+  readonly profileVersion: string;
+  readonly editorGraphJson: Readonly<Record<string, unknown>>;
+  readonly lastApiGraphJson?: Readonly<Record<string, unknown>>;
+  readonly authorType: string;
+  readonly authorId: string;
+  readonly version: number;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+export interface WorkflowDraftRepository {
+  findByShot(
+    tenantId: Uuid,
+    projectId: Uuid,
+    shotId: Uuid,
+  ): Promise<WorkflowDraftRecord | null>;
+  create(
+    draft: WorkflowDraftRecord,
+    idempotencyKey: string,
+  ): Promise<WorkflowDraftRecord>;
+  update(
+    draft: WorkflowDraftRecord,
+    expectedVersion: number,
+    idempotencyKey: string,
+  ): Promise<WorkflowDraftRecord>;
+}
+
+export interface WorkflowRevisionRecord {
+  readonly id: Uuid;
+  readonly tenantId: Uuid;
+  readonly projectId: Uuid;
+  readonly shotId: Uuid;
+  readonly revisionNumber: number;
+  readonly parentRevisionId?: Uuid;
+  readonly profileId: string;
+  readonly profileVersion: string;
+  readonly source: WorkflowRevisionSource;
+  readonly authorType: string;
+  readonly authorId: string;
+  readonly editorGraphJson: Readonly<Record<string, unknown>>;
+  readonly apiGraphJson: Readonly<Record<string, unknown>>;
+  readonly executionHash: string;
+  readonly executionParametersJson: Readonly<Record<string, unknown>>;
+  readonly validationStatus: WorkflowRevisionValidationStatus;
+  readonly validationErrorsJson: readonly WorkflowValidationError[];
+  readonly validatedAt?: string;
+  readonly executorFingerprint?: string;
+  readonly createdAt: string;
+}
+
+export interface WorkflowRevisionValidationUpdate {
+  readonly validationStatus: WorkflowRevisionValidationStatus;
+  readonly validationErrorsJson: readonly WorkflowValidationError[];
+  readonly validatedAt: string | null;
+  readonly executorFingerprint: string | null;
+}
+
+export interface WorkflowRevisionRepository {
+  create(
+    revision: WorkflowRevisionRecord,
+    idempotencyKey: string,
+  ): Promise<WorkflowRevisionRecord>;
+  findById(
+    tenantId: Uuid,
+    projectId: Uuid,
+    shotId: Uuid,
+    revisionId: Uuid,
+  ): Promise<WorkflowRevisionRecord | null>;
+  listByShot(
+    tenantId: Uuid,
+    projectId: Uuid,
+    shotId: Uuid,
+  ): Promise<readonly WorkflowRevisionRecord[]>;
+  updateValidation(
+    tenantId: Uuid,
+    projectId: Uuid,
+    shotId: Uuid,
+    revisionId: Uuid,
+    update: WorkflowRevisionValidationUpdate,
+  ): Promise<WorkflowRevisionRecord>;
+}
+
+export const RECOMMENDATION_SEVERITIES = [
+  'info',
+  'warning',
+  'critical',
+] as const;
+export type RecommendationSeverity = (typeof RECOMMENDATION_SEVERITIES)[number];
+
+export const RECOMMENDATION_ACTION_TYPES = [
+  'retry_attempt',
+  'open_workflow_revision',
+  'wait_for_executor',
+  'request_human_review',
+  'no_action',
+] as const;
+export type RecommendationActionType =
+  (typeof RECOMMENDATION_ACTION_TYPES)[number];
+
+export const RECOMMENDATION_STATUSES = [
+  'pending',
+  'applied',
+  'dismissed',
+  'expired',
+] as const;
+export type RecommendationStatus = (typeof RECOMMENDATION_STATUSES)[number];
+
+export interface RecommendationEvidenceReference {
+  readonly type: string;
+  readonly resourceId: string;
+}
+
+export interface OperationalRecommendationRecord {
+  readonly id: Uuid;
+  readonly tenantId: Uuid;
+  readonly projectId: Uuid;
+  readonly shotId?: Uuid;
+  readonly attemptId?: Uuid;
+  readonly triggerEventId: Uuid;
+  readonly piAgentRunId?: Uuid;
+  readonly severity: RecommendationSeverity;
+  readonly recommendationCode: string;
+  readonly title: string;
+  readonly detail: string;
+  readonly evidenceReferencesJson: readonly RecommendationEvidenceReference[];
+  readonly proposedActionType: RecommendationActionType;
+  readonly proposedResourceIdsJson: readonly string[];
+  readonly status: RecommendationStatus;
+  readonly version: number;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+export interface OperationalRecommendationRepository {
+  create(recommendation: OperationalRecommendationRecord): Promise<void>;
+  findById(
+    tenantId: Uuid,
+    projectId: Uuid,
+    recommendationId: Uuid,
+  ): Promise<OperationalRecommendationRecord | null>;
+  listByProject(
+    tenantId: Uuid,
+    projectId: Uuid,
+  ): Promise<readonly OperationalRecommendationRecord[]>;
+  updateStatus(
+    tenantId: Uuid,
+    projectId: Uuid,
+    recommendationId: Uuid,
+    status: RecommendationStatus,
+    expectedVersion: number,
+    updatedAt: string,
+  ): Promise<OperationalRecommendationRecord>;
+}
+
 export interface EventRepository {
   append(event: DomainEvent): Promise<void>;
   listByProject(projectId: Uuid): Promise<readonly DomainEvent[]>;
@@ -343,6 +613,10 @@ export interface Repositories {
   readonly evaluations: EvaluationRepository;
   readonly agentRuns: AgentRunRepository;
   readonly workflowVersions: WorkflowVersionRepository;
+  readonly workflowDrafts: WorkflowDraftRepository;
+  readonly workflowRevisions: WorkflowRevisionRepository;
+  readonly recommendations: OperationalRecommendationRepository;
+  readonly operationalRecommendations: OperationalRecommendationRepository;
   readonly events: EventRepository;
   readonly outbox: OutboxRepository;
   readonly idempotency: IdempotencyRepository;
@@ -397,6 +671,12 @@ interface ShotRow extends QueryResultRow {
   duration_seconds: string | number;
   mode: string;
   quality_tier: string;
+  visual_description: string | null;
+  camera_direction: string | null;
+  audio_direction: string | null;
+  dialogue: string | null;
+  acceptance_criteria: unknown;
+  required_asset_ids: unknown;
   status: string;
   accepted_attempt_id: string | null;
   version: number;
@@ -417,6 +697,7 @@ interface AttemptRow extends QueryResultRow {
   requested_height: number;
   requested_duration_seconds: string | number;
   workflow_version_id: string | null;
+  workflow_revision_id: string | null;
   workflow_hash: string;
   correlation_id: string;
   trace_id: string | null;
@@ -496,6 +777,67 @@ interface WorkflowVersionRow extends QueryResultRow {
   created_at: DatabaseTimestamp;
 }
 
+interface WorkflowDraftRow extends QueryResultRow {
+  id: string;
+  tenant_id: string;
+  project_id: string;
+  shot_id: string;
+  base_revision_id: string | null;
+  profile_id: string;
+  profile_version: string;
+  editor_graph_json: unknown;
+  last_api_graph_json: unknown | null;
+  author_type: string;
+  author_id: string;
+  version: number;
+  created_at: DatabaseTimestamp;
+  updated_at: DatabaseTimestamp;
+}
+
+interface WorkflowRevisionRow extends QueryResultRow {
+  id: string;
+  tenant_id: string;
+  project_id: string;
+  shot_id: string;
+  revision_number: number;
+  parent_revision_id: string | null;
+  profile_id: string;
+  profile_version: string;
+  source: string;
+  author_type: string;
+  author_id: string;
+  editor_graph_json: unknown;
+  api_graph_json: unknown;
+  execution_hash: string;
+  execution_parameters_json: unknown;
+  validation_status: string;
+  validation_errors_json: unknown;
+  validated_at: DatabaseTimestamp | null;
+  executor_fingerprint: string | null;
+  created_at: DatabaseTimestamp;
+}
+
+interface RecommendationRow extends QueryResultRow {
+  id: string;
+  tenant_id: string;
+  project_id: string;
+  shot_id: string | null;
+  attempt_id: string | null;
+  trigger_event_id: string;
+  pi_agent_run_id: string | null;
+  severity: string;
+  recommendation_code: string;
+  title: string;
+  detail: string;
+  evidence_references_json: unknown;
+  proposed_action_type: string;
+  proposed_resource_ids_json: unknown;
+  status: string;
+  version: number;
+  created_at: DatabaseTimestamp;
+  updated_at: DatabaseTimestamp;
+}
+
 interface EventRow extends QueryResultRow {
   id: string;
   event_sequence?: number;
@@ -567,6 +909,311 @@ function databaseJson(value: unknown): string {
     );
   }
   return serialized;
+}
+
+function jsonByteLength(value: unknown): number {
+  return Buffer.byteLength(databaseJson(value), 'utf8');
+}
+
+function databaseJsonRecord(
+  value: unknown,
+  message: string,
+): Readonly<Record<string, unknown>> {
+  const parsed = typeof value === 'string' ? JSON.parse(value) : value;
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new RepositoryError('DATABASE_ERROR', message);
+  }
+  return parsed as Readonly<Record<string, unknown>>;
+}
+
+function databaseJsonArray(
+  value: unknown,
+  message: string,
+): readonly unknown[] {
+  const parsed = typeof value === 'string' ? JSON.parse(value) : value;
+  if (!Array.isArray(parsed)) {
+    throw new RepositoryError('DATABASE_ERROR', message);
+  }
+  return parsed;
+}
+
+function mutationKey(value: string): string {
+  if (!value.trim() || value.length > 200) {
+    throw new RepositoryError(
+      'INVALID_ARGUMENT',
+      'Workflow mutations require a bounded idempotency key.',
+    );
+  }
+  return value;
+}
+
+function mutationRequestHash(value: unknown): string {
+  return createHash('sha256')
+    .update(canonicalizeJson(value), 'utf8')
+    .digest('hex');
+}
+
+function assertBoundedText(
+  value: unknown,
+  name: string,
+  maxLength: number,
+): asserts value is string {
+  if (typeof value !== 'string' || !value.trim() || value.length > maxLength) {
+    throw new RepositoryError(
+      'INVALID_ARGUMENT',
+      `${name} must be non-empty and bounded.`,
+    );
+  }
+}
+
+function assertGraphJson(
+  value: unknown,
+  name: string,
+  maxBytes = 1_048_576,
+): asserts value is Readonly<Record<string, unknown>> {
+  databaseJsonRecord(value, `${name} must be a JSON object.`);
+  if (jsonByteLength(value) > maxBytes) {
+    throw new RepositoryError(
+      'INVALID_ARGUMENT',
+      `${name} exceeds the stored JSON size limit.`,
+    );
+  }
+}
+
+function assertWorkflowDraftRecord(draft: WorkflowDraftRecord): void {
+  assertUuid(draft.id);
+  assertUuid(draft.tenantId);
+  assertUuid(draft.projectId);
+  assertUuid(draft.shotId);
+  if (draft.baseRevisionId) assertUuid(draft.baseRevisionId);
+  assertBoundedText(draft.profileId, 'Workflow draft profile ID', 128);
+  assertBoundedText(draft.profileVersion, 'Workflow draft profile version', 64);
+  assertGraphJson(draft.editorGraphJson, 'Workflow draft editor graph');
+  if (draft.lastApiGraphJson !== undefined) {
+    assertGraphJson(draft.lastApiGraphJson, 'Workflow draft API graph');
+  }
+  assertBoundedText(draft.authorType, 'Workflow draft author type', 64);
+  assertBoundedText(draft.authorId, 'Workflow draft author ID', 200);
+  if (!Number.isSafeInteger(draft.version) || draft.version < 1) {
+    throw new RepositoryError(
+      'INVALID_ARGUMENT',
+      'Workflow draft version must be positive.',
+    );
+  }
+  toIsoUtc(new Date(draft.createdAt));
+  toIsoUtc(new Date(draft.updatedAt));
+}
+
+function assertWorkflowValidationErrors(
+  value: readonly WorkflowValidationError[],
+): void {
+  if (
+    !Array.isArray(value) ||
+    value.length > 32 ||
+    value.some(
+      (error) =>
+        typeof error !== 'object' ||
+        error === null ||
+        typeof error.code !== 'string' ||
+        !error.code.trim() ||
+        error.code.length > 64 ||
+        typeof error.message !== 'string' ||
+        !error.message.trim() ||
+        error.message.length > 500,
+    )
+  ) {
+    throw new RepositoryError(
+      'INVALID_ARGUMENT',
+      'Workflow validation errors must be a bounded array of safe codes and messages.',
+    );
+  }
+}
+
+function assertWorkflowRevisionRecord(revision: WorkflowRevisionRecord): void {
+  assertUuid(revision.id);
+  assertUuid(revision.tenantId);
+  assertUuid(revision.projectId);
+  assertUuid(revision.shotId);
+  if (
+    !Number.isSafeInteger(revision.revisionNumber) ||
+    revision.revisionNumber < 1
+  ) {
+    throw new RepositoryError(
+      'INVALID_ARGUMENT',
+      'Workflow revision number must be positive.',
+    );
+  }
+  if (revision.parentRevisionId) assertUuid(revision.parentRevisionId);
+  assertBoundedText(revision.profileId, 'Workflow revision profile ID', 128);
+  assertBoundedText(
+    revision.profileVersion,
+    'Workflow revision profile version',
+    64,
+  );
+  if (!WORKFLOW_REVISION_SOURCES.includes(revision.source)) {
+    throw new RepositoryError(
+      'INVALID_ARGUMENT',
+      'Workflow revision source is unknown.',
+    );
+  }
+  assertBoundedText(revision.authorType, 'Workflow revision author type', 64);
+  assertBoundedText(revision.authorId, 'Workflow revision author ID', 200);
+  assertGraphJson(revision.editorGraphJson, 'Workflow revision editor graph');
+  assertGraphJson(revision.apiGraphJson, 'Workflow revision API graph');
+  if (!/^[0-9a-f]{64}$/.test(revision.executionHash)) {
+    throw new RepositoryError(
+      'INVALID_ARGUMENT',
+      'Workflow revision execution hash must be lowercase SHA-256 hex.',
+    );
+  }
+  const expectedHash = hashWorkflowExecutionEnvelope({
+    profileId: revision.profileId,
+    profileVersion: revision.profileVersion,
+    apiGraph: revision.apiGraphJson,
+    parameters: revision.executionParametersJson,
+  });
+  if (revision.executionHash !== expectedHash) {
+    throw new RepositoryError(
+      'INVALID_ARGUMENT',
+      'Workflow revision execution hash does not match its canonical envelope.',
+    );
+  }
+  assertGraphJson(
+    revision.executionParametersJson,
+    'Workflow revision execution parameters',
+    262_144,
+  );
+  if (
+    !WORKFLOW_REVISION_VALIDATION_STATUSES.includes(revision.validationStatus)
+  ) {
+    throw new RepositoryError(
+      'INVALID_ARGUMENT',
+      'Workflow revision validation status is unknown.',
+    );
+  }
+  assertWorkflowValidationErrors(revision.validationErrorsJson);
+  if (jsonByteLength(revision.validationErrorsJson) > 131_072) {
+    throw new RepositoryError(
+      'INVALID_ARGUMENT',
+      'Workflow revision validation errors exceed the stored JSON size limit.',
+    );
+  }
+  if (revision.validatedAt !== undefined)
+    toIsoUtc(new Date(revision.validatedAt));
+  if (revision.executorFingerprint !== undefined) {
+    assertBoundedText(
+      revision.executorFingerprint,
+      'Workflow revision executor fingerprint',
+      256,
+    );
+  }
+  toIsoUtc(new Date(revision.createdAt));
+}
+
+function assertWorkflowValidationUpdate(
+  update: WorkflowRevisionValidationUpdate,
+): void {
+  if (
+    !WORKFLOW_REVISION_VALIDATION_STATUSES.includes(update.validationStatus)
+  ) {
+    throw new RepositoryError(
+      'INVALID_ARGUMENT',
+      'Workflow revision validation status is unknown.',
+    );
+  }
+  assertWorkflowValidationErrors(update.validationErrorsJson);
+  if (update.validatedAt !== null) toIsoUtc(new Date(update.validatedAt));
+  if (update.executorFingerprint !== null) {
+    assertBoundedText(
+      update.executorFingerprint,
+      'Workflow revision executor fingerprint',
+      256,
+    );
+  }
+}
+
+function assertRecommendationRecord(
+  recommendation: OperationalRecommendationRecord,
+): void {
+  assertUuid(recommendation.id);
+  assertUuid(recommendation.tenantId);
+  assertUuid(recommendation.projectId);
+  if (recommendation.shotId) assertUuid(recommendation.shotId);
+  if (recommendation.attemptId) assertUuid(recommendation.attemptId);
+  assertUuid(recommendation.triggerEventId);
+  if (recommendation.piAgentRunId) assertUuid(recommendation.piAgentRunId);
+  if (!RECOMMENDATION_SEVERITIES.includes(recommendation.severity)) {
+    throw new RepositoryError(
+      'INVALID_ARGUMENT',
+      'Recommendation severity is unknown.',
+    );
+  }
+  if (!/^[A-Z0-9][A-Z0-9_.-]{0,63}$/.test(recommendation.recommendationCode)) {
+    throw new RepositoryError(
+      'INVALID_ARGUMENT',
+      'Recommendation code is invalid.',
+    );
+  }
+  assertBoundedText(recommendation.title, 'Recommendation title', 240);
+  assertBoundedText(recommendation.detail, 'Recommendation detail', 2_000);
+  if (
+    !Array.isArray(recommendation.evidenceReferencesJson) ||
+    recommendation.evidenceReferencesJson.length > 32 ||
+    recommendation.evidenceReferencesJson.some(
+      (reference) =>
+        typeof reference.type !== 'string' ||
+        !reference.type.trim() ||
+        reference.type.length > 64 ||
+        typeof reference.resourceId !== 'string' ||
+        !reference.resourceId.trim() ||
+        reference.resourceId.length > 200,
+    )
+  ) {
+    throw new RepositoryError(
+      'INVALID_ARGUMENT',
+      'Recommendation evidence references must be bounded and sanitized.',
+    );
+  }
+  if (
+    !RECOMMENDATION_ACTION_TYPES.includes(recommendation.proposedActionType)
+  ) {
+    throw new RepositoryError(
+      'INVALID_ARGUMENT',
+      'Recommendation action is unknown.',
+    );
+  }
+  if (
+    !Array.isArray(recommendation.proposedResourceIdsJson) ||
+    recommendation.proposedResourceIdsJson.length > 32 ||
+    recommendation.proposedResourceIdsJson.some(
+      (resourceId) =>
+        typeof resourceId !== 'string' ||
+        !resourceId.trim() ||
+        resourceId.length > 200,
+    )
+  ) {
+    throw new RepositoryError(
+      'INVALID_ARGUMENT',
+      'Recommendation resource IDs must be bounded strings.',
+    );
+  }
+  if (!RECOMMENDATION_STATUSES.includes(recommendation.status)) {
+    throw new RepositoryError(
+      'INVALID_ARGUMENT',
+      'Recommendation status is unknown.',
+    );
+  }
+  if (
+    !Number.isSafeInteger(recommendation.version) ||
+    recommendation.version < 1
+  ) {
+    throw new RepositoryError(
+      'INVALID_ARGUMENT',
+      'Recommendation version must be positive.',
+    );
+  }
+  toIsoUtc(new Date(recommendation.createdAt));
+  toIsoUtc(new Date(recommendation.updatedAt));
 }
 
 function databaseStringArray(
@@ -768,6 +1415,18 @@ function mapShot(row: ShotRow): Shot {
     durationSeconds: databaseNumber(row.duration_seconds),
     mode: 't2v',
     qualityTier: 'preview',
+    ...(row.visual_description !== null
+      ? { visualDescription: row.visual_description }
+      : {}),
+    ...(row.camera_direction !== null
+      ? { cameraDirection: row.camera_direction }
+      : {}),
+    ...(row.audio_direction !== null
+      ? { audioDirection: row.audio_direction }
+      : {}),
+    ...(row.dialogue !== null ? { dialogue: row.dialogue } : {}),
+    acceptanceCriteria: databaseStringArray(row.acceptance_criteria),
+    requiredAssetIds: databaseStringArray(row.required_asset_ids),
     status: parseShotStatus(row.status),
     version: row.version,
     createdAt: databaseTimestamp(row.created_at) as Shot['createdAt'],
@@ -810,6 +1469,9 @@ function mapAttempt(row: AttemptRow): GenerationAttempt {
   const workflowVersionId = row.workflow_version_id
     ? assertUuid(row.workflow_version_id)
     : undefined;
+  const workflowRevisionId = row.workflow_revision_id
+    ? assertUuid(row.workflow_revision_id)
+    : undefined;
   const traceId = row.trace_id ?? undefined;
   const scenario = row.scenario ?? undefined;
   const comfyPromptId = row.comfy_prompt_id ?? undefined;
@@ -850,6 +1512,7 @@ function mapAttempt(row: AttemptRow): GenerationAttempt {
       row.updated_at,
     ) as GenerationAttempt['updatedAt'],
     ...(workflowVersionId ? { workflowVersionId } : {}),
+    ...(workflowRevisionId ? { workflowRevisionId } : {}),
     ...(traceId ? { traceId } : {}),
     ...(scenario ? { scenario } : {}),
     ...(comfyPromptId ? { comfyPromptId } : {}),
@@ -935,6 +1598,194 @@ function mapWorkflowVersion(row: WorkflowVersionRow): WorkflowVersionRecord {
   };
 }
 
+function mapWorkflowDraft(row: WorkflowDraftRow): WorkflowDraftRecord {
+  const baseRevisionId = row.base_revision_id
+    ? assertUuid(row.base_revision_id)
+    : undefined;
+  const lastApiGraphJson =
+    row.last_api_graph_json === null
+      ? undefined
+      : databaseJsonRecord(
+          row.last_api_graph_json,
+          'Stored workflow draft API graph is invalid.',
+        );
+  return {
+    id: assertUuid(row.id),
+    tenantId: assertUuid(row.tenant_id),
+    projectId: assertUuid(row.project_id),
+    shotId: assertUuid(row.shot_id),
+    ...(baseRevisionId ? { baseRevisionId } : {}),
+    profileId: row.profile_id,
+    profileVersion: row.profile_version,
+    editorGraphJson: databaseJsonRecord(
+      row.editor_graph_json,
+      'Stored workflow draft editor graph is invalid.',
+    ),
+    ...(lastApiGraphJson ? { lastApiGraphJson } : {}),
+    authorType: row.author_type,
+    authorId: row.author_id,
+    version: row.version,
+    createdAt: databaseTimestamp(row.created_at),
+    updatedAt: databaseTimestamp(row.updated_at),
+  };
+}
+
+function mapWorkflowRevision(row: WorkflowRevisionRow): WorkflowRevisionRecord {
+  const parentRevisionId = row.parent_revision_id
+    ? assertUuid(row.parent_revision_id)
+    : undefined;
+  const validatedAt = row.validated_at
+    ? databaseTimestamp(row.validated_at)
+    : undefined;
+  const executorFingerprint = row.executor_fingerprint ?? undefined;
+  if (
+    !WORKFLOW_REVISION_SOURCES.includes(row.source as WorkflowRevisionSource)
+  ) {
+    throw new RepositoryError(
+      'DATABASE_ERROR',
+      'Database returned an unknown workflow revision source.',
+    );
+  }
+  if (
+    !WORKFLOW_REVISION_VALIDATION_STATUSES.includes(
+      row.validation_status as WorkflowRevisionValidationStatus,
+    )
+  ) {
+    throw new RepositoryError(
+      'DATABASE_ERROR',
+      'Database returned an unknown workflow revision validation status.',
+    );
+  }
+  const validationErrorsJson = databaseJsonArray(
+    row.validation_errors_json,
+    'Stored workflow validation errors are invalid.',
+  ).map((value) => {
+    const record =
+      typeof value === 'object' && value !== null
+        ? (value as Record<string, unknown>)
+        : undefined;
+    if (
+      !record ||
+      typeof record.code !== 'string' ||
+      typeof record.message !== 'string'
+    ) {
+      throw new RepositoryError(
+        'DATABASE_ERROR',
+        'Stored workflow validation error is invalid.',
+      );
+    }
+    return { code: record.code, message: record.message };
+  });
+  return {
+    id: assertUuid(row.id),
+    tenantId: assertUuid(row.tenant_id),
+    projectId: assertUuid(row.project_id),
+    shotId: assertUuid(row.shot_id),
+    revisionNumber: row.revision_number,
+    ...(parentRevisionId ? { parentRevisionId } : {}),
+    profileId: row.profile_id,
+    profileVersion: row.profile_version,
+    source: row.source as WorkflowRevisionSource,
+    authorType: row.author_type,
+    authorId: row.author_id,
+    editorGraphJson: databaseJsonRecord(
+      row.editor_graph_json,
+      'Stored workflow revision editor graph is invalid.',
+    ),
+    apiGraphJson: databaseJsonRecord(
+      row.api_graph_json,
+      'Stored workflow revision API graph is invalid.',
+    ),
+    executionHash: row.execution_hash,
+    executionParametersJson: databaseJsonRecord(
+      row.execution_parameters_json,
+      'Stored workflow execution parameters are invalid.',
+    ),
+    validationStatus: row.validation_status as WorkflowRevisionValidationStatus,
+    validationErrorsJson,
+    ...(validatedAt ? { validatedAt } : {}),
+    ...(executorFingerprint ? { executorFingerprint } : {}),
+    createdAt: databaseTimestamp(row.created_at),
+  };
+}
+
+function mapRecommendation(
+  row: RecommendationRow,
+): OperationalRecommendationRecord {
+  const shotId = row.shot_id ? assertUuid(row.shot_id) : undefined;
+  const attemptId = row.attempt_id ? assertUuid(row.attempt_id) : undefined;
+  const piAgentRunId = row.pi_agent_run_id
+    ? assertUuid(row.pi_agent_run_id)
+    : undefined;
+  if (
+    !RECOMMENDATION_SEVERITIES.includes(row.severity as RecommendationSeverity)
+  ) {
+    throw new RepositoryError(
+      'DATABASE_ERROR',
+      'Database returned an unknown recommendation severity.',
+    );
+  }
+  if (
+    !RECOMMENDATION_ACTION_TYPES.includes(
+      row.proposed_action_type as RecommendationActionType,
+    )
+  ) {
+    throw new RepositoryError(
+      'DATABASE_ERROR',
+      'Database returned an unknown recommendation action.',
+    );
+  }
+  if (!RECOMMENDATION_STATUSES.includes(row.status as RecommendationStatus)) {
+    throw new RepositoryError(
+      'DATABASE_ERROR',
+      'Database returned an unknown recommendation status.',
+    );
+  }
+  const evidenceReferencesJson = databaseJsonArray(
+    row.evidence_references_json,
+    'Stored recommendation evidence is invalid.',
+  ).map((value) => {
+    const record =
+      typeof value === 'object' && value !== null
+        ? (value as Record<string, unknown>)
+        : undefined;
+    if (
+      !record ||
+      typeof record.type !== 'string' ||
+      typeof record.resourceId !== 'string'
+    ) {
+      throw new RepositoryError(
+        'DATABASE_ERROR',
+        'Stored recommendation evidence reference is invalid.',
+      );
+    }
+    return { type: record.type, resourceId: record.resourceId };
+  });
+  const proposedResourceIdsJson = databaseStringArray(
+    row.proposed_resource_ids_json,
+  );
+  return {
+    id: assertUuid(row.id),
+    tenantId: assertUuid(row.tenant_id),
+    projectId: assertUuid(row.project_id),
+    ...(shotId ? { shotId } : {}),
+    ...(attemptId ? { attemptId } : {}),
+    triggerEventId: assertUuid(row.trigger_event_id),
+    ...(piAgentRunId ? { piAgentRunId } : {}),
+    severity: row.severity as RecommendationSeverity,
+    recommendationCode: row.recommendation_code,
+    title: row.title,
+    detail: row.detail,
+    evidenceReferencesJson,
+    proposedActionType: row.proposed_action_type as RecommendationActionType,
+    proposedResourceIdsJson,
+    status: row.status as RecommendationStatus,
+    version: row.version,
+    createdAt: databaseTimestamp(row.created_at),
+    updatedAt: databaseTimestamp(row.updated_at),
+  };
+}
+
 function mapEvent(row: EventRow): DomainEvent {
   const projectId = row.project_id ? assertUuid(row.project_id) : undefined;
   const shotId = row.shot_id ? assertUuid(row.shot_id) : undefined;
@@ -983,6 +1834,116 @@ function mapOutboxMessage(row: OutboxRow): OutboxMessage {
     availableAt: databaseTimestamp(row.available_at),
     attemptCount: row.attempt_count,
   };
+}
+
+async function assertProjectShotScope(
+  executor: SqlExecutor,
+  tenantId: Uuid,
+  projectId: Uuid,
+  shotId: Uuid,
+): Promise<void> {
+  const result = await executor.query<{
+    tenant_id: string;
+    project_id: string;
+  }>(
+    `SELECT project.tenant_id, shot.project_id
+     FROM video_projects AS project
+     JOIN shots AS shot ON shot.project_id = project.id
+     WHERE project.tenant_id = $1 AND project.id = $2 AND shot.id = $3
+     FOR UPDATE OF shot`,
+    [tenantId, projectId, shotId],
+  );
+  if (result.rows.length === 0) {
+    throw new RepositoryError(
+      'SCOPE_VIOLATION',
+      'The tenant, project, and shot scope does not match.',
+    );
+  }
+}
+
+interface ResourceMutationReservation {
+  readonly key: string;
+  readonly replayResourceId?: Uuid;
+}
+
+async function reserveResourceMutation(
+  idempotency: IdempotencyRepository,
+  tenantId: Uuid,
+  key: string,
+  operation: string,
+  request: unknown,
+  createdAt: string,
+): Promise<ResourceMutationReservation> {
+  const normalizedKey = mutationKey(key);
+  const reservation = await idempotency.reserve(
+    tenantId,
+    normalizedKey,
+    operation,
+    mutationRequestHash(request),
+    createdAt,
+  );
+  if (reservation.kind === 'reserved') {
+    return { key: normalizedKey };
+  }
+  if (reservation.kind === 'replay') {
+    const body = reservation.body;
+    if (
+      typeof body !== 'object' ||
+      body === null ||
+      typeof (body as Record<string, unknown>).resourceId !== 'string'
+    ) {
+      throw new RepositoryError(
+        'DATABASE_ERROR',
+        'The stored workflow idempotency result is invalid.',
+      );
+    }
+    return {
+      key: normalizedKey,
+      replayResourceId: assertUuid(
+        (body as Record<string, unknown>).resourceId as string,
+      ),
+    };
+  }
+  throw new RepositoryError(
+    'IDEMPOTENCY_CONFLICT',
+    reservation.kind === 'conflict'
+      ? 'The idempotency key was already used for a different workflow mutation.'
+      : 'The workflow mutation is already in progress.',
+  );
+}
+
+async function completeResourceMutation(
+  idempotency: IdempotencyRepository,
+  tenantId: Uuid,
+  reservation: ResourceMutationReservation,
+  resourceId: Uuid,
+  completedAt: string,
+): Promise<void> {
+  if (reservation.replayResourceId) return;
+  await idempotency.complete(
+    tenantId,
+    reservation.key,
+    200,
+    { resourceId },
+    completedAt,
+  );
+}
+
+async function releaseResourceMutation(
+  idempotency: IdempotencyRepository,
+  tenantId: Uuid,
+  reservation: ResourceMutationReservation | undefined,
+): Promise<void> {
+  if (reservation && !reservation.replayResourceId) {
+    // A failed PostgreSQL statement can abort the surrounding transaction.
+    // Releasing the reservation is best effort in that case; rollback removes
+    // it together with the failed mutation.
+    try {
+      await idempotency.release(tenantId, reservation.key);
+    } catch {
+      // Preserve the original mutation error.
+    }
+  }
 }
 
 class PostgresTenantRepository implements TenantRepository {
@@ -1207,9 +2168,12 @@ class PostgresShotRepository implements ShotRepository {
       await this.executor.query(
         `INSERT INTO shots (
           id, project_id, storyboard_proposal_id, ordinal, purpose, prompt,
-          duration_seconds, mode, quality_tier, status, accepted_attempt_id,
-          version, created_at, updated_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
+          duration_seconds, mode, quality_tier, visual_description,
+          camera_direction, audio_direction, dialogue, acceptance_criteria,
+          required_asset_ids, status, accepted_attempt_id, version,
+          created_at, updated_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+          $13, $14::jsonb, $15::jsonb, $16, $17, $18, $19, $20)`,
         [
           shot.id,
           shot.projectId,
@@ -1220,6 +2184,12 @@ class PostgresShotRepository implements ShotRepository {
           shot.durationSeconds,
           shot.mode,
           shot.qualityTier,
+          shot.visualDescription ?? null,
+          shot.cameraDirection ?? null,
+          shot.audioDirection ?? null,
+          shot.dialogue ?? null,
+          databaseJson(shot.acceptanceCriteria ?? []),
+          databaseJson(shot.requiredAssetIds ?? []),
           shot.status,
           shot.acceptedAttemptId ?? null,
           shot.version,
@@ -1260,13 +2230,25 @@ class PostgresShotRepository implements ShotRepository {
     const result = await this.executor.query<ShotRow>(
       `UPDATE shots
        SET status = $1,
-           accepted_attempt_id = $2,
-           version = $3,
-           updated_at = $4
-       WHERE id = $5 AND project_id = $6 AND version = $7
+           visual_description = $2,
+           camera_direction = $3,
+           audio_direction = $4,
+           dialogue = $5,
+           acceptance_criteria = $6::jsonb,
+           required_asset_ids = $7::jsonb,
+           accepted_attempt_id = $8,
+           version = $9,
+           updated_at = $10
+       WHERE id = $11 AND project_id = $12 AND version = $13
        RETURNING *`,
       [
         shot.status,
+        shot.visualDescription ?? null,
+        shot.cameraDirection ?? null,
+        shot.audioDirection ?? null,
+        shot.dialogue ?? null,
+        databaseJson(shot.acceptanceCriteria ?? []),
+        databaseJson(shot.requiredAssetIds ?? []),
         shot.acceptedAttemptId ?? null,
         shot.version,
         shot.updatedAt,
@@ -1302,11 +2284,11 @@ class PostgresAttemptRepository implements AttemptRepository {
         scenario, comfy_prompt_id, lease_owner, lease_expires_at, queued_at, submitted_at,
         finished_at, compute_seconds, estimated_cost_microusd, failure_code,
         failure_message, source_attempt_id, artifact_id, version, created_at,
-        updated_at
+        updated_at, workflow_revision_id
       ) VALUES (
         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
         $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29,
-        $30, $31
+        $30, $31, $32
       )`,
       [
         attempt.id,
@@ -1340,6 +2322,7 @@ class PostgresAttemptRepository implements AttemptRepository {
         attempt.version,
         attempt.createdAt,
         attempt.updatedAt,
+        attempt.workflowRevisionId ?? null,
       ],
     );
   }
@@ -1413,28 +2396,39 @@ class PostgresAttemptRepository implements AttemptRepository {
     const result = await this.executor.query<AttemptRow>(
       `UPDATE generation_attempts
        SET status = $1,
-           workflow_version_id = $2,
-           workflow_hash = $3,
-           correlation_id = $4,
-           trace_id = $5,
-           scenario = $6,
-           comfy_prompt_id = $7,
-           lease_owner = $8,
-           lease_expires_at = $9,
-           submitted_at = $10,
-           finished_at = $11,
-           compute_seconds = $12,
-           estimated_cost_microusd = $13,
-           failure_code = $14,
-           failure_message = $15,
-           source_attempt_id = $16,
-           artifact_id = $17,
-           version = $18,
-           updated_at = $19
-       WHERE id = $20 AND tenant_id = $21 AND version = $22
+           seed = $2,
+           steps = $3,
+           requested_width = $4,
+           requested_height = $5,
+           requested_duration_seconds = $6,
+           workflow_version_id = $7,
+           workflow_hash = $8,
+           correlation_id = $9,
+           trace_id = $10,
+           scenario = $11,
+           comfy_prompt_id = $12,
+           lease_owner = $13,
+           lease_expires_at = $14,
+           submitted_at = $15,
+           finished_at = $16,
+           compute_seconds = $17,
+           estimated_cost_microusd = $18,
+           failure_code = $19,
+           failure_message = $20,
+           source_attempt_id = $21,
+           artifact_id = $22,
+           version = $23,
+           updated_at = $24,
+           workflow_revision_id = $25
+       WHERE id = $26 AND tenant_id = $27 AND version = $28
        RETURNING *`,
       [
         attempt.status,
+        attempt.seed,
+        attempt.steps,
+        attempt.requestedWidth,
+        attempt.requestedHeight,
+        attempt.requestedDurationSeconds,
         attempt.workflowVersionId ?? null,
         attempt.workflowHash,
         attempt.correlationId,
@@ -1453,6 +2447,7 @@ class PostgresAttemptRepository implements AttemptRepository {
         attempt.artifactId ?? null,
         attempt.version,
         attempt.updatedAt,
+        attempt.workflowRevisionId ?? null,
         attempt.id,
         attempt.tenantId,
         expectedVersion,
@@ -1814,6 +2809,522 @@ class PostgresWorkflowVersionRepository implements WorkflowVersionRepository {
   }
 }
 
+class PostgresWorkflowDraftRepository implements WorkflowDraftRepository {
+  private readonly executor: SqlExecutor;
+  private readonly idempotency: IdempotencyRepository;
+
+  constructor(executor: SqlExecutor) {
+    this.executor = executor;
+    this.idempotency = new PostgresIdempotencyRepository(executor);
+  }
+
+  async findByShot(
+    tenantId: Uuid,
+    projectId: Uuid,
+    shotId: Uuid,
+  ): Promise<WorkflowDraftRecord | null> {
+    const result = await this.executor.query<WorkflowDraftRow>(
+      `SELECT * FROM workflow_drafts
+       WHERE tenant_id = $1 AND project_id = $2 AND shot_id = $3`,
+      [tenantId, projectId, shotId],
+    );
+    const row = result.rows[0];
+    return row ? mapWorkflowDraft(row) : null;
+  }
+
+  async create(
+    draft: WorkflowDraftRecord,
+    idempotencyKey: string,
+  ): Promise<WorkflowDraftRecord> {
+    assertWorkflowDraftRecord(draft);
+    await assertProjectShotScope(
+      this.executor,
+      draft.tenantId,
+      draft.projectId,
+      draft.shotId,
+    );
+    const reservation = await reserveResourceMutation(
+      this.idempotency,
+      draft.tenantId,
+      idempotencyKey,
+      'workflow-draft.create',
+      draft,
+      draft.createdAt,
+    );
+    if (reservation.replayResourceId) {
+      const existing = await this.findByShot(
+        draft.tenantId,
+        draft.projectId,
+        draft.shotId,
+      );
+      if (!existing || existing.id !== reservation.replayResourceId) {
+        throw new RepositoryError(
+          'DATABASE_ERROR',
+          'The stored workflow draft idempotency result is missing.',
+        );
+      }
+      return existing;
+    }
+    try {
+      const result = await this.executor.query<WorkflowDraftRow>(
+        `INSERT INTO workflow_drafts (
+          id, tenant_id, project_id, shot_id, base_revision_id, profile_id,
+          profile_version, editor_graph_json, last_api_graph_json, author_type,
+          author_id, version, created_at, updated_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb, $10,
+          $11, $12, $13, $14)
+        RETURNING *`,
+        [
+          draft.id,
+          draft.tenantId,
+          draft.projectId,
+          draft.shotId,
+          draft.baseRevisionId ?? null,
+          draft.profileId,
+          draft.profileVersion,
+          databaseJson(draft.editorGraphJson),
+          draft.lastApiGraphJson === undefined
+            ? null
+            : databaseJson(draft.lastApiGraphJson),
+          draft.authorType,
+          draft.authorId,
+          draft.version,
+          draft.createdAt,
+          draft.updatedAt,
+        ],
+      );
+      const row = result.rows[0];
+      if (!row) {
+        throw new RepositoryError(
+          'DATABASE_ERROR',
+          'The workflow draft was not returned after creation.',
+        );
+      }
+      const created = mapWorkflowDraft(row);
+      await completeResourceMutation(
+        this.idempotency,
+        draft.tenantId,
+        reservation,
+        created.id,
+        draft.updatedAt,
+      );
+      return created;
+    } catch (error) {
+      await releaseResourceMutation(
+        this.idempotency,
+        draft.tenantId,
+        reservation,
+      );
+      throw error;
+    }
+  }
+
+  async update(
+    draft: WorkflowDraftRecord,
+    expectedVersion: number,
+    idempotencyKey: string,
+  ): Promise<WorkflowDraftRecord> {
+    assertWorkflowDraftRecord(draft);
+    await assertProjectShotScope(
+      this.executor,
+      draft.tenantId,
+      draft.projectId,
+      draft.shotId,
+    );
+    const reservation = await reserveResourceMutation(
+      this.idempotency,
+      draft.tenantId,
+      idempotencyKey,
+      'workflow-draft.update',
+      { draft, expectedVersion },
+      draft.updatedAt,
+    );
+    if (reservation.replayResourceId) {
+      const existing = await this.findByShot(
+        draft.tenantId,
+        draft.projectId,
+        draft.shotId,
+      );
+      if (!existing || existing.id !== reservation.replayResourceId) {
+        throw new RepositoryError(
+          'DATABASE_ERROR',
+          'The stored workflow draft idempotency result is missing.',
+        );
+      }
+      return existing;
+    }
+    try {
+      const result = await this.executor.query<WorkflowDraftRow>(
+        `UPDATE workflow_drafts
+         SET base_revision_id = $1,
+             profile_id = $2,
+             profile_version = $3,
+             editor_graph_json = $4::jsonb,
+             last_api_graph_json = $5::jsonb,
+             author_type = $6,
+             author_id = $7,
+             version = $8,
+             updated_at = $9
+         WHERE id = $10 AND tenant_id = $11 AND project_id = $12
+           AND shot_id = $13 AND version = $14
+         RETURNING *`,
+        [
+          draft.baseRevisionId ?? null,
+          draft.profileId,
+          draft.profileVersion,
+          databaseJson(draft.editorGraphJson),
+          draft.lastApiGraphJson === undefined
+            ? null
+            : databaseJson(draft.lastApiGraphJson),
+          draft.authorType,
+          draft.authorId,
+          draft.version,
+          draft.updatedAt,
+          draft.id,
+          draft.tenantId,
+          draft.projectId,
+          draft.shotId,
+          expectedVersion,
+        ],
+      );
+      const row = result.rows[0];
+      if (!row) {
+        throw new RepositoryError(
+          'OPTIMISTIC_CONFLICT',
+          'The workflow draft was modified by another transaction.',
+        );
+      }
+      const updated = mapWorkflowDraft(row);
+      await completeResourceMutation(
+        this.idempotency,
+        draft.tenantId,
+        reservation,
+        updated.id,
+        draft.updatedAt,
+      );
+      return updated;
+    } catch (error) {
+      await releaseResourceMutation(
+        this.idempotency,
+        draft.tenantId,
+        reservation,
+      );
+      throw error;
+    }
+  }
+}
+
+class PostgresWorkflowRevisionRepository implements WorkflowRevisionRepository {
+  private readonly executor: SqlExecutor;
+  private readonly idempotency: IdempotencyRepository;
+
+  constructor(executor: SqlExecutor) {
+    this.executor = executor;
+    this.idempotency = new PostgresIdempotencyRepository(executor);
+  }
+
+  async create(
+    revision: WorkflowRevisionRecord,
+    idempotencyKey: string,
+  ): Promise<WorkflowRevisionRecord> {
+    assertWorkflowRevisionRecord(revision);
+    await assertProjectShotScope(
+      this.executor,
+      revision.tenantId,
+      revision.projectId,
+      revision.shotId,
+    );
+    const { revisionNumber: _revisionNumber, ...request } = revision;
+    const reservation = await reserveResourceMutation(
+      this.idempotency,
+      revision.tenantId,
+      idempotencyKey,
+      'workflow-revision.create',
+      request,
+      revision.createdAt,
+    );
+    if (reservation.replayResourceId) {
+      const existing = await this.findById(
+        revision.tenantId,
+        revision.projectId,
+        revision.shotId,
+        reservation.replayResourceId,
+      );
+      if (!existing) {
+        throw new RepositoryError(
+          'DATABASE_ERROR',
+          'The stored workflow revision idempotency result is missing.',
+        );
+      }
+      return existing;
+    }
+    try {
+      const nextNumber = await this.executor.query<{ revision_number: number }>(
+        `SELECT COALESCE(MAX(revision_number), 0) + 1 AS revision_number
+         FROM workflow_revisions
+         WHERE tenant_id = $1 AND project_id = $2 AND shot_id = $3`,
+        [revision.tenantId, revision.projectId, revision.shotId],
+      );
+      const revisionNumber = nextNumber.rows[0]?.revision_number;
+      if (!revisionNumber) {
+        throw new RepositoryError(
+          'DATABASE_ERROR',
+          'The next workflow revision number could not be allocated.',
+        );
+      }
+      const result = await this.executor.query<WorkflowRevisionRow>(
+        `INSERT INTO workflow_revisions (
+          id, tenant_id, project_id, shot_id, revision_number,
+          parent_revision_id, profile_id, profile_version, source, author_type,
+          author_id, editor_graph_json, api_graph_json, execution_hash,
+          execution_parameters_json, validation_status, validation_errors_json,
+          validated_at, executor_fingerprint, created_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb,
+          $13::jsonb, $14, $15::jsonb, $16, $17::jsonb, $18, $19, $20)
+        RETURNING *`,
+        [
+          revision.id,
+          revision.tenantId,
+          revision.projectId,
+          revision.shotId,
+          revisionNumber,
+          revision.parentRevisionId ?? null,
+          revision.profileId,
+          revision.profileVersion,
+          revision.source,
+          revision.authorType,
+          revision.authorId,
+          databaseJson(revision.editorGraphJson),
+          databaseJson(revision.apiGraphJson),
+          revision.executionHash,
+          databaseJson(revision.executionParametersJson),
+          revision.validationStatus,
+          databaseJson(revision.validationErrorsJson),
+          revision.validatedAt ?? null,
+          revision.executorFingerprint ?? null,
+          revision.createdAt,
+        ],
+      );
+      const row = result.rows[0];
+      if (!row) {
+        throw new RepositoryError(
+          'DATABASE_ERROR',
+          'The workflow revision was not returned after creation.',
+        );
+      }
+      const created = mapWorkflowRevision(row);
+      await completeResourceMutation(
+        this.idempotency,
+        revision.tenantId,
+        reservation,
+        created.id,
+        revision.createdAt,
+      );
+      return created;
+    } catch (error) {
+      await releaseResourceMutation(
+        this.idempotency,
+        revision.tenantId,
+        reservation,
+      );
+      throw error;
+    }
+  }
+
+  async findById(
+    tenantId: Uuid,
+    projectId: Uuid,
+    shotId: Uuid,
+    revisionId: Uuid,
+  ): Promise<WorkflowRevisionRecord | null> {
+    const result = await this.executor.query<WorkflowRevisionRow>(
+      `SELECT * FROM workflow_revisions
+       WHERE tenant_id = $1 AND project_id = $2 AND shot_id = $3 AND id = $4`,
+      [tenantId, projectId, shotId, revisionId],
+    );
+    const row = result.rows[0];
+    return row ? mapWorkflowRevision(row) : null;
+  }
+
+  async listByShot(
+    tenantId: Uuid,
+    projectId: Uuid,
+    shotId: Uuid,
+  ): Promise<readonly WorkflowRevisionRecord[]> {
+    const result = await this.executor.query<WorkflowRevisionRow>(
+      `SELECT * FROM workflow_revisions
+       WHERE tenant_id = $1 AND project_id = $2 AND shot_id = $3
+       ORDER BY revision_number`,
+      [tenantId, projectId, shotId],
+    );
+    return result.rows.map(mapWorkflowRevision);
+  }
+
+  async updateValidation(
+    tenantId: Uuid,
+    projectId: Uuid,
+    shotId: Uuid,
+    revisionId: Uuid,
+    update: WorkflowRevisionValidationUpdate,
+  ): Promise<WorkflowRevisionRecord> {
+    assertWorkflowValidationUpdate(update);
+    const result = await this.executor.query<WorkflowRevisionRow>(
+      `UPDATE workflow_revisions
+       SET validation_status = $1,
+           validation_errors_json = $2::jsonb,
+           validated_at = $3,
+           executor_fingerprint = $4
+       WHERE tenant_id = $5 AND project_id = $6 AND shot_id = $7 AND id = $8
+       RETURNING *`,
+      [
+        update.validationStatus,
+        databaseJson(update.validationErrorsJson),
+        update.validatedAt,
+        update.executorFingerprint,
+        tenantId,
+        projectId,
+        shotId,
+        revisionId,
+      ],
+    );
+    const row = result.rows[0];
+    if (!row) {
+      throw new RepositoryError(
+        'NOT_FOUND',
+        'The workflow revision was not found in the requested scope.',
+      );
+    }
+    return mapWorkflowRevision(row);
+  }
+}
+
+class PostgresOperationalRecommendationRepository
+  implements OperationalRecommendationRepository
+{
+  private readonly executor: SqlExecutor;
+
+  constructor(executor: SqlExecutor) {
+    this.executor = executor;
+  }
+
+  async create(recommendation: OperationalRecommendationRecord): Promise<void> {
+    assertRecommendationRecord(recommendation);
+    const project = await this.executor.query<{ id: string }>(
+      'SELECT id FROM video_projects WHERE id = $1 AND tenant_id = $2',
+      [recommendation.projectId, recommendation.tenantId],
+    );
+    if (project.rows.length === 0) {
+      throw new RepositoryError(
+        'SCOPE_VIOLATION',
+        'The recommendation project is outside its tenant scope.',
+      );
+    }
+    if (recommendation.shotId) {
+      await assertProjectShotScope(
+        this.executor,
+        recommendation.tenantId,
+        recommendation.projectId,
+        recommendation.shotId,
+      );
+    }
+    await this.executor.query(
+      `INSERT INTO operational_recommendations (
+        id, tenant_id, project_id, shot_id, attempt_id, trigger_event_id,
+        pi_agent_run_id, severity, recommendation_code, title, detail,
+        evidence_references_json, proposed_action_type,
+        proposed_resource_ids_json, status, version, created_at, updated_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb,
+        $13, $14::jsonb, $15, $16, $17, $18)`,
+      [
+        recommendation.id,
+        recommendation.tenantId,
+        recommendation.projectId,
+        recommendation.shotId ?? null,
+        recommendation.attemptId ?? null,
+        recommendation.triggerEventId,
+        recommendation.piAgentRunId ?? null,
+        recommendation.severity,
+        recommendation.recommendationCode,
+        recommendation.title,
+        recommendation.detail,
+        databaseJson(recommendation.evidenceReferencesJson),
+        recommendation.proposedActionType,
+        databaseJson(recommendation.proposedResourceIdsJson),
+        recommendation.status,
+        recommendation.version,
+        recommendation.createdAt,
+        recommendation.updatedAt,
+      ],
+    );
+  }
+
+  async findById(
+    tenantId: Uuid,
+    projectId: Uuid,
+    recommendationId: Uuid,
+  ): Promise<OperationalRecommendationRecord | null> {
+    const result = await this.executor.query<RecommendationRow>(
+      `SELECT * FROM operational_recommendations
+       WHERE tenant_id = $1 AND project_id = $2 AND id = $3`,
+      [tenantId, projectId, recommendationId],
+    );
+    const row = result.rows[0];
+    return row ? mapRecommendation(row) : null;
+  }
+
+  async listByProject(
+    tenantId: Uuid,
+    projectId: Uuid,
+  ): Promise<readonly OperationalRecommendationRecord[]> {
+    const result = await this.executor.query<RecommendationRow>(
+      `SELECT * FROM operational_recommendations
+       WHERE tenant_id = $1 AND project_id = $2
+       ORDER BY created_at, id`,
+      [tenantId, projectId],
+    );
+    return result.rows.map(mapRecommendation);
+  }
+
+  async updateStatus(
+    tenantId: Uuid,
+    projectId: Uuid,
+    recommendationId: Uuid,
+    status: RecommendationStatus,
+    expectedVersion: number,
+    updatedAt: string,
+  ): Promise<OperationalRecommendationRecord> {
+    if (!RECOMMENDATION_STATUSES.includes(status)) {
+      throw new RepositoryError(
+        'INVALID_ARGUMENT',
+        'Recommendation status is unknown.',
+      );
+    }
+    const result = await this.executor.query<RecommendationRow>(
+      `UPDATE operational_recommendations
+       SET status = $1, version = version + 1, updated_at = $2
+       WHERE tenant_id = $3 AND project_id = $4 AND id = $5
+         AND version = $6 AND status = 'pending'
+       RETURNING *`,
+      [
+        status,
+        updatedAt,
+        tenantId,
+        projectId,
+        recommendationId,
+        expectedVersion,
+      ],
+    );
+    const row = result.rows[0];
+    if (!row) {
+      throw new RepositoryError(
+        'OPTIMISTIC_CONFLICT',
+        'The recommendation was modified or is no longer pending.',
+      );
+    }
+    return mapRecommendation(row);
+  }
+}
+
 class PostgresEventRepository implements EventRepository {
   private readonly executor: SqlExecutor;
 
@@ -2024,6 +3535,9 @@ class PostgresIdempotencyRepository implements IdempotencyRepository {
 }
 
 function createPostgresRepositories(executor: SqlExecutor): Repositories {
+  const recommendations = new PostgresOperationalRecommendationRepository(
+    executor,
+  );
   return {
     tenants: new PostgresTenantRepository(executor),
     projects: new PostgresProjectRepository(executor),
@@ -2034,6 +3548,10 @@ function createPostgresRepositories(executor: SqlExecutor): Repositories {
     evaluations: new PostgresEvaluationRepository(executor),
     agentRuns: new PostgresAgentRunRepository(executor),
     workflowVersions: new PostgresWorkflowVersionRepository(executor),
+    workflowDrafts: new PostgresWorkflowDraftRepository(executor),
+    workflowRevisions: new PostgresWorkflowRevisionRepository(executor),
+    recommendations,
+    operationalRecommendations: recommendations,
     events: new PostgresEventRepository(executor),
     outbox: new PostgresOutboxRepository(executor),
     idempotency: new PostgresIdempotencyRepository(executor),
@@ -2092,6 +3610,9 @@ interface MemoryState {
   readonly evaluations: Map<Uuid, EvaluationResult>;
   readonly agentRuns: Map<Uuid, AgentRunRecord>;
   readonly workflowVersions: Map<Uuid, WorkflowVersionRecord>;
+  readonly workflowDrafts: Map<Uuid, WorkflowDraftRecord>;
+  readonly workflowRevisions: Map<Uuid, WorkflowRevisionRecord>;
+  readonly recommendations: Map<Uuid, OperationalRecommendationRecord>;
   readonly events: Map<Uuid, DomainEvent>;
   readonly outbox: Map<
     Uuid,
@@ -2114,6 +3635,9 @@ function emptyMemoryState(): MemoryState {
     evaluations: new Map(),
     agentRuns: new Map(),
     workflowVersions: new Map(),
+    workflowDrafts: new Map(),
+    workflowRevisions: new Map(),
+    recommendations: new Map(),
     events: new Map(),
     outbox: new Map(),
     idempotency: new Map(),
@@ -2130,7 +3654,7 @@ function cloneMemoryState(state: MemoryState): MemoryState {
         { ...proposal, shots: [...proposal.shots] },
       ]),
     ),
-    shots: new Map([...state.shots].map(([id, shot]) => [id, { ...shot }])),
+    shots: new Map([...state.shots].map(([id, shot]) => [id, cloneShot(shot)])),
     attempts: new Map(
       [...state.attempts].map(([id, attempt]) => [id, { ...attempt }]),
     ),
@@ -2156,6 +3680,44 @@ function cloneMemoryState(state: MemoryState): MemoryState {
         { ...version, workflowJson: { ...version.workflowJson } },
       ]),
     ),
+    workflowDrafts: new Map(
+      [...state.workflowDrafts].map(([id, draft]) => [
+        id,
+        {
+          ...draft,
+          editorGraphJson: structuredClone(draft.editorGraphJson),
+          ...(draft.lastApiGraphJson !== undefined
+            ? { lastApiGraphJson: structuredClone(draft.lastApiGraphJson) }
+            : {}),
+        },
+      ]),
+    ),
+    workflowRevisions: new Map(
+      [...state.workflowRevisions].map(([id, revision]) => [
+        id,
+        {
+          ...revision,
+          editorGraphJson: structuredClone(revision.editorGraphJson),
+          apiGraphJson: structuredClone(revision.apiGraphJson),
+          executionParametersJson: structuredClone(
+            revision.executionParametersJson,
+          ),
+          validationErrorsJson: structuredClone(revision.validationErrorsJson),
+        },
+      ]),
+    ),
+    recommendations: new Map(
+      [...state.recommendations].map(([id, recommendation]) => [
+        id,
+        {
+          ...recommendation,
+          evidenceReferencesJson: structuredClone(
+            recommendation.evidenceReferencesJson,
+          ),
+          proposedResourceIdsJson: [...recommendation.proposedResourceIdsJson],
+        },
+      ]),
+    ),
     events: new Map(
       [...state.events].map(([id, event]) => [
         id,
@@ -2168,6 +3730,18 @@ function cloneMemoryState(state: MemoryState): MemoryState {
     idempotency: new Map(
       [...state.idempotency].map(([id, record]) => [id, { ...record }]),
     ),
+  };
+}
+
+function cloneShot(shot: Shot): Shot {
+  return {
+    ...shot,
+    ...(shot.acceptanceCriteria !== undefined
+      ? { acceptanceCriteria: [...shot.acceptanceCriteria] }
+      : {}),
+    ...(shot.requiredAssetIds !== undefined
+      ? { requiredAssetIds: [...shot.requiredAssetIds] }
+      : {}),
   };
 }
 
@@ -2185,6 +3759,10 @@ class MemoryRepositories implements Repositories {
   readonly evaluations: EvaluationRepository;
   readonly agentRuns: AgentRunRepository;
   readonly workflowVersions: WorkflowVersionRepository;
+  readonly workflowDrafts: WorkflowDraftRepository;
+  readonly workflowRevisions: WorkflowRevisionRepository;
+  readonly recommendations: OperationalRecommendationRepository;
+  readonly operationalRecommendations: OperationalRecommendationRepository;
   readonly events: EventRepository;
   readonly outbox: OutboxRepository;
   readonly idempotency: IdempotencyRepository;
@@ -2307,21 +3885,21 @@ class MemoryRepositories implements Repositories {
           keys.add(key);
         }
         for (const shot of shots) {
-          this.state.shots.set(shot.id, { ...shot });
+          this.state.shots.set(shot.id, cloneShot(shot));
         }
       },
       listByProject: async (projectId) =>
         [...this.state.shots.values()]
           .filter((shot) => shot.projectId === projectId)
           .sort((left, right) => left.ordinal - right.ordinal)
-          .map((shot) => ({ ...shot })),
+          .map(cloneShot),
       findById: async (projectId, shotId) => {
         const shot = this.state.shots.get(shotId);
-        return shot && shot.projectId === projectId ? { ...shot } : null;
+        return shot && shot.projectId === projectId ? cloneShot(shot) : null;
       },
       findByIdAny: async (shotId) => {
         const shot = this.state.shots.get(shotId);
-        return shot ? { ...shot } : null;
+        return shot ? cloneShot(shot) : null;
       },
       update: async (shot, expectedVersion) => {
         const current = this.state.shots.get(shot.id);
@@ -2331,12 +3909,30 @@ class MemoryRepositories implements Repositories {
             'The shot was modified by another transaction.',
           );
         }
-        this.state.shots.set(shot.id, { ...shot });
-        return { ...shot };
+        this.state.shots.set(shot.id, cloneShot(shot));
+        return cloneShot(shot);
       },
     };
     this.attempts = {
       create: async (attempt) => {
+        if (attempt.workflowRevisionId) {
+          const revision = this.state.workflowRevisions.get(
+            attempt.workflowRevisionId,
+          );
+          if (
+            !revision ||
+            revision.tenantId !== attempt.tenantId ||
+            revision.projectId !== attempt.projectId ||
+            revision.shotId !== attempt.shotId ||
+            revision.validationStatus !== 'validated' ||
+            revision.executionHash !== attempt.workflowHash
+          ) {
+            throw new RepositoryError(
+              'SCOPE_VIOLATION',
+              'Managed attempts require one validated workflow revision in the same scope.',
+            );
+          }
+        }
         if (this.state.attempts.has(attempt.id)) {
           throw new RepositoryError(
             'UNIQUE_VIOLATION',
@@ -2429,6 +4025,29 @@ class MemoryRepositories implements Repositories {
           throw new RepositoryError(
             'OPTIMISTIC_CONFLICT',
             'The generation attempt was modified by another transaction.',
+          );
+        }
+        if (isTerminalGenerationAttempt(current.status)) {
+          throw new RepositoryError(
+            'INVALID_ARGUMENT',
+            'Terminal generation attempts are immutable.',
+          );
+        }
+        if (
+          current.workflowRevisionId &&
+          (attempt.workflowRevisionId !== current.workflowRevisionId ||
+            attempt.workflowVersionId !== current.workflowVersionId ||
+            attempt.seed !== current.seed ||
+            attempt.steps !== current.steps ||
+            attempt.requestedWidth !== current.requestedWidth ||
+            attempt.requestedHeight !== current.requestedHeight ||
+            attempt.requestedDurationSeconds !==
+              current.requestedDurationSeconds ||
+            attempt.workflowHash !== current.workflowHash)
+        ) {
+          throw new RepositoryError(
+            'INVALID_ARGUMENT',
+            'Managed attempt execution data is immutable.',
           );
         }
         this.state.attempts.set(attempt.id, { ...attempt });
@@ -2706,6 +4325,507 @@ class MemoryRepositories implements Repositories {
         });
       },
     };
+    const copyDraft = (draft: WorkflowDraftRecord): WorkflowDraftRecord => ({
+      ...draft,
+      editorGraphJson: structuredClone(draft.editorGraphJson),
+      ...(draft.lastApiGraphJson !== undefined
+        ? { lastApiGraphJson: structuredClone(draft.lastApiGraphJson) }
+        : {}),
+    });
+    const copyRevision = (
+      revision: WorkflowRevisionRecord,
+    ): WorkflowRevisionRecord => ({
+      ...revision,
+      editorGraphJson: structuredClone(revision.editorGraphJson),
+      apiGraphJson: structuredClone(revision.apiGraphJson),
+      executionParametersJson: structuredClone(
+        revision.executionParametersJson,
+      ),
+      validationErrorsJson: structuredClone(revision.validationErrorsJson),
+    });
+    const copyRecommendation = (
+      recommendation: OperationalRecommendationRecord,
+    ): OperationalRecommendationRecord => ({
+      ...recommendation,
+      evidenceReferencesJson: structuredClone(
+        recommendation.evidenceReferencesJson,
+      ),
+      proposedResourceIdsJson: [...recommendation.proposedResourceIdsJson],
+    });
+    const assertMemoryProjectShotScope = (
+      tenantId: Uuid,
+      projectId: Uuid,
+      shotId: Uuid,
+    ): void => {
+      const project = this.state.projects.get(projectId);
+      const shot = this.state.shots.get(shotId);
+      if (
+        !project ||
+        project.tenantId !== tenantId ||
+        !shot ||
+        shot.projectId !== projectId
+      ) {
+        throw new RepositoryError(
+          'SCOPE_VIOLATION',
+          'The tenant, project, and shot scope does not match.',
+        );
+      }
+    };
+    this.workflowDrafts = {
+      findByShot: async (tenantId, projectId, shotId) => {
+        const draft = [...this.state.workflowDrafts.values()].find(
+          (current) =>
+            current.tenantId === tenantId &&
+            current.projectId === projectId &&
+            current.shotId === shotId,
+        );
+        return draft ? copyDraft(draft) : null;
+      },
+      create: async (draft, idempotencyKey) => {
+        assertWorkflowDraftRecord(draft);
+        const reservation = await reserveResourceMutation(
+          this.idempotency,
+          draft.tenantId,
+          idempotencyKey,
+          'workflow-draft.create',
+          draft,
+          draft.createdAt,
+        );
+        if (reservation.replayResourceId) {
+          const existing = [...this.state.workflowDrafts.values()].find(
+            (current) =>
+              current.id === reservation.replayResourceId &&
+              current.tenantId === draft.tenantId &&
+              current.projectId === draft.projectId &&
+              current.shotId === draft.shotId,
+          );
+          if (!existing) {
+            throw new RepositoryError(
+              'DATABASE_ERROR',
+              'The stored workflow draft idempotency result is missing.',
+            );
+          }
+          return copyDraft(existing);
+        }
+        try {
+          assertMemoryProjectShotScope(
+            draft.tenantId,
+            draft.projectId,
+            draft.shotId,
+          );
+          if (
+            draft.baseRevisionId &&
+            ![...this.state.workflowRevisions.values()].some(
+              (revision) =>
+                revision.id === draft.baseRevisionId &&
+                revision.tenantId === draft.tenantId &&
+                revision.projectId === draft.projectId &&
+                revision.shotId === draft.shotId,
+            )
+          ) {
+            throw new RepositoryError(
+              'SCOPE_VIOLATION',
+              'The workflow draft base revision is outside its shot scope.',
+            );
+          }
+          if (
+            this.state.workflowDrafts.has(draft.id) ||
+            [...this.state.workflowDrafts.values()].some(
+              (current) =>
+                current.tenantId === draft.tenantId &&
+                current.projectId === draft.projectId &&
+                current.shotId === draft.shotId,
+            )
+          ) {
+            throw new RepositoryError(
+              'UNIQUE_VIOLATION',
+              'A workflow draft already exists for this shot.',
+            );
+          }
+          this.state.workflowDrafts.set(draft.id, copyDraft(draft));
+          await completeResourceMutation(
+            this.idempotency,
+            draft.tenantId,
+            reservation,
+            draft.id,
+            draft.updatedAt,
+          );
+          return copyDraft(draft);
+        } catch (error) {
+          await releaseResourceMutation(
+            this.idempotency,
+            draft.tenantId,
+            reservation,
+          );
+          throw error;
+        }
+      },
+      update: async (draft, expectedVersion, idempotencyKey) => {
+        assertWorkflowDraftRecord(draft);
+        const reservation = await reserveResourceMutation(
+          this.idempotency,
+          draft.tenantId,
+          idempotencyKey,
+          'workflow-draft.update',
+          { draft, expectedVersion },
+          draft.updatedAt,
+        );
+        if (reservation.replayResourceId) {
+          const existing = [...this.state.workflowDrafts.values()].find(
+            (current) =>
+              current.id === reservation.replayResourceId &&
+              current.tenantId === draft.tenantId &&
+              current.projectId === draft.projectId &&
+              current.shotId === draft.shotId,
+          );
+          if (!existing) {
+            throw new RepositoryError(
+              'DATABASE_ERROR',
+              'The stored workflow draft idempotency result is missing.',
+            );
+          }
+          return copyDraft(existing);
+        }
+        try {
+          assertMemoryProjectShotScope(
+            draft.tenantId,
+            draft.projectId,
+            draft.shotId,
+          );
+          const current = this.state.workflowDrafts.get(draft.id);
+          if (
+            !current ||
+            current.tenantId !== draft.tenantId ||
+            current.projectId !== draft.projectId ||
+            current.shotId !== draft.shotId ||
+            current.version !== expectedVersion
+          ) {
+            throw new RepositoryError(
+              'OPTIMISTIC_CONFLICT',
+              'The workflow draft was modified by another transaction.',
+            );
+          }
+          if (
+            draft.baseRevisionId &&
+            ![...this.state.workflowRevisions.values()].some(
+              (revision) =>
+                revision.id === draft.baseRevisionId &&
+                revision.tenantId === draft.tenantId &&
+                revision.projectId === draft.projectId &&
+                revision.shotId === draft.shotId,
+            )
+          ) {
+            throw new RepositoryError(
+              'SCOPE_VIOLATION',
+              'The workflow draft base revision is outside its shot scope.',
+            );
+          }
+          this.state.workflowDrafts.set(draft.id, copyDraft(draft));
+          await completeResourceMutation(
+            this.idempotency,
+            draft.tenantId,
+            reservation,
+            draft.id,
+            draft.updatedAt,
+          );
+          return copyDraft(draft);
+        } catch (error) {
+          await releaseResourceMutation(
+            this.idempotency,
+            draft.tenantId,
+            reservation,
+          );
+          throw error;
+        }
+      },
+    };
+    this.workflowRevisions = {
+      create: async (revision, idempotencyKey) => {
+        assertWorkflowRevisionRecord(revision);
+        const { revisionNumber: _revisionNumber, ...request } = revision;
+        const reservation = await reserveResourceMutation(
+          this.idempotency,
+          revision.tenantId,
+          idempotencyKey,
+          'workflow-revision.create',
+          request,
+          revision.createdAt,
+        );
+        if (reservation.replayResourceId) {
+          const existing = this.state.workflowRevisions.get(
+            reservation.replayResourceId,
+          );
+          if (
+            !existing ||
+            existing.tenantId !== revision.tenantId ||
+            existing.projectId !== revision.projectId ||
+            existing.shotId !== revision.shotId
+          ) {
+            throw new RepositoryError(
+              'DATABASE_ERROR',
+              'The stored workflow revision idempotency result is missing.',
+            );
+          }
+          return copyRevision(existing);
+        }
+        try {
+          assertMemoryProjectShotScope(
+            revision.tenantId,
+            revision.projectId,
+            revision.shotId,
+          );
+          if (
+            revision.parentRevisionId &&
+            ![...this.state.workflowRevisions.values()].some(
+              (current) =>
+                current.id === revision.parentRevisionId &&
+                current.tenantId === revision.tenantId &&
+                current.projectId === revision.projectId &&
+                current.shotId === revision.shotId,
+            )
+          ) {
+            throw new RepositoryError(
+              'SCOPE_VIOLATION',
+              'The workflow revision parent is outside its shot scope.',
+            );
+          }
+          if (this.state.workflowRevisions.has(revision.id)) {
+            throw new RepositoryError(
+              'UNIQUE_VIOLATION',
+              'Workflow revision already exists.',
+            );
+          }
+          const nextRevisionNumber =
+            Math.max(
+              0,
+              ...[...this.state.workflowRevisions.values()]
+                .filter(
+                  (current) =>
+                    current.tenantId === revision.tenantId &&
+                    current.projectId === revision.projectId &&
+                    current.shotId === revision.shotId,
+                )
+                .map((current) => current.revisionNumber),
+            ) + 1;
+          const created = copyRevision({
+            ...revision,
+            revisionNumber: nextRevisionNumber,
+          });
+          this.state.workflowRevisions.set(created.id, created);
+          await completeResourceMutation(
+            this.idempotency,
+            revision.tenantId,
+            reservation,
+            created.id,
+            revision.createdAt,
+          );
+          return copyRevision(created);
+        } catch (error) {
+          await releaseResourceMutation(
+            this.idempotency,
+            revision.tenantId,
+            reservation,
+          );
+          throw error;
+        }
+      },
+      findById: async (tenantId, projectId, shotId, revisionId) => {
+        const revision = this.state.workflowRevisions.get(revisionId);
+        return revision &&
+          revision.tenantId === tenantId &&
+          revision.projectId === projectId &&
+          revision.shotId === shotId
+          ? copyRevision(revision)
+          : null;
+      },
+      listByShot: async (tenantId, projectId, shotId) =>
+        [...this.state.workflowRevisions.values()]
+          .filter(
+            (revision) =>
+              revision.tenantId === tenantId &&
+              revision.projectId === projectId &&
+              revision.shotId === shotId,
+          )
+          .sort((left, right) => left.revisionNumber - right.revisionNumber)
+          .map(copyRevision),
+      updateValidation: async (
+        tenantId,
+        projectId,
+        shotId,
+        revisionId,
+        update,
+      ) => {
+        assertWorkflowValidationUpdate(update);
+        const current = this.state.workflowRevisions.get(revisionId);
+        if (
+          !current ||
+          current.tenantId !== tenantId ||
+          current.projectId !== projectId ||
+          current.shotId !== shotId
+        ) {
+          throw new RepositoryError(
+            'NOT_FOUND',
+            'The workflow revision was not found in the requested scope.',
+          );
+        }
+        const {
+          validatedAt: _validatedAt,
+          executorFingerprint: _executorFingerprint,
+          ...withoutValidationTimestamps
+        } = current;
+        const updated = copyRevision({
+          ...withoutValidationTimestamps,
+          validationStatus: update.validationStatus,
+          validationErrorsJson: [...update.validationErrorsJson],
+          ...(update.validatedAt !== null
+            ? { validatedAt: update.validatedAt }
+            : {}),
+          ...(update.executorFingerprint !== null
+            ? { executorFingerprint: update.executorFingerprint }
+            : {}),
+        });
+        this.state.workflowRevisions.set(revisionId, updated);
+        return copyRevision(updated);
+      },
+    };
+    this.recommendations = {
+      create: async (recommendation) => {
+        assertRecommendationRecord(recommendation);
+        const project = this.state.projects.get(recommendation.projectId);
+        if (!project || project.tenantId !== recommendation.tenantId) {
+          throw new RepositoryError(
+            'SCOPE_VIOLATION',
+            'The recommendation project is outside its tenant scope.',
+          );
+        }
+        if (recommendation.shotId) {
+          assertMemoryProjectShotScope(
+            recommendation.tenantId,
+            recommendation.projectId,
+            recommendation.shotId,
+          );
+        }
+        const attempt = recommendation.attemptId
+          ? this.state.attempts.get(recommendation.attemptId)
+          : undefined;
+        if (
+          recommendation.attemptId &&
+          (!attempt ||
+            attempt.tenantId !== recommendation.tenantId ||
+            attempt.projectId !== recommendation.projectId ||
+            (recommendation.shotId !== undefined &&
+              attempt.shotId !== recommendation.shotId))
+        ) {
+          throw new RepositoryError(
+            'SCOPE_VIOLATION',
+            'The recommendation attempt is outside its resource scope.',
+          );
+        }
+        const event = this.state.events.get(recommendation.triggerEventId);
+        if (
+          !event ||
+          event.tenantId !== recommendation.tenantId ||
+          event.projectId !== recommendation.projectId ||
+          (recommendation.shotId !== undefined &&
+            event.shotId !== recommendation.shotId) ||
+          (recommendation.attemptId !== undefined &&
+            event.attemptId !== recommendation.attemptId)
+        ) {
+          throw new RepositoryError(
+            'SCOPE_VIOLATION',
+            'The recommendation trigger event is outside its resource scope.',
+          );
+        }
+        if (recommendation.piAgentRunId) {
+          const run = this.state.agentRuns.get(recommendation.piAgentRunId);
+          if (
+            !run ||
+            run.tenantId !== recommendation.tenantId ||
+            run.projectId !== recommendation.projectId
+          ) {
+            throw new RepositoryError(
+              'SCOPE_VIOLATION',
+              'The recommendation Pi run is outside its project scope.',
+            );
+          }
+        }
+        if (
+          this.state.recommendations.has(recommendation.id) ||
+          [...this.state.recommendations.values()].some(
+            (current) =>
+              current.triggerEventId === recommendation.triggerEventId &&
+              current.recommendationCode === recommendation.recommendationCode,
+          )
+        ) {
+          throw new RepositoryError(
+            'UNIQUE_VIOLATION',
+            'A recommendation already exists for this trigger and code.',
+          );
+        }
+        this.state.recommendations.set(
+          recommendation.id,
+          copyRecommendation(recommendation),
+        );
+      },
+      findById: async (tenantId, projectId, recommendationId) => {
+        const recommendation = this.state.recommendations.get(recommendationId);
+        return recommendation &&
+          recommendation.tenantId === tenantId &&
+          recommendation.projectId === projectId
+          ? copyRecommendation(recommendation)
+          : null;
+      },
+      listByProject: async (tenantId, projectId) =>
+        [...this.state.recommendations.values()]
+          .filter(
+            (recommendation) =>
+              recommendation.tenantId === tenantId &&
+              recommendation.projectId === projectId,
+          )
+          .sort(
+            (left, right) =>
+              left.createdAt.localeCompare(right.createdAt) ||
+              left.id.localeCompare(right.id),
+          )
+          .map(copyRecommendation),
+      updateStatus: async (
+        tenantId,
+        projectId,
+        recommendationId,
+        status,
+        expectedVersion,
+        updatedAt,
+      ) => {
+        if (!RECOMMENDATION_STATUSES.includes(status)) {
+          throw new RepositoryError(
+            'INVALID_ARGUMENT',
+            'Recommendation status is unknown.',
+          );
+        }
+        const current = this.state.recommendations.get(recommendationId);
+        if (
+          !current ||
+          current.tenantId !== tenantId ||
+          current.projectId !== projectId ||
+          current.version !== expectedVersion ||
+          current.status !== 'pending'
+        ) {
+          throw new RepositoryError(
+            'OPTIMISTIC_CONFLICT',
+            'The recommendation was modified or is no longer pending.',
+          );
+        }
+        const updated = copyRecommendation({
+          ...current,
+          status,
+          version: current.version + 1,
+          updatedAt,
+        });
+        this.state.recommendations.set(recommendationId, updated);
+        return copyRecommendation(updated);
+      },
+    };
+    this.operationalRecommendations = this.recommendations;
     this.events = {
       append: async (event) => {
         if (this.state.events.has(event.id)) {

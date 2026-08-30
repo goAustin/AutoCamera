@@ -48,6 +48,15 @@ export const PREVIEW_STEPS = 8 as const;
 export const MAX_ATTEMPTS_PER_SHOT = 3 as const;
 export const DEFAULT_ESTIMATED_ATTEMPT_COST = 100_000 as MicroUsd;
 
+const RECOVERABLE_FAILURE_CODES: ReadonlySet<AttemptFailureCode> = new Set([
+  'COMFY_UNAVAILABLE',
+  'COMFY_SUBMISSION_UNCERTAIN',
+  'COMFY_EXECUTION_FAILED',
+  'GENERATION_TIMEOUT',
+  'ARTIFACT_DOWNLOAD_FAILED',
+  'ARTIFACT_STORAGE_FAILED',
+]);
+
 export type GenerationApplicationErrorCode =
   | 'SHOT_NOT_FOUND'
   | 'ATTEMPT_NOT_FOUND'
@@ -379,7 +388,8 @@ export class GenerationApplicationService {
     }
     if (
       shot.status !== 'approved_for_generation' &&
-      shot.status !== 'rejected'
+      shot.status !== 'rejected' &&
+      shot.status !== 'retryable'
     ) {
       throw new GenerationApplicationError(
         'SHOT_NOT_READY_FOR_GENERATION',
@@ -467,7 +477,8 @@ export class GenerationApplicationService {
     let updatedProject = project;
     if (
       project.status === 'ready_for_generation' ||
-      project.status === 'awaiting_final_review'
+      project.status === 'awaiting_final_review' ||
+      project.status === 'needs_attention'
     ) {
       updatedProject = transitionProject(project, 'generating');
     } else if (project.status !== 'generating') {
@@ -706,10 +717,14 @@ export class GenerationApplicationService {
     command: CreateAttemptCommand,
   ): Promise<GenerationAttempt> {
     const source = await this.requireAttempt(repositories, attemptId);
-    if (source.status !== 'rejected') {
+    if (
+      source.status !== 'rejected' &&
+      source.status !== 'failed' &&
+      source.status !== 'timed_out'
+    ) {
       throw new GenerationApplicationError(
         'ATTEMPT_NOT_REJECTED',
-        'Regeneration requires a rejected source attempt.',
+        'Retry requires a failed, timed-out, or rejected source attempt.',
       );
     }
     return this.createAttemptInTransaction(
@@ -1532,12 +1547,18 @@ export class GenerationWorker {
         attempt.projectId,
         attempt.shotId,
       );
+      const recoverable =
+        status !== 'cancelled' && RECOVERABLE_FAILURE_CODES.has(code);
       if (shot && (shot.status === 'queued' || shot.status === 'generating')) {
         await repositories.shots.update(
           updatedAt(
             transitionShot(
               shot,
-              status === 'cancelled' ? 'cancelled' : 'failed',
+              status === 'cancelled'
+                ? 'cancelled'
+                : recoverable
+                  ? 'retryable'
+                  : 'failed',
             ),
             this.service.clock,
           ),
@@ -1553,7 +1574,11 @@ export class GenerationWorker {
           updatedAt(
             transitionProject(
               project,
-              status === 'cancelled' ? 'cancelled' : 'failed',
+              status === 'cancelled'
+                ? 'cancelled'
+                : recoverable
+                  ? 'needs_attention'
+                  : 'failed',
             ),
             this.service.clock,
           ),
@@ -1571,7 +1596,11 @@ export class GenerationWorker {
         shotId: attempt.shotId,
         attemptId,
         ...(attempt.comfyPromptId ? { promptId: attempt.comfyPromptId } : {}),
-        payload: { code, message: redactFailureMessage(message) },
+        payload: {
+          code,
+          message: redactFailureMessage(message),
+          recoverable,
+        },
       });
     });
   }

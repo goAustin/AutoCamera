@@ -18,6 +18,7 @@ export const PROJECT_STATUSES = [
   'awaiting_storyboard_approval',
   'ready_for_generation',
   'generating',
+  'needs_attention',
   'awaiting_final_review',
   'failed',
   'cancelled',
@@ -37,6 +38,7 @@ export const SHOT_STATUSES = [
   'approved_for_generation',
   'queued',
   'generating',
+  'retryable',
   'awaiting_review',
   'accepted',
   'rejected',
@@ -241,6 +243,7 @@ export interface GenerationAttempt {
   readonly requestedHeight: number;
   readonly requestedDurationSeconds: number;
   readonly workflowVersionId?: Uuid;
+  readonly workflowRevisionId?: Uuid;
   readonly workflowHash: string;
   readonly correlationId: string;
   readonly traceId?: string;
@@ -334,7 +337,13 @@ export const PROJECT_STATUS_TRANSITIONS: Readonly<
     'cancelled',
   ],
   ready_for_generation: ['generating', 'cancelled'],
-  generating: ['awaiting_final_review', 'failed', 'cancelled'],
+  generating: [
+    'awaiting_final_review',
+    'needs_attention',
+    'failed',
+    'cancelled',
+  ],
+  needs_attention: ['generating', 'cancelled'],
   awaiting_final_review: ['generating', 'completed', 'cancelled'],
   failed: [],
   cancelled: [],
@@ -354,8 +363,9 @@ export const SHOT_STATUS_TRANSITIONS: Readonly<
 > = {
   draft: ['approved_for_generation', 'cancelled', 'failed'],
   approved_for_generation: ['queued', 'cancelled', 'failed'],
-  queued: ['generating', 'cancelled', 'failed'],
-  generating: ['awaiting_review', 'cancelled', 'failed'],
+  queued: ['generating', 'retryable', 'cancelled', 'failed'],
+  generating: ['awaiting_review', 'retryable', 'cancelled', 'failed'],
+  retryable: ['queued', 'cancelled'],
   awaiting_review: ['accepted', 'rejected', 'cancelled', 'failed'],
   accepted: [],
   rejected: ['queued', 'cancelled', 'failed'],
@@ -672,7 +682,7 @@ function assertShotDefinition(definition: StoryboardShotDefinition): void {
       'Phase 2 supports preview T2V shots only.',
     );
   }
-  const optionalTextFields = [
+  const optionalTextFields: readonly unknown[] = [
     definition.visualDescription,
     definition.cameraDirection,
     definition.audioDirection,
@@ -680,7 +690,9 @@ function assertShotDefinition(definition: StoryboardShotDefinition): void {
   ];
   if (
     optionalTextFields.some(
-      (value) => value !== undefined && (!value.trim() || value.length > 2_000),
+      (value) =>
+        value !== undefined &&
+        (typeof value !== 'string' || !value.trim() || value.length > 2_000),
     )
   ) {
     throw new DomainError(
@@ -688,24 +700,45 @@ function assertShotDefinition(definition: StoryboardShotDefinition): void {
       'Optional shot direction text must be non-empty and bounded.',
     );
   }
-  if (definition.acceptanceCriteria) {
-    if (
-      definition.acceptanceCriteria.length > 8 ||
-      definition.acceptanceCriteria.some(
-        (value) => !value.trim() || value.length > 280,
-      )
-    ) {
-      throw new DomainError(
-        'INVALID_SHOT',
-        'Shot acceptance criteria must be bounded.',
-      );
-    }
+  if (definition.acceptanceCriteria !== undefined) {
+    assertBoundedStringArray(
+      definition.acceptanceCriteria,
+      8,
+      280,
+      'Shot acceptance criteria must be bounded.',
+    );
+  }
+  if (definition.requiredAssetIds !== undefined) {
+    assertBoundedStringArray(
+      definition.requiredAssetIds,
+      32,
+      200,
+      'Shot asset identifiers must be bounded strings.',
+    );
   }
   if (definition.requiredAssetIds?.length) {
     throw new DomainError(
       'INVALID_SHOT',
       'T2V shots cannot contain asset references.',
     );
+  }
+}
+
+function assertBoundedStringArray(
+  value: unknown,
+  maxItems: number,
+  maxItemLength: number,
+  message: string,
+): asserts value is readonly string[] {
+  if (
+    !Array.isArray(value) ||
+    value.length > maxItems ||
+    value.some(
+      (item) =>
+        typeof item !== 'string' || !item.trim() || item.length > maxItemLength,
+    )
+  ) {
+    throw new DomainError('INVALID_SHOT', message);
   }
 }
 
@@ -891,6 +924,13 @@ function assertAttempt(attempt: GenerationAttempt): void {
     );
   }
   assertUuidIfPresent(attempt.workflowVersionId);
+  assertUuidIfPresent(attempt.workflowRevisionId);
+  if (attempt.workflowVersionId && attempt.workflowRevisionId) {
+    throw new DomainError(
+      'INVALID_ATTEMPT',
+      'An attempt cannot reference both a legacy workflow version and a managed workflow revision.',
+    );
+  }
   assertUuidIfPresent(attempt.sourceAttemptId);
   assertUuidIfPresent(attempt.artifactId);
   assertIsoIfPresent(attempt.leaseExpiresAt);
@@ -1249,6 +1289,7 @@ export interface CreateGenerationAttemptInput {
   readonly requestedHeight: number;
   readonly requestedDurationSeconds: number;
   readonly workflowVersionId?: Uuid;
+  readonly workflowRevisionId?: Uuid;
   readonly workflowHash: string;
   readonly correlationId: string;
   readonly traceId?: string;
@@ -1282,6 +1323,9 @@ export function createGenerationAttempt(
     updatedAt: input.now,
     ...(input.workflowVersionId
       ? { workflowVersionId: input.workflowVersionId }
+      : {}),
+    ...(input.workflowRevisionId
+      ? { workflowRevisionId: input.workflowRevisionId }
       : {}),
     ...(input.traceId ? { traceId: input.traceId } : {}),
     ...(input.scenario ? { scenario: input.scenario } : {}),

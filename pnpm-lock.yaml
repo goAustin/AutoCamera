@@ -129,9 +129,6 @@ importers:
       '@h3/domain':
         specifier: workspace:0.1.0
         version: link:../domain
-      '@opentelemetry/api':
-        specifier: 1.9.1
-        version: 1.9.1
       zod:
         specifier: 4.4.3
         version: 4.4.3
@@ -171,9 +168,6 @@ importers:
       '@opentelemetry/api':
         specifier: 1.9.1
         version: 1.9.1
-      zod:
-        specifier: 4.4.3
-        version: 4.4.3
 
   packages/test-support: {}
 

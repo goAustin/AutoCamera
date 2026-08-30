@@ -719,6 +719,7 @@ export function transitionShotForFuturePhases(
   nextStatus:
     | 'queued'
     | 'generating'
+    | 'retryable'
     | 'awaiting_review'
     | 'rejected'
     | 'cancelled'

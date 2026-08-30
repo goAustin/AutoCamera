@@ -1,5 +1,6 @@
 import { statfsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
+import { createConnection } from 'node:net';
 
 const REQUIRED_NODE_MAJOR = 24;
 const PINNED_PNPM_VERSION = '9.15.0';
@@ -37,6 +38,8 @@ function parseConfiguredPort(name: string, fallback: number): number {
     : fallback;
 }
 
+type PortState = 'free' | 'occupied' | 'postgres' | 'unknown';
+
 function inspectPort(port: number): 'free' | 'occupied' | 'unknown' {
   const result = spawnSync('lsof', ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN'], {
     encoding: 'utf8',
@@ -52,6 +55,53 @@ function inspectPort(port: number): 'free' | 'occupied' | 'unknown' {
     return 'free';
   }
   return 'unknown';
+}
+
+function inspectPostgresListener(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const socket = createConnection({ host: '127.0.0.1', port });
+    let settled = false;
+    const timeout = setTimeout(() => finish(false), 1_000);
+
+    const finish = (reachable: boolean): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      socket.destroy();
+      resolve(reachable);
+    };
+
+    socket.once('connect', () => {
+      const parameters = Buffer.from(
+        'user\0h3_videoops\0database\0h3_videoops\0\0',
+        'utf8',
+      );
+      const startup = Buffer.alloc(8 + parameters.length);
+      startup.writeInt32BE(startup.length, 0);
+      startup.writeInt32BE(196_608, 4);
+      parameters.copy(startup, 8);
+      socket.write(startup);
+    });
+    socket.once('data', (data) => {
+      // PostgreSQL answers a valid startup packet with an authentication (R)
+      // or error (E) message. Either response proves the listener is a
+      // PostgreSQL service or tunnel; credentials are checked by db:migrate.
+      finish(data[0] === 0x52 || data[0] === 0x45);
+    });
+    socket.once('error', () => finish(false));
+    socket.once('close', () => finish(false));
+  });
+}
+
+async function inspectConfiguredPort(
+  name: string,
+  port: number,
+): Promise<PortState> {
+  const state = inspectPort(port);
+  if (state !== 'occupied' || name !== 'POSTGRES_PORT') {
+    return state;
+  }
+  return (await inspectPostgresListener(port)) ? 'postgres' : 'occupied';
 }
 
 function inspectCompose(): CheckResult {
@@ -149,18 +199,22 @@ async function audit(): Promise<CheckResult[]> {
   ] as const;
   const portChecks = await Promise.all(
     portEntries.map(async ([name, port]) => {
-      const state = await inspectPort(port);
+      const state = await inspectConfiguredPort(name, port);
       return {
         name: `Port ${name} (${port})`,
-        ok: state === 'free',
+        ok: state === 'free' || state === 'postgres',
         detail:
           state === 'free'
             ? 'free'
-            : state === 'occupied'
-              ? 'occupied by another process'
-              : 'could not be inspected',
+            : state === 'postgres'
+              ? 'an existing PostgreSQL service or tunnel is reachable'
+              : state === 'occupied'
+                ? 'occupied by another process'
+                : 'could not be inspected',
         action:
-          'Stop the process using this port or set a different local port',
+          state === 'postgres'
+            ? 'Keep the existing PostgreSQL service or tunnel and skip starting a second one'
+            : 'Stop the process using this port or set a different local port',
       } satisfies CheckResult;
     }),
   );
