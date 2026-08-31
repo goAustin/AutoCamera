@@ -598,6 +598,13 @@ export class ProjectApplicationService {
     });
   }
 
+  async getStoryboard(projectId: Uuid): Promise<StoryboardProposal | null> {
+    return this.store.withTransaction(async (repositories) => {
+      await this.requireProject(repositories, projectId);
+      return repositories.storyboards.findLatest(projectId);
+    });
+  }
+
   async listEvents(projectId: Uuid): Promise<readonly DomainEvent[]> {
     return this.store.withTransaction(async (repositories) => {
       await this.requireProject(repositories, projectId);

@@ -56,4 +56,54 @@ describe('API health routes', () => {
       dependencies: { postgres: 'ok' },
     });
   });
+
+  it('returns the latest storyboard proposal after planning for refresh recovery', async () => {
+    const app = buildApiApp({ config: getApiConfig({ NODE_ENV: 'test' }) });
+    apps.add(app);
+    const headers = {
+      authorization: 'Bearer test-token',
+      'idempotency-key': 'project-create-for-storyboard-read',
+    };
+
+    const created = await app.inject({
+      method: 'POST',
+      url: '/v1/projects',
+      headers,
+      payload: {
+        title: 'Storyboard refresh',
+        brief: 'A concise product story.',
+        targetDurationSeconds: 15,
+      },
+    });
+    expect(created.statusCode).toBe(201);
+    const projectId = created.json().project.id as string;
+
+    const planned = await app.inject({
+      method: 'POST',
+      url: `/v1/projects/${projectId}/plan`,
+      headers: {
+        authorization: 'Bearer test-token',
+        'idempotency-key': 'project-plan-for-storyboard-read',
+      },
+      payload: {},
+    });
+    expect(planned.statusCode).toBe(200);
+
+    const storyboard = await app.inject({
+      method: 'GET',
+      url: `/v1/projects/${projectId}/storyboard`,
+      headers: { authorization: 'Bearer test-token' },
+    });
+    expect(storyboard.statusCode).toBe(200);
+    expect(storyboard.json().proposal).toMatchObject({
+      projectId,
+      status: 'proposed',
+      shots: expect.arrayContaining([
+        expect.objectContaining({
+          ordinal: 1,
+          acceptanceCriteria: expect.any(Array),
+        }),
+      ]),
+    });
+  });
 });

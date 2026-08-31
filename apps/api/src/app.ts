@@ -1412,6 +1412,13 @@ function baseRouteSchemas() {
       type: 'object',
       properties: { events: { type: 'array', items: eventJsonSchema } },
     },
+    storyboardResponse: {
+      type: 'object',
+      required: ['proposal'],
+      properties: {
+        proposal: { anyOf: [proposalJsonSchema, { type: 'null' }] },
+      },
+    },
     costResponse: {
       type: 'object',
       properties: {
@@ -1982,6 +1989,26 @@ export function buildApiApp(options: ApiAppOptions = {}): FastifyInstance {
           },
         );
         return reply.code(response.status as 200).send(response.body);
+      },
+    );
+
+    routes.get(
+      '/v1/projects/:projectId/storyboard',
+      {
+        schema: {
+          tags: ['projects'],
+          summary: 'Get the latest storyboard proposal',
+          params: {
+            type: 'object',
+            required: ['projectId'],
+            properties: { projectId: { type: 'string', format: 'uuid' } },
+          },
+          response: { 200: schemas.storyboardResponse },
+        },
+      },
+      async (request) => {
+        const proposal = await service.getStoryboard(parseProjectId(request));
+        return { proposal: proposal ? proposalResponse(proposal) : null };
       },
     );
 
