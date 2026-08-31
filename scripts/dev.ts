@@ -65,6 +65,11 @@ function startManaged(label: string, args: readonly string[]): ManagedProcess {
 loadLocalEnvironment();
 
 try {
+  const comfyMode = process.env.COMFY_MODE ?? 'fake';
+  if (comfyMode !== 'fake' && comfyMode !== 'remote') {
+    throw new Error('COMFY_MODE must be either fake or remote.');
+  }
+
   await run('pnpm', ['prerequisites']);
   await run('pnpm', ['media:fixture']);
   await run('pnpm', ['infra:up']);
@@ -76,7 +81,9 @@ try {
   process.env.VITE_API_ORIGIN ??= `http://${apiHost}:${apiPort}`;
   const children = [
     startManaged('api', ['--filter', '@h3/api', 'dev']),
-    startManaged('fake-comfy', ['--filter', '@h3/fake-comfy', 'dev']),
+    ...(comfyMode === 'fake'
+      ? [startManaged('fake-comfy', ['--filter', '@h3/fake-comfy', 'dev'])]
+      : []),
     startManaged('web', ['--filter', '@h3/web', 'dev']),
   ];
 

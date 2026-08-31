@@ -5,6 +5,7 @@ import {
   type ComfyHealthResponse,
   type ComfyScenario,
   type ComfyObjectInfoResponse,
+  type ComfySystemStatsResponse,
 } from '@h3/comfy-client';
 import { getFakeComfyConfig, type FakeComfyConfig } from '@h3/config';
 
@@ -27,15 +28,32 @@ function scenario(value: unknown): ComfyScenario {
   return 'success';
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
 function historyResponse(
   record: ReturnType<DeterministicFakeComfyService['history']>,
 ): Record<string, unknown> {
   if (!record) return {};
   const outputs =
-    record.outputs.length > 0 ? { '4': { videos: record.outputs } } : {};
+    record.outputs.length > 0
+      ? {
+          '4': {
+            videos: record.outputs.map(
+              ({ filename, subfolder, type, format }) => ({
+                filename,
+                subfolder,
+                type,
+                ...(format ? { format } : {}),
+              }),
+            ),
+          },
+        }
+      : {};
   return {
     [record.promptId]: {
-      prompt: [0, record.extraData, {}, {}, []],
+      prompt: [0, record.promptId, record.workflow ?? {}, record.extraData, []],
       extra_data: record.extraData,
       outputs,
       status: {
@@ -48,6 +66,21 @@ function historyResponse(
         : {}),
     },
   };
+}
+
+function authorizeUpgrade(
+  request: {
+    readonly headers: {
+      readonly authorization?: string | string[] | undefined;
+    };
+  },
+  authToken: string | undefined,
+): boolean {
+  return (
+    !authToken ||
+    (typeof request.headers.authorization === 'string' &&
+      request.headers.authorization === `Bearer ${authToken}`)
+  );
 }
 
 function writeWebSocketFrame(
@@ -69,9 +102,14 @@ function writeWebSocketFrame(
 function attachWebSocket(
   app: FastifyInstance,
   service: DeterministicFakeComfyService,
+  authToken: string | undefined,
 ): void {
   app.server.on('upgrade', (request, socket) => {
     if (!request.url?.startsWith('/ws')) return;
+    if (!authorizeUpgrade(request, authToken)) {
+      socket.end('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
+      return;
+    }
     const key = request.headers['sec-websocket-key'];
     if (typeof key !== 'string') {
       socket.destroy();
@@ -90,6 +128,23 @@ function attachWebSocket(
         `Sec-WebSocket-Accept: ${digest}`,
         '\r\n',
       ].join('\r\n'),
+    );
+    const query = new URL(request.url, 'http://fake-comfy.local').searchParams;
+    const queue = service.queue();
+    writeWebSocketFrame(
+      socket,
+      JSON.stringify({
+        type: 'status',
+        data: {
+          status: {
+            exec_info: {
+              queue_remaining:
+                queue.queuePending.length + queue.queueRunning.length,
+            },
+          },
+          sid: query.get('clientId'),
+        },
+      }),
     );
     for (const event of service.eventsSnapshot()) {
       writeWebSocketFrame(socket, JSON.stringify(event.message));
@@ -113,7 +168,17 @@ export function buildFakeComfyApp(
 ): FastifyInstance {
   const config = options.config ?? getFakeComfyConfig();
   const service = options.service ?? new DeterministicFakeComfyService();
-  const app = Fastify({ logger: { level: config.logLevel } });
+  const app = Fastify({
+    logger: {
+      level: config.logLevel,
+      redact: [
+        'req.headers.authorization',
+        'req.headers.cookie',
+        'headers.authorization',
+        'headers.cookie',
+      ],
+    },
+  });
 
   const health = async (): Promise<ComfyHealthResponse> => ({
     service: 'fake-comfy',
@@ -122,6 +187,15 @@ export function buildFakeComfyApp(
 
   app.get('/health', health);
   app.get('/health/live', health);
+  app.addHook('onRequest', async (request, reply) => {
+    if (request.url.startsWith('/health')) return;
+    if (authorizeUpgrade(request, config.authToken)) return;
+    return reply.code(401).send({ error: 'unauthorized' });
+  });
+  app.get(
+    '/system_stats',
+    async (): Promise<ComfySystemStatsResponse> => service.getSystemStats(),
+  );
   app.get(
     '/object_info',
     async (): Promise<ComfyObjectInfoResponse> => service.getObjectInfo(),
@@ -129,16 +203,38 @@ export function buildFakeComfyApp(
 
   app.post('/prompt', async (request, reply) => {
     const body = (request.body ?? {}) as Record<string, unknown>;
+    const prompt = body.prompt;
+    if (!isRecord(prompt)) {
+      return reply.code(400).send({
+        error: 'Prompt must be an object.',
+        node_errors: {},
+      });
+    }
+    const availableClasses = new Set(Object.keys(service.getObjectInfo()));
+    const nodeErrors: Record<string, unknown> = {};
+    for (const [nodeId, node] of Object.entries(prompt)) {
+      if (!isRecord(node) || typeof node.class_type !== 'string') {
+        nodeErrors[nodeId] = { errors: ['node class_type is required'] };
+      } else if (!availableClasses.has(node.class_type)) {
+        nodeErrors[nodeId] = {
+          class_type: node.class_type,
+          errors: ['node class is not available'],
+        };
+      }
+    }
+    if (Object.keys(nodeErrors).length > 0) {
+      return reply.code(400).send({
+        error: 'Prompt validation failed.',
+        node_errors: nodeErrors,
+      });
+    }
     const extraData =
       typeof body.extra_data === 'object' && body.extra_data !== null
         ? (body.extra_data as Record<string, unknown>)
         : {};
     try {
       const submission = service.submit({
-        workflow:
-          typeof body.prompt === 'object' && body.prompt !== null
-            ? (body.prompt as Record<string, unknown>)
-            : {},
+        workflow: prompt,
         extraData,
         ...(typeof body.client_id === 'string'
           ? { clientId: body.client_id }
@@ -148,7 +244,7 @@ export function buildFakeComfyApp(
       });
       return reply.send({
         prompt_id: submission.promptId,
-        number: 0,
+        number: submission.queueNumber ?? 0,
         node_errors: {},
       });
     } catch (error) {
@@ -163,30 +259,38 @@ export function buildFakeComfyApp(
   });
 
   app.get('/prompt', async () => {
-    const queue = service.queue();
-    return {
-      queue_pending: queue.queuePending,
-      queue_running: queue.queueRunning,
-    };
+    return service.queueProtocol();
   });
 
-  app.get('/history', async () => service.histories());
+  app.get('/queue', async () => service.queueProtocol());
+
+  app.get('/history', async () =>
+    Object.fromEntries(
+      Object.values(service.histories()).flatMap((record) =>
+        Object.entries(historyResponse(record)),
+      ),
+    ),
+  );
   app.get('/history/:promptId', async (request, reply) => {
     const params = request.params as { promptId?: string };
     const record = params.promptId ? service.history(params.promptId) : null;
-    if (!record) return reply.code(404).send({ error: 'not found' });
+    if (!record) return reply.send({});
     return reply.send(historyResponse(record));
   });
 
   app.get('/view', async (request, reply) => {
-    const query = request.query as { filename?: string };
+    const query = request.query as {
+      filename?: string;
+      subfolder?: string;
+      type?: string;
+    };
     if (!query.filename)
       return reply.code(400).send({ error: 'filename required' });
     try {
       const output = service.output({
         filename: query.filename,
-        subfolder: '',
-        type: 'output',
+        subfolder: query.subfolder ?? '',
+        type: query.type ?? 'output',
         mimeType: 'video/mp4',
       });
       return reply.type('video/mp4').send(Buffer.from(output));
@@ -206,7 +310,7 @@ export function buildFakeComfyApp(
   app.get('/ws', async (_request, reply) =>
     reply.code(426).send({ error: 'websocket upgrade required' }),
   );
-  attachWebSocket(app, service);
+  attachWebSocket(app, service, config.authToken);
 
   return app;
 }

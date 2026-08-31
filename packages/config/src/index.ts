@@ -1,6 +1,7 @@
 import { z } from 'zod';
 
 const nodeEnvironments = ['development', 'test', 'production'] as const;
+const comfyModes = ['fake', 'remote'] as const;
 const logLevels = [
   'fatal',
   'error',
@@ -13,6 +14,7 @@ const logLevels = [
 
 const port = z.coerce.number().int().min(1).max(65_535);
 const positiveInteger = z.coerce.number().int().positive();
+const requestTimeoutMs = z.coerce.number().int().min(100).max(120_000);
 const optionalUrl = z.preprocess(
   (value: unknown) => (value === '' ? undefined : value),
   z.string().url().optional(),
@@ -39,8 +41,15 @@ export const environmentSchema = z.object({
     z.string().trim().min(1).optional(),
   ),
   ARTIFACT_ROOT: z.string().trim().min(1).default('.data/artifacts'),
+  COMFY_MODE: z.enum(comfyModes).default('fake'),
   COMFY_BASE_URL: z.string().url().default('http://127.0.0.1:8188'),
   COMFY_WS_URL: z.string().url().default('ws://127.0.0.1:8188/ws'),
+  COMFY_FRONTEND_URL: z.string().url().default('http://127.0.0.1:8188'),
+  COMFY_AUTH_TOKEN: z.preprocess(
+    (value: unknown) => (value === '' ? undefined : value),
+    z.string().trim().min(1).optional(),
+  ),
+  COMFY_REQUEST_TIMEOUT_MS: requestTimeoutMs.default(15_000),
   COMFY_CLIENT_ID_PREFIX: z.string().trim().min(1).default('h3-dev'),
   GPU_WORKER_ID: z.string().trim().min(1).default('local-worker-1'),
   PI_PROVIDER: z.string().trim().min(1).default('faux'),
@@ -70,6 +79,7 @@ export const environmentSchema = z.object({
 
 export type Environment = z.infer<typeof environmentSchema>;
 export type NodeEnvironment = (typeof nodeEnvironments)[number];
+export type ComfyMode = (typeof comfyModes)[number];
 export type LogLevel = (typeof logLevels)[number];
 
 export class ConfigurationError extends Error {
@@ -104,6 +114,46 @@ export function parseEnvironment(raw: NodeJS.ProcessEnv): Environment {
     throw new ConfigurationError(['PI_API_KEY']);
   }
 
+  const invalidComfyVariables = new Set<string>();
+  const urlProtocols: ReadonlyArray<
+    readonly [
+      'COMFY_BASE_URL' | 'COMFY_WS_URL' | 'COMFY_FRONTEND_URL',
+      readonly string[],
+    ]
+  > = [
+    ['COMFY_BASE_URL', ['http:', 'https:']],
+    ['COMFY_WS_URL', ['ws:', 'wss:']],
+    ['COMFY_FRONTEND_URL', ['http:', 'https:']],
+  ];
+  for (const [name, allowedProtocols] of urlProtocols) {
+    const value = result.data[name];
+    const parsed = new URL(value);
+    if (
+      !allowedProtocols.includes(parsed.protocol) ||
+      parsed.username.length > 0 ||
+      parsed.password.length > 0
+    ) {
+      invalidComfyVariables.add(name);
+    }
+  }
+
+  if (result.data.COMFY_MODE === 'remote') {
+    for (const name of [
+      'COMFY_BASE_URL',
+      'COMFY_WS_URL',
+      'COMFY_FRONTEND_URL',
+    ] as const) {
+      const rawValue = raw[name];
+      if (typeof rawValue !== 'string' || rawValue.trim().length === 0) {
+        invalidComfyVariables.add(name);
+      }
+    }
+  }
+
+  if (invalidComfyVariables.size > 0) {
+    throw new ConfigurationError([...invalidComfyVariables]);
+  }
+
   return result.data;
 }
 
@@ -116,9 +166,13 @@ export interface ApiConfig {
   readonly databaseUrl: string;
   readonly devAuthToken: string;
   readonly artifactRoot: string;
+  readonly comfyMode: ComfyMode;
   readonly comfyBaseUrl: string;
   readonly comfyWsUrl: string;
+  readonly comfyFrontendUrl: string;
+  readonly comfyRequestTimeoutMs: number;
   readonly comfyClientIdPrefix: string;
+  readonly comfyAuthToken?: string;
   readonly gpuWorkerId: string;
   readonly piProvider: string;
   readonly piModel: string;
@@ -144,8 +198,11 @@ export function getApiConfig(raw: NodeJS.ProcessEnv = process.env): ApiConfig {
       environment.DEV_AUTH_TOKEN ??
       (environment.NODE_ENV === 'test' ? 'test-token' : ''),
     artifactRoot: environment.ARTIFACT_ROOT,
+    comfyMode: environment.COMFY_MODE,
     comfyBaseUrl: environment.COMFY_BASE_URL,
     comfyWsUrl: environment.COMFY_WS_URL,
+    comfyFrontendUrl: environment.COMFY_FRONTEND_URL,
+    comfyRequestTimeoutMs: environment.COMFY_REQUEST_TIMEOUT_MS,
     comfyClientIdPrefix: environment.COMFY_CLIENT_ID_PREFIX,
     gpuWorkerId: environment.GPU_WORKER_ID,
     piProvider: environment.PI_PROVIDER,
@@ -157,12 +214,16 @@ export function getApiConfig(raw: NodeJS.ProcessEnv = process.env): ApiConfig {
   };
 
   if (
+    environment.COMFY_AUTH_TOKEN ||
     environment.PI_API_KEY ||
     environment.PI_BASE_URL ||
     environment.OTEL_EXPORTER_OTLP_ENDPOINT
   ) {
     return {
       ...config,
+      ...(environment.COMFY_AUTH_TOKEN
+        ? { comfyAuthToken: environment.COMFY_AUTH_TOKEN }
+        : {}),
       ...(environment.PI_API_KEY ? { piApiKey: environment.PI_API_KEY } : {}),
       ...(environment.PI_BASE_URL
         ? { piBaseUrl: environment.PI_BASE_URL }
@@ -181,6 +242,7 @@ export interface FakeComfyConfig {
   readonly logLevel: LogLevel;
   readonly host: string;
   readonly port: number;
+  readonly authToken?: string;
 }
 
 export function getFakeComfyConfig(
@@ -192,6 +254,9 @@ export function getFakeComfyConfig(
     logLevel: environment.LOG_LEVEL,
     host: environment.FAKE_COMFY_HOST,
     port: environment.FAKE_COMFY_PORT,
+    ...(environment.COMFY_AUTH_TOKEN
+      ? { authToken: environment.COMFY_AUTH_TOKEN }
+      : {}),
   };
 }
 

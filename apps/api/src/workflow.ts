@@ -26,6 +26,7 @@ import {
   validateMinimaxH3T2vaPreview,
   type MinimaxH3ValidationResult,
 } from '@h3/workflow-compiler';
+import type { AgentTelemetry, MetricsRegistry } from '@h3/telemetry';
 
 export type WorkflowGraph = Readonly<Record<string, unknown>>;
 
@@ -73,10 +74,13 @@ export interface WorkflowApplicationServiceOptions {
   readonly idGenerator?: IdGenerator;
   readonly executor?: WorkflowCapabilityProvider;
   readonly requireExecutor?: boolean;
+  readonly telemetry?: AgentTelemetry;
+  readonly metrics?: MetricsRegistry;
 }
 
 export interface CreateWorkflowDraftCommand {
   readonly idempotencyKey: string;
+  readonly traceId?: string;
   readonly editorGraphJson: WorkflowGraph;
   readonly lastApiGraphJson?: WorkflowGraph | null;
   readonly baseRevisionId?: Uuid | null;
@@ -96,6 +100,7 @@ export interface SaveWorkflowDraftCommand extends CreateWorkflowDraftCommand {
 
 export interface CreateWorkflowRevisionCommand {
   readonly idempotencyKey: string;
+  readonly traceId?: string;
   readonly editorGraphJson: WorkflowGraph;
   readonly apiGraphJson: WorkflowGraph;
   readonly parentRevisionId?: Uuid | null;
@@ -299,6 +304,8 @@ export class WorkflowApplicationService {
   readonly idGenerator: IdGenerator;
   readonly executor: WorkflowCapabilityProvider | undefined;
   readonly requireExecutor: boolean;
+  readonly telemetry: AgentTelemetry | undefined;
+  readonly metrics: MetricsRegistry | undefined;
 
   constructor(options: WorkflowApplicationServiceOptions) {
     this.store = options.store;
@@ -307,6 +314,8 @@ export class WorkflowApplicationService {
     this.idGenerator = options.idGenerator ?? systemIdGenerator;
     this.executor = options.executor;
     this.requireExecutor = options.requireExecutor ?? false;
+    this.telemetry = options.telemetry;
+    this.metrics = options.metrics;
   }
 
   withTransaction<Result>(
@@ -736,6 +745,7 @@ export class WorkflowApplicationService {
         'Workflow revision parent is outside its shot scope.',
       );
     }
+    const validationStartedAt = Date.now();
     const validation = await this.validateGraphs(
       editorGraphJson,
       apiGraphJson,
@@ -743,6 +753,7 @@ export class WorkflowApplicationService {
       profileVersion,
       command.executorObjectInfo,
     );
+    this.observeValidation(validation, validationStartedAt);
     const executionHash = hashWorkflowExecutionEnvelope({
       profileId,
       profileVersion,
@@ -826,6 +837,11 @@ export class WorkflowApplicationService {
         revision,
         resourceMutationKey('revision.create', reservation.key),
       );
+      this.incrementRevisionMetric(
+        created.profileId,
+        created.validationStatus,
+        created.source,
+      );
       if (validation.errors.length > 0) {
         await this.appendValidationEvents(
           repositories,
@@ -833,6 +849,7 @@ export class WorkflowApplicationService {
           shotId,
           created.id,
           validation.errors.map((issue) => issue.code),
+          command.traceId,
         );
       }
       await completeApplicationMutation(
@@ -859,6 +876,7 @@ export class WorkflowApplicationService {
     shotId: Uuid,
     revisionId: Uuid,
     executorObjectInfo?: unknown,
+    traceId?: string,
   ): Promise<WorkflowRevisionValidationResult> {
     return this.store.withTransaction((repositories) =>
       this.validateWorkflowRevisionInTransaction(
@@ -867,6 +885,7 @@ export class WorkflowApplicationService {
         shotId,
         revisionId,
         executorObjectInfo,
+        traceId,
       ),
     );
   }
@@ -877,6 +896,7 @@ export class WorkflowApplicationService {
     shotId: Uuid,
     revisionId: Uuid,
     executorObjectInfo?: unknown,
+    traceId?: string,
   ): Promise<WorkflowRevisionValidationResult> {
     await this.requireShotScope(repositories, projectId, shotId);
     const revision = await this.requireRevision(
@@ -886,6 +906,7 @@ export class WorkflowApplicationService {
       revisionId,
       'The workflow revision was not found.',
     );
+    const validationStartedAt = Date.now();
     const validation = await this.validateGraphs(
       revision.editorGraphJson,
       revision.apiGraphJson,
@@ -893,6 +914,7 @@ export class WorkflowApplicationService {
       revision.profileVersion,
       executorObjectInfo,
     );
+    this.observeValidation(validation, validationStartedAt);
     const updated = await repositories.workflowRevisions.updateValidation(
       this.tenantId,
       projectId,
@@ -916,6 +938,7 @@ export class WorkflowApplicationService {
         shotId,
         updated.id,
         validation.errors.map((issue) => issue.code),
+        traceId,
       );
     }
     return { revision: updated, validation };
@@ -927,6 +950,7 @@ export class WorkflowApplicationService {
     shotId: Uuid,
     revisionId: Uuid,
     validationCodes: readonly string[],
+    traceId?: string,
   ): Promise<void> {
     const now = toIsoUtc(this.clock.now());
     const append = async (
@@ -942,6 +966,7 @@ export class WorkflowApplicationService {
         shotId,
         clock: { now: () => new Date(now) },
         payload,
+        ...(traceId ? { traceId } : {}),
       });
       await repositories.events.append(event);
       await repositories.outbox.enqueue(event);
@@ -955,6 +980,42 @@ export class WorkflowApplicationService {
         workflowRevisionId: revisionId,
         reasonCode: 'EXECUTOR_UNAVAILABLE',
       });
+    }
+  }
+
+  private observeValidation(
+    validation: MinimaxH3ValidationResult,
+    startedAt: number,
+  ): void {
+    if (!this.metrics) return;
+    try {
+      this.metrics.observe(
+        'video_workflow_validation_duration_seconds',
+        {
+          profile_id: MINIMAX_H3_PROFILE_ID,
+          result: validation.errors.length === 0 ? 'success' : 'failure',
+        },
+        Math.max(0, (Date.now() - startedAt) / 1_000),
+      );
+    } catch {
+      // Metrics are diagnostic and cannot change revision persistence.
+    }
+  }
+
+  private incrementRevisionMetric(
+    profileId: string,
+    validationStatus: WorkflowRevisionRecord['validationStatus'],
+    source: WorkflowRevisionSource,
+  ): void {
+    if (!this.metrics) return;
+    try {
+      this.metrics.increment('video_workflow_revisions_total', {
+        profile_id: profileId,
+        validation_status: validationStatus,
+        source,
+      });
+    } catch {
+      // Metrics are diagnostic and cannot change revision persistence.
     }
   }
 

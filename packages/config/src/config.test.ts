@@ -16,6 +16,9 @@ describe('configuration', () => {
     expect(config.piProvider).toBe('faux');
     expect(config.piModel).toBe('h3-videoops-storyboard-v1');
     expect(config.piMaxConcurrentRuns).toBe(1);
+    expect(config.comfyMode).toBe('fake');
+    expect(config.comfyFrontendUrl).toBe('http://127.0.0.1:8188');
+    expect(config.comfyRequestTimeoutMs).toBe(15_000);
     expect(getWebConfig({ NODE_ENV: 'test' }).apiOrigin).toBe(
       'http://127.0.0.1:3000',
     );
@@ -74,5 +77,35 @@ describe('configuration', () => {
         PI_API_KEY: 'secret',
       }).PI_PROVIDER,
     ).toBe('hosted');
+  });
+
+  it('requires explicit, protocol-safe remote Comfy endpoints', () => {
+    expect(() =>
+      parseEnvironment({ NODE_ENV: 'test', COMFY_MODE: 'remote' }),
+    ).toThrowError('COMFY_BASE_URL');
+    expect(() =>
+      parseEnvironment({
+        NODE_ENV: 'test',
+        COMFY_MODE: 'remote',
+        COMFY_BASE_URL: 'ftp://comfy.example.test',
+        COMFY_WS_URL: 'ws://comfy.example.test/ws',
+        COMFY_FRONTEND_URL: 'http://comfy.example.test',
+      }),
+    ).toThrowError(ConfigurationError);
+    expect(
+      parseEnvironment({
+        NODE_ENV: 'test',
+        COMFY_MODE: 'remote',
+        COMFY_BASE_URL: 'https://comfy.example.test',
+        COMFY_WS_URL: 'wss://comfy.example.test/ws',
+        COMFY_FRONTEND_URL: 'https://comfy.example.test',
+        COMFY_REQUEST_TIMEOUT_MS: '20000',
+        COMFY_AUTH_TOKEN: 'secret',
+      }),
+    ).toMatchObject({
+      COMFY_MODE: 'remote',
+      COMFY_REQUEST_TIMEOUT_MS: 20_000,
+      COMFY_AUTH_TOKEN: 'secret',
+    });
   });
 });

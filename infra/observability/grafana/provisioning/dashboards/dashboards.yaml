@@ -1,0 +1,10 @@
+apiVersion: 1
+providers:
+  - name: H3 VideoOps
+    orgId: 1
+    folder: H3 VideoOps
+    type: file
+    disableDeletion: true
+    editable: false
+    options:
+      path: /var/lib/grafana/dashboards

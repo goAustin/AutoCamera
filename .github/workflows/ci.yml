@@ -42,6 +42,11 @@ jobs:
         run: ffmpeg -version && ffprobe -version
       - name: Generate synthetic media fixture
         run: pnpm media:fixture
+      - name: Validate release metadata and observability
+        run: |
+          pnpm observability:config
+          pnpm security:scan
+          pnpm docs:check
       - name: Check repository
         env:
           NODE_ENV: test
@@ -54,3 +59,11 @@ jobs:
           DATABASE_URL: postgres://h3_videoops:h3_videoops@127.0.0.1:5432/h3_videoops
           DEV_AUTH_TOKEN: ci-local-token
         run: pnpm test:integration
+      - name: Install Playwright Chromium
+        run: pnpm exec playwright install --with-deps chromium
+      - name: Run fake-mode browser E2E
+        env:
+          NODE_ENV: test
+          DATABASE_URL: postgres://h3_videoops:h3_videoops@127.0.0.1:5432/h3_videoops
+          DEV_AUTH_TOKEN: ci-local-token
+        run: pnpm test:e2e

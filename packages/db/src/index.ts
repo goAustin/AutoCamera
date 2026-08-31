@@ -35,13 +35,23 @@ export interface SqlExecutor {
   ): Promise<QueryResult<T>>;
 }
 
-export function createDatabasePool(databaseUrl: string): Pool {
+export interface DatabasePoolOptions {
+  readonly searchPath?: string;
+}
+
+export function createDatabasePool(
+  databaseUrl: string,
+  options: DatabasePoolOptions = {},
+): Pool {
   return new Pool({
     connectionString: databaseUrl,
     max: 10,
     idleTimeoutMillis: 30_000,
     connectionTimeoutMillis: 2_000,
     application_name: 'h3-videoops-api',
+    ...(options.searchPath
+      ? { options: `-c search_path=${options.searchPath},public` }
+      : {}),
   });
 }
 

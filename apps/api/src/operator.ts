@@ -53,6 +53,8 @@ import {
 import {
   type AgentTelemetry,
   InMemoryTelemetry,
+  type MetricsRegistry,
+  type TraceId,
   type TelemetryAttributes,
   type TelemetrySpanHandle,
 } from '@h3/telemetry';
@@ -100,6 +102,7 @@ export interface OperationalPiAdapterOptions {
   readonly provider?: string;
   readonly model?: string;
   readonly telemetry?: AgentTelemetry;
+  readonly metrics?: MetricsRegistry;
   readonly services: OperationalToolServiceFactory;
   readonly script?: FauxOperationalScript;
 }
@@ -509,6 +512,7 @@ export class OperationalPiAdapter {
   readonly provider: string;
   readonly modelName: string;
   readonly telemetry: AgentTelemetry;
+  readonly metrics: MetricsRegistry | undefined;
   readonly services: OperationalToolServiceFactory;
   readonly script: FauxOperationalScript | undefined;
 
@@ -524,6 +528,7 @@ export class OperationalPiAdapter {
     this.provider = options.provider ?? 'faux';
     this.modelName = options.model ?? 'h3-videoops-operator-v1';
     this.telemetry = options.telemetry ?? new InMemoryTelemetry();
+    this.metrics = options.metrics;
     this.services = options.services;
     this.script = options.script;
   }
@@ -668,6 +673,17 @@ export class OperationalPiAdapter {
       await repositories.agentRuns.create(run);
     }
 
+    const recommendationSpan = this.telemetry.startRootSpan
+      ? this.telemetry.startRootSpan(
+          'operator.recommend',
+          { eventType: event.type, status: 'running' },
+          event.traceId as TraceId | undefined,
+        )
+      : this.telemetry.startSpan('operator.recommend', {
+          eventType: event.type,
+          status: 'running',
+        });
+    const runStartedAt = Date.now();
     let runResult: OperatorRunResult | undefined;
     let runError: unknown;
     try {
@@ -678,8 +694,16 @@ export class OperationalPiAdapter {
         ...(hasRevision ? { revision: hasRevision } : {}),
         services,
       });
+      recommendationSpan.setStatus('ok');
     } catch (error) {
       runError = error;
+      recommendationSpan.setStatus('error', error);
+    } finally {
+      recommendationSpan.setAttributes({
+        result: runError ? 'failure' : 'success',
+        durationMs: Math.max(0, Date.now() - runStartedAt),
+      });
+      recommendationSpan.end();
     }
 
     const fallback = defaultOutput(
@@ -768,6 +792,27 @@ export class OperationalPiAdapter {
       }
       throw error;
     }
+    if (this.metrics) {
+      try {
+        this.metrics.increment('pi_agent_runs_total', {
+          run_type: 'operator',
+          status: runError ? 'failure' : 'success',
+          provider: this.provider === 'faux' ? 'faux' : 'hosted',
+        });
+        this.metrics.observe(
+          'pi_agent_duration_seconds',
+          { run_type: 'operator', status: runError ? 'failure' : 'success' },
+          Math.max(0, (Date.now() - runStartedAt) / 1_000),
+        );
+        this.metrics.increment('video_operator_recommendations_total', {
+          code: recommendationCode,
+          status: recommendation.status,
+          severity: recommendation.severity,
+        });
+      } catch {
+        // Metrics are diagnostic and cannot change the recommendation result.
+      }
+    }
     return {
       handled: true,
       duplicate: false,
@@ -786,12 +831,23 @@ export class OperationalPiAdapter {
       readonly services: OperationalToolServices;
     },
   ): Promise<OperatorRunResult> {
-    const rootSpan = this.telemetry.startSpan('agent.operator.run', {
-      provider: this.provider,
-      model: this.modelName,
-      eventType: event.type,
-      status: 'running',
-    });
+    const rootSpan = this.telemetry.startRootSpan
+      ? this.telemetry.startRootSpan(
+          'agent.operator.run',
+          {
+            provider: this.provider,
+            model: this.modelName,
+            eventType: event.type,
+            status: 'running',
+          },
+          event.traceId as TraceId | undefined,
+        )
+      : this.telemetry.startSpan('agent.operator.run', {
+          provider: this.provider,
+          model: this.modelName,
+          eventType: event.type,
+          status: 'running',
+        });
     let toolsUsed = 0;
     let terminalStatus: 'ok' | 'error' = 'error';
     try {

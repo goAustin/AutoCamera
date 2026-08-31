@@ -191,10 +191,18 @@ async function audit(): Promise<CheckResult[]> {
     action: 'Free at least 10 GiB for dependencies, containers, and fixtures',
   };
 
+  const comfyMode = process.env.COMFY_MODE ?? 'fake';
   const portEntries = [
     ['API_PORT', parseConfiguredPort('API_PORT', 3000)],
     ['WEB_PORT', parseConfiguredPort('WEB_PORT', 5173)],
-    ['FAKE_COMFY_PORT', parseConfiguredPort('FAKE_COMFY_PORT', 8188)],
+    ...(comfyMode === 'fake'
+      ? [
+          [
+            'FAKE_COMFY_PORT',
+            parseConfiguredPort('FAKE_COMFY_PORT', 8188),
+          ] as const,
+        ]
+      : []),
     ['POSTGRES_PORT', parseConfiguredPort('POSTGRES_PORT', 5432)],
   ] as const;
   const portChecks = await Promise.all(

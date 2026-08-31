@@ -1,0 +1,43 @@
+{
+  "manifestVersion": 1,
+  "verifiedAt": "2026-08-31",
+  "comfyui": {
+    "repository": "https://github.com/Comfy-Org/ComfyUI.git",
+    "ref": "8a33128f2f8c5585c57486c07de481241e70a39c"
+  },
+  "comfyuiFrontend": {
+    "repository": "https://github.com/Comfy-Org/ComfyUI_frontend.git",
+    "ref": "3697a1bc3ba7f6b98a1ead888721f7676b536eb5"
+  },
+  "workflowTemplates": {
+    "repository": "https://github.com/Comfy-Org/workflow_templates.git",
+    "ref": "d3b4a9e89573162b005961865164c18c8ae2206b",
+    "h3T2vTemplate": "templates/video_minimax_h3_t2v.json"
+  },
+  "miniMaxH3": {
+    "repository": "https://github.com/MiniMax-AI/MiniMax-H3.git",
+    "ref": "d21241f0a4b3acbb34c97dae47fa417b7065e438",
+    "managedWorkflowUsesRepository": false
+  },
+  "frontendBridge": {
+    "source": "integrations/comfyui-videoops",
+    "installDirectory": "ComfyUI/custom_nodes/comfyui-videoops",
+    "executionNodes": false
+  },
+  "models": {
+    "diffusionModel": "models/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+    "textEncoder": "models/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+    "videoVae": "models/vae/minimax_h3_video_vae_fp16.safetensors",
+    "audioVae": "models/vae/minimax_h3_audio_vae_fp32.safetensors",
+    "turboLora": "models/loras/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors"
+  },
+  "runtime": {
+    "fps": 24,
+    "previewWidth": 960,
+    "previewHeight": 544,
+    "nonTurboSteps": 20,
+    "audioSampleRate": 32000,
+    "audioChannels": 2,
+    "realGenerationEvidenceRequired": true
+  }
+}

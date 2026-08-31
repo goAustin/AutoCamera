@@ -1,0 +1,141 @@
+{
+  "annotations": { "list": [] },
+  "editable": false,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "links": [],
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Projects by durable status",
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 0 },
+      "targets": [
+        { "expr": "video_projects_total", "legendFormat": "{{status}}" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Attempts by status and executor",
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 0 },
+      "targets": [
+        {
+          "expr": "video_generation_attempts_total",
+          "legendFormat": "{{status}} / {{executor_mode}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Workflow validation outcomes",
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 0 },
+      "targets": [
+        {
+          "expr": "video_workflow_revisions_total",
+          "legendFormat": "{{profile_id}} / {{validation_status}} / {{source}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Queue wait and execution duration",
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 7 },
+      "targets": [
+        {
+          "expr": "rate(video_generation_queue_wait_seconds_sum[5m])",
+          "legendFormat": "queue wait"
+        },
+        {
+          "expr": "rate(video_generation_duration_seconds_sum[5m])",
+          "legendFormat": "duration"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Executor readiness",
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 7 },
+      "targets": [
+        { "expr": "video_executor_ready", "legendFormat": "{{executor_mode}}" },
+        {
+          "expr": "video_comfy_ws_connected",
+          "legendFormat": "WS {{executor_mode}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Comfy reconciliation outcomes",
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 7 },
+      "targets": [
+        {
+          "expr": "video_comfy_reconciliations_total",
+          "legendFormat": "{{outcome}}"
+        },
+        {
+          "expr": "video_comfy_orphan_events_total",
+          "legendFormat": "orphans {{executor_mode}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Evaluation failures",
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 14 },
+      "targets": [
+        {
+          "expr": "video_evaluation_failures_total",
+          "legendFormat": "{{check}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Recorded compute cost (USD)",
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 14 },
+      "targets": [
+        {
+          "expr": "video_generation_compute_cost_usd",
+          "legendFormat": "{{executor_mode}} · evidence is local fake or configured remote"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Pi planning and operator runs",
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 14 },
+      "targets": [
+        {
+          "expr": "pi_agent_runs_total",
+          "legendFormat": "{{run_type}} / {{status}} / {{provider}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Operator recommendations",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 21 },
+      "targets": [
+        {
+          "expr": "video_operator_recommendations_total",
+          "legendFormat": "{{code}} / {{status}} / {{severity}}"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Active SSE connections",
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 21 },
+      "targets": [{ "expr": "video_sse_connections", "legendFormat": "SSE" }]
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 39,
+  "style": "dark",
+  "tags": ["h3-videoops", "offline-fake"],
+  "templating": { "list": [] },
+  "time": { "from": "now-15m", "to": "now" },
+  "timezone": "browser",
+  "title": "H3 VideoOps — Phase 6 offline observability",
+  "uid": "h3-videoops-phase6",
+  "version": 1
+}

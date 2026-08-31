@@ -1,0 +1,9 @@
+{
+  "observabilityProfile": "phase6-local",
+  "otelCollector": "otel/opentelemetry-collector-contrib:0.136.0",
+  "tempo": "grafana/tempo:2.8.2",
+  "prometheus": "prom/prometheus:v3.5.0",
+  "grafana": "grafana/grafana:12.1.1",
+  "dashboard": "grafana/dashboards/h3-videoops.json",
+  "dataPolicy": "Named observability volumes only; infra:down and observability:down do not remove PostgreSQL or artifact data."
+}

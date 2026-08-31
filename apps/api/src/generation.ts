@@ -45,6 +45,13 @@ import {
   validateMinimaxH3T2vaPreview,
 } from '@h3/workflow-compiler';
 import { createLocalArtifactStore, type ArtifactStore } from '@h3/object-store';
+import {
+  InMemoryTelemetry,
+  type MetricsRegistry,
+  type AgentTelemetry,
+  type TelemetrySpanHandle,
+  type TraceId,
+} from '@h3/telemetry';
 
 export const PREVIEW_WIDTH = 960 as const;
 export const PREVIEW_HEIGHT = 544 as const;
@@ -138,6 +145,9 @@ export interface GenerationApplicationServiceOptions {
   readonly maxAttemptsPerShot?: number;
   readonly estimatedAttemptCostMicrousd?: MicroUsd;
   readonly previewDurationSeconds?: number;
+  readonly telemetry?: AgentTelemetry;
+  readonly metrics?: MetricsRegistry;
+  readonly executorMode?: 'fake' | 'remote';
 }
 
 function updatedAt<Value extends { readonly updatedAt: IsoUtcTimestamp }>(
@@ -433,6 +443,9 @@ export class GenerationApplicationService {
   readonly maxAttemptsPerShot: number;
   readonly estimatedAttemptCostMicrousd: MicroUsd;
   readonly previewDurationSeconds: number;
+  readonly telemetry: AgentTelemetry;
+  readonly metrics: MetricsRegistry | undefined;
+  readonly executorMode: 'fake' | 'remote';
 
   constructor(options: GenerationApplicationServiceOptions) {
     this.store = options.store;
@@ -449,6 +462,84 @@ export class GenerationApplicationService {
       options.estimatedAttemptCostMicrousd ?? DEFAULT_ESTIMATED_ATTEMPT_COST;
     this.previewDurationSeconds =
       options.previewDurationSeconds ?? PREVIEW_DURATION_SECONDS;
+    this.telemetry = options.telemetry ?? new InMemoryTelemetry();
+    this.metrics = options.metrics;
+    this.executorMode = options.executorMode ?? 'fake';
+  }
+
+  startAttemptSpan(
+    name: string,
+    attempt: GenerationAttempt,
+    attributes: Readonly<Record<string, string | number | boolean>> = {},
+    parent?: TelemetrySpanHandle,
+  ): TelemetrySpanHandle {
+    if (parent) return this.telemetry.startSpan(name, attributes, parent);
+    return this.telemetry.startRootSpan
+      ? this.telemetry.startRootSpan(
+          name,
+          attributes,
+          attempt.traceId as TraceId | undefined,
+        )
+      : this.telemetry.startSpan(name, attributes);
+  }
+
+  metric(work: () => void): void {
+    if (!this.metrics) return;
+    try {
+      work();
+    } catch {
+      // Metrics are diagnostic and cannot change durable generation state.
+    }
+  }
+
+  recordAttemptStatus(
+    status: GenerationAttempt['status'],
+    qualityTier = 'preview',
+  ): void {
+    const allowedStatus = status;
+    this.metric(() =>
+      this.metrics?.increment('video_generation_attempts_total', {
+        status: allowedStatus,
+        quality_tier: qualityTier,
+        executor_mode: this.executorMode,
+      }),
+    );
+  }
+
+  private recordBudgetDenial(): void {
+    this.metric(() =>
+      this.metrics?.increment('video_budget_denials_total', {
+        operation: 'generate',
+      }),
+    );
+  }
+
+  setActiveJobs(value: number): void {
+    this.metric(() =>
+      this.metrics?.set(
+        'video_generation_active_jobs',
+        { executor_mode: this.executorMode },
+        Math.max(0, value),
+      ),
+    );
+  }
+
+  setWsConnected(value: number): void {
+    this.metric(() =>
+      this.metrics?.set(
+        'video_comfy_ws_connected',
+        { executor_mode: this.executorMode },
+        Math.max(0, value),
+      ),
+    );
+  }
+
+  recordReconciliation(outcome: string): void {
+    this.metric(() =>
+      this.metrics?.increment('video_comfy_reconciliations_total', {
+        outcome,
+      }),
+    );
   }
 
   async createAttempt(
@@ -536,6 +627,7 @@ export class GenerationApplicationService {
         shotId,
         payload: { reason: 'attempt_limit', shotId },
       });
+      this.recordBudgetDenial();
       throw new GenerationApplicationError(
         'ATTEMPT_LIMIT_REACHED',
         'The shot has reached its maximum preview-attempt count.',
@@ -555,6 +647,7 @@ export class GenerationApplicationService {
           estimatedCostMicrousd: this.estimatedAttemptCostMicrousd,
         },
       });
+      this.recordBudgetDenial();
       throw new GenerationApplicationError(
         'BUDGET_EXCEEDED',
         'The project budget cannot cover another preview attempt.',
@@ -617,6 +710,7 @@ export class GenerationApplicationService {
         estimatedCostMicrousd: attempt.estimatedCostMicrousd,
       },
     });
+    this.recordAttemptStatus(attempt.status);
     if (sourceAttemptId) {
       await this.appendEvent(repositories, {
         type: 'attempt.regenerated',
@@ -675,6 +769,7 @@ export class GenerationApplicationService {
         shotId,
         payload: { reason: 'attempt_limit', shotId },
       });
+      this.recordBudgetDenial();
       throw new GenerationApplicationError(
         'ATTEMPT_LIMIT_REACHED',
         'The shot has reached its maximum preview-attempt count.',
@@ -694,6 +789,7 @@ export class GenerationApplicationService {
           estimatedCostMicrousd: this.estimatedAttemptCostMicrousd,
         },
       });
+      this.recordBudgetDenial();
       throw new GenerationApplicationError(
         'BUDGET_EXCEEDED',
         'The project budget cannot cover another preview attempt.',
@@ -772,6 +868,7 @@ export class GenerationApplicationService {
         estimatedCostMicrousd: attempt.estimatedCostMicrousd,
       },
     });
+    this.recordAttemptStatus(attempt.status);
     if (sourceAttemptId) {
       await this.appendEvent(repositories, {
         type: 'attempt.regenerated',
@@ -1138,6 +1235,11 @@ export class GenerationApplicationService {
           promptId,
         },
       });
+      this.metric(() =>
+        this.metrics?.increment('video_comfy_orphan_events_total', {
+          executor_mode: this.executorMode,
+        }),
+      );
       return true;
     });
   }
@@ -1168,9 +1270,14 @@ export class GenerationApplicationService {
       readonly shotId?: Uuid;
       readonly attemptId?: Uuid;
       readonly promptId?: string;
+      readonly traceId?: string;
       readonly payload: Readonly<Record<string, unknown>>;
     },
   ): Promise<void> {
+    const attemptTraceId = input.attemptId
+      ? (await repositories.attempts.findById(this.tenantId, input.attemptId))
+          ?.traceId
+      : undefined;
     const event = createDomainEvent({
       id: this.idGenerator.next(),
       type: input.type,
@@ -1182,9 +1289,20 @@ export class GenerationApplicationService {
       ...(input.shotId ? { shotId: input.shotId } : {}),
       ...(input.attemptId ? { attemptId: input.attemptId } : {}),
       ...(input.promptId ? { promptId: input.promptId } : {}),
+      ...(input.traceId
+        ? { traceId: input.traceId }
+        : attemptTraceId
+          ? { traceId: attemptTraceId }
+          : {}),
     });
     await repositories.events.append(event);
     await repositories.outbox.enqueue(event);
+  }
+
+  async currentAttempt(attemptId: Uuid): Promise<GenerationAttempt | null> {
+    return this.store.withTransaction((repositories) =>
+      repositories.attempts.findById(this.tenantId, attemptId),
+    );
   }
 }
 
@@ -1239,13 +1357,61 @@ export class GenerationWorker {
         repositories.attempts.claimNext(this.workerId, now, leaseExpiresAt),
     );
     if (!attempt) return false;
+    const claimSpan = this.service.startAttemptSpan('attempt.claim', attempt, {
+      executorMode: this.service.executorMode,
+      status: 'claimed',
+    });
+    const startedAt = Date.now();
+    const queuedAt = Date.parse(attempt.queuedAt);
+    if (Number.isFinite(queuedAt)) {
+      this.service.metric(() =>
+        this.service.metrics?.observe(
+          'video_generation_queue_wait_seconds',
+          { executor_mode: this.service.executorMode },
+          Math.max(0, (Date.now() - queuedAt) / 1_000),
+        ),
+      );
+    }
+    this.service.setActiveJobs(1);
     this.currentAttemptId = attempt.id;
-    this.currentWork = this.processAttempt(attempt).finally(() => {
+    this.currentWork = this.processAttempt(attempt, claimSpan).finally(() => {
       this.currentWork = undefined;
       this.currentAttemptId = undefined;
+      this.service.setActiveJobs(0);
     });
-    await this.currentWork;
-    return true;
+    try {
+      await this.currentWork;
+      claimSpan.setStatus('ok');
+      return true;
+    } catch (error) {
+      claimSpan.setStatus('error', error);
+      throw error;
+    } finally {
+      const finalAttempt = await this.currentAttempt(attempt.id);
+      const result =
+        finalAttempt?.status === 'awaiting_review' ||
+        finalAttempt?.status === 'accepted'
+          ? 'success'
+          : 'failure';
+      claimSpan.setAttributes({ result });
+      claimSpan.end();
+      this.service.metric(() =>
+        this.service.metrics?.observe(
+          'video_generation_duration_seconds',
+          { executor_mode: this.service.executorMode, result },
+          Math.max(0, (Date.now() - startedAt) / 1_000),
+        ),
+      );
+      if (finalAttempt?.finishedAt) {
+        this.service.metric(() =>
+          this.service.metrics?.increment(
+            'video_generation_compute_cost_usd',
+            { executor_mode: this.service.executorMode },
+            finalAttempt.estimatedCostMicrousd / 1_000_000,
+          ),
+        );
+      }
+    }
   }
 
   async run(intervalMilliseconds = 50): Promise<void> {
@@ -1275,7 +1441,17 @@ export class GenerationWorker {
     }
   }
 
-  private async processAttempt(claimed: GenerationAttempt): Promise<void> {
+  private async processAttempt(
+    claimed: GenerationAttempt,
+    parentSpan?: TelemetrySpanHandle,
+  ): Promise<void> {
+    const spanFor = (
+      name: string,
+      attributes: Readonly<Record<string, string | number | boolean>> = {},
+    ): TelemetrySpanHandle =>
+      parentSpan
+        ? this.service.telemetry.startSpan(name, attributes, parentSpan)
+        : this.service.startAttemptSpan(name, claimed, attributes);
     const heartbeat = setInterval(
       () => {
         void this.service.store.withTransaction(async (repositories) => {
@@ -1391,11 +1567,26 @@ export class GenerationWorker {
           : attempt;
       if (!submissionIntent) return;
       attempt = submissionIntent;
-      let history = attempt.comfyPromptId
-        ? await this.service.comfyClient.getHistory(attempt.comfyPromptId)
-        : await this.service.comfyClient.findHistoryByCorrelation(
-            attempt.correlationId,
-          );
+      const historySpan = spanFor('comfy.reconcile_history', {
+        executorMode: this.service.executorMode,
+      });
+      let history: Awaited<ReturnType<ComfyClient['getHistory']>>;
+      try {
+        history = attempt.comfyPromptId
+          ? await this.service.comfyClient.getHistory(attempt.comfyPromptId)
+          : await this.service.comfyClient.findHistoryByCorrelation(
+              attempt.correlationId,
+            );
+        const outcome = history ? 'history_found' : 'history_missing';
+        historySpan.setAttributes({ outcome });
+        this.service.recordReconciliation(outcome);
+        historySpan.setStatus('ok');
+      } catch (error) {
+        historySpan.setStatus('error', error);
+        throw error;
+      } finally {
+        historySpan.end();
+      }
       if (!history) {
         if (claimed.status !== 'claimed') {
           await this.failAttempt(
@@ -1412,6 +1603,11 @@ export class GenerationWorker {
         ) {
           return;
         }
+        const submitSpan = spanFor('comfy.submit', {
+          executorMode: this.service.executorMode,
+          status: 'started',
+        });
+        let submitSucceeded = false;
         try {
           const response = await this.service.comfyClient.submitPrompt({
             workflow: managedRevision
@@ -1441,6 +1637,7 @@ export class GenerationWorker {
             response.promptId,
           );
           attempt = await this.persistSubmitted(attempt, response.promptId);
+          submitSucceeded = true;
         } catch (error) {
           if (!(error instanceof ComfySubmissionUncertainError)) {
             await this.failAttempt(
@@ -1466,12 +1663,31 @@ export class GenerationWorker {
             return;
           }
           attempt = await this.persistSubmitted(attempt, history.promptId);
+          submitSucceeded = true;
+        } finally {
+          submitSpan.setAttributes({
+            result: submitSucceeded ? 'success' : 'failure',
+          });
+          submitSpan.setStatus(submitSucceeded ? 'ok' : 'error');
+          submitSpan.end();
         }
       } else if (!attempt.comfyPromptId) {
         attempt = await this.persistSubmitted(attempt, history.promptId);
       }
       if (this.stopping) return;
-      await this.reconcileOrObserve(attempt, history);
+      const observeSpan = spanFor('comfy.observe', {
+        executorMode: this.service.executorMode,
+        status: 'running',
+      });
+      try {
+        await this.reconcileOrObserve(attempt, history);
+        observeSpan.setStatus('ok');
+      } catch (error) {
+        observeSpan.setStatus('error', error);
+        throw error;
+      } finally {
+        observeSpan.end();
+      }
     } finally {
       clearInterval(heartbeat);
     }
@@ -1482,60 +1698,82 @@ export class GenerationWorker {
     attempt: GenerationAttempt,
   ): Promise<boolean> {
     if (!revision) return true;
+    const validationSpan = this.service.startAttemptSpan(
+      'workflow.revision.validate',
+      attempt,
+      {
+        executorMode: this.service.executorMode,
+        profileId: revision.profileId,
+      },
+    );
+    const startedAt = Date.now();
     let objectInfo: unknown;
     try {
-      objectInfo = await this.service.comfyClient.getObjectInfo();
-    } catch {
-      objectInfo = null;
-    }
-    const validation = validateMinimaxH3T2vaPreview({
-      editorGraph: revision.editorGraphJson,
-      apiGraph: revision.apiGraphJson,
-      profileId: revision.profileId,
-      profileVersion: revision.profileVersion,
-      objectInfo,
-      requireExecutor: true,
-    });
-    const fingerprintDrifted =
-      revision.executorFingerprint !== undefined &&
-      validation.executorFingerprint !== revision.executorFingerprint;
-    const errors = fingerprintDrifted
-      ? [
-          ...validation.errors,
+      try {
+        objectInfo = await this.service.comfyClient.getObjectInfo();
+      } catch {
+        objectInfo = null;
+      }
+      const validation = validateMinimaxH3T2vaPreview({
+        editorGraph: revision.editorGraphJson,
+        apiGraph: revision.apiGraphJson,
+        profileId: revision.profileId,
+        profileVersion: revision.profileVersion,
+        objectInfo,
+        requireExecutor: true,
+      });
+      const fingerprintDrifted =
+        revision.executorFingerprint !== undefined &&
+        validation.executorFingerprint !== revision.executorFingerprint;
+      const errors = fingerprintDrifted
+        ? [
+            ...validation.errors,
+            {
+              code: 'CAPABILITY_DRIFT' as const,
+              message:
+                'Executor capability fingerprint changed since the revision was validated.',
+            },
+          ]
+        : validation.errors;
+      await this.service.store.withTransaction(async (repositories) => {
+        await repositories.workflowRevisions.updateValidation(
+          this.service.tenantId,
+          revision.projectId,
+          revision.shotId,
+          revision.id,
           {
-            code: 'CAPABILITY_DRIFT' as const,
-            message:
-              'Executor capability fingerprint changed since the revision was validated.',
+            validationStatus: errors.length === 0 ? 'validated' : 'invalid',
+            validationErrorsJson: errors.map(({ code, message }) => ({
+              code,
+              message,
+            })),
+            validatedAt: toIsoUtc(this.service.clock.now()),
+            executorFingerprint: validation.executorFingerprint ?? null,
           },
-        ]
-      : validation.errors;
-    await this.service.store.withTransaction(async (repositories) => {
-      await repositories.workflowRevisions.updateValidation(
-        this.service.tenantId,
-        revision.projectId,
-        revision.shotId,
-        revision.id,
-        {
-          validationStatus: errors.length === 0 ? 'validated' : 'invalid',
-          validationErrorsJson: errors.map(({ code, message }) => ({
-            code,
-            message,
-          })),
-          validatedAt: toIsoUtc(this.service.clock.now()),
-          executorFingerprint: validation.executorFingerprint ?? null,
-        },
-      );
-    });
-    if (errors.length > 0) {
-      await this.failAttempt(
-        attempt.id,
-        'failed',
-        'CAPABILITY_DRIFT',
-        'Executor capabilities no longer satisfy the validated workflow revision.',
-      );
-      return false;
+        );
+      });
+      const result = errors.length === 0 ? 'success' : 'failure';
+      validationSpan.setAttributes({ result });
+      validationSpan.setStatus(errors.length === 0 ? 'ok' : 'error');
+      if (errors.length > 0) {
+        await this.failAttempt(
+          attempt.id,
+          'failed',
+          'CAPABILITY_DRIFT',
+          'Executor capabilities no longer satisfy the validated workflow revision.',
+        );
+        return false;
+      }
+      return true;
+    } catch (error) {
+      validationSpan.setStatus('error', error);
+      throw error;
+    } finally {
+      validationSpan.setAttributes({
+        durationMs: Math.max(0, Date.now() - startedAt),
+      });
+      validationSpan.end();
     }
-    return true;
   }
 
   private async reconcileOrObserve(
@@ -1573,6 +1811,7 @@ export class GenerationWorker {
     );
     const observer = new ComfyObserver();
     let output: ComfyOutputReference | undefined;
+    this.service.setWsConnected(1);
     try {
       for await (const message of this.service.comfyClient.events({
         ...(attempt.comfyPromptId ? { promptId: attempt.comfyPromptId } : {}),
@@ -1622,15 +1861,33 @@ export class GenerationWorker {
         throw error;
       }
     } finally {
+      this.service.setWsConnected(0);
       clearTimeout(timeout);
       if (this.activeAbortController === controller) {
         this.activeAbortController = undefined;
       }
     }
     for (let retry = 0; retry <= this.maxReconnects; retry += 1) {
-      const history = await this.service.comfyClient.getHistory(
-        attempt.comfyPromptId ?? '',
+      const historySpan = this.service.startAttemptSpan(
+        'comfy.reconcile_history',
+        attempt,
+        { executorMode: this.service.executorMode },
       );
+      let history: Awaited<ReturnType<ComfyClient['getHistory']>>;
+      try {
+        history = await this.service.comfyClient.getHistory(
+          attempt.comfyPromptId ?? '',
+        );
+        const outcome = history ? 'history_found' : 'history_missing';
+        historySpan.setAttributes({ outcome });
+        this.service.recordReconciliation(outcome);
+        historySpan.setStatus('ok');
+      } catch (error) {
+        historySpan.setStatus('error', error);
+        throw error;
+      } finally {
+        historySpan.end();
+      }
       if (history?.status === 'success') {
         await this.finishSuccess(attempt.id, output ?? history.outputs[0]);
         return;
@@ -1787,6 +2044,14 @@ export class GenerationWorker {
     let artifact: ArtifactRecord;
     let bytes: Uint8Array;
     let artifactCreated = false;
+    const artifactSpan = this.service.startAttemptSpan(
+      'artifact.ingest',
+      attempt,
+      {
+        executorMode: this.service.executorMode,
+      },
+    );
+    let artifactSucceeded = false;
     try {
       if (existingArtifact) {
         artifact = existingArtifact;
@@ -1821,7 +2086,9 @@ export class GenerationWorker {
         };
         artifactCreated = true;
       }
+      artifactSucceeded = true;
     } catch (error) {
+      artifactSpan.setStatus('error', error);
       await this.failAttempt(
         attemptId,
         'failed',
@@ -1829,24 +2096,72 @@ export class GenerationWorker {
         error instanceof Error ? error.message : 'Artifact storage failed.',
       );
       return;
+    } finally {
+      artifactSpan.setAttributes({
+        result: artifactSucceeded ? 'success' : 'failure',
+      });
+      if (artifactSucceeded) artifactSpan.setStatus('ok');
+      artifactSpan.end();
     }
-    const evaluation = existingEvaluation
-      ? {
-          evaluatorVersion: existingEvaluation.evaluatorVersion,
-          status: existingEvaluation.status,
-          checks: existingEvaluation.checks,
-          details: existingEvaluation.details,
-          ...(existingEvaluation.status === 'failed'
-            ? { failureCode: evaluationFailureCode(existingEvaluation) }
-            : {}),
-        }
-      : await this.service.evaluator.evaluate({
-          bytes,
-          artifact,
-          expectedWidth: PREVIEW_WIDTH,
-          expectedHeight: PREVIEW_HEIGHT,
-          expectedDurationSeconds: this.service.previewDurationSeconds,
-        });
+    const evaluationSpan = this.service.startAttemptSpan(
+      'evaluation.run',
+      attempt,
+      {
+        executorMode: this.service.executorMode,
+      },
+    );
+    let evaluation: Awaited<ReturnType<MediaEvaluator['evaluate']>>;
+    try {
+      evaluation = existingEvaluation
+        ? {
+            evaluatorVersion: existingEvaluation.evaluatorVersion,
+            status: existingEvaluation.status,
+            checks: existingEvaluation.checks,
+            details: existingEvaluation.details,
+            ...(existingEvaluation.status === 'failed'
+              ? { failureCode: evaluationFailureCode(existingEvaluation) }
+              : {}),
+          }
+        : await this.service.evaluator.evaluate({
+            bytes,
+            artifact,
+            expectedWidth: PREVIEW_WIDTH,
+            expectedHeight: PREVIEW_HEIGHT,
+            expectedDurationSeconds: this.service.previewDurationSeconds,
+          });
+      evaluationSpan.setAttributes({
+        result: evaluation.status === 'passed' ? 'passed' : 'failed',
+      });
+      evaluationSpan.setStatus(evaluation.status === 'passed' ? 'ok' : 'error');
+    } catch (error) {
+      evaluationSpan.setStatus('error', error);
+      throw error;
+    } finally {
+      evaluationSpan.end();
+    }
+    for (const [check, result] of Object.entries(evaluation.checks)) {
+      if (result.status !== 'failed') continue;
+      const allowedCheck = [
+        'file_readable',
+        'checksum',
+        'byte_size',
+        'container',
+        'video_stream',
+        'dimensions',
+        'duration',
+        'frame_rate',
+        'decoder',
+        'motion',
+        'audio',
+      ].includes(check)
+        ? check
+        : 'decoder';
+      this.service.metric(() =>
+        this.service.metrics?.increment('video_evaluation_failures_total', {
+          check: allowedCheck,
+        }),
+      );
+    }
     await this.service.store.withTransaction(async (repositories) => {
       const current = await repositories.attempts.findById(
         this.service.tenantId,
@@ -2009,6 +2324,9 @@ export class GenerationWorker {
         });
       }
     });
+    this.service.recordAttemptStatus(
+      evaluation.status === 'passed' ? 'awaiting_review' : 'failed',
+    );
   }
 
   private async failAttempt(
@@ -2095,11 +2413,10 @@ export class GenerationWorker {
         },
       });
     });
+    this.service.recordAttemptStatus(status);
   }
 
-  private async currentAttempt(
-    attemptId: Uuid,
-  ): Promise<GenerationAttempt | null> {
+  async currentAttempt(attemptId: Uuid): Promise<GenerationAttempt | null> {
     return this.service.store.withTransaction((repositories) =>
       repositories.attempts.findById(this.service.tenantId, attemptId),
     );

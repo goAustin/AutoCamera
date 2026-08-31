@@ -37,6 +37,7 @@ export interface PlanProjectInput {
   readonly projectId: Uuid;
   readonly tenantId: Uuid;
   readonly project: VideoProject;
+  readonly traceId?: string;
 }
 
 export interface PlanningShot {
@@ -224,6 +225,7 @@ export interface CreateProjectCommand {
   readonly brief: string;
   readonly targetDurationSeconds: number;
   readonly budgetMicrousd: MicroUsd;
+  readonly traceId?: string;
 }
 
 export interface ProjectPlanResult {
@@ -300,6 +302,7 @@ export class ProjectApplicationService {
     await this.appendEvent(repositories, {
       type: 'project.created',
       projectId: project.id,
+      ...(command.traceId ? { traceId: command.traceId } : {}),
       payload: { status: project.status },
     });
     return project;
@@ -308,16 +311,27 @@ export class ProjectApplicationService {
   async planProject(
     projectId: Uuid,
     signal?: AbortSignal,
+    traceId?: string,
   ): Promise<ProjectPlanResult> {
     const project = await this.store.withTransaction((repositories) =>
       this.requirePlanningProject(repositories, projectId),
     );
     const result = await this.planner.planProject(
-      { projectId, tenantId: this.tenantId, project },
+      {
+        projectId,
+        tenantId: this.tenantId,
+        project,
+        ...(traceId ? { traceId } : {}),
+      },
       signal,
     );
     return this.store.withTransaction((repositories) =>
-      this.persistPlanProjectInTransaction(repositories, projectId, result),
+      this.persistPlanProjectInTransaction(
+        repositories,
+        projectId,
+        result,
+        traceId,
+      ),
     );
   }
 
@@ -325,16 +339,23 @@ export class ProjectApplicationService {
     repositories: Repositories,
     projectId: Uuid,
     signal?: AbortSignal,
+    traceId?: string,
   ): Promise<ProjectPlanResult> {
     const project = await this.requirePlanningProject(repositories, projectId);
     const result = await this.planner.planProject(
-      { projectId, tenantId: this.tenantId, project },
+      {
+        projectId,
+        tenantId: this.tenantId,
+        project,
+        ...(traceId ? { traceId } : {}),
+      },
       signal,
     );
     return this.persistPlanProjectInTransaction(
       repositories,
       projectId,
       result,
+      traceId,
     );
   }
 
@@ -342,6 +363,7 @@ export class ProjectApplicationService {
     repositories: Repositories,
     projectId: Uuid,
     result: PlanProjectResult,
+    traceId?: string,
   ): Promise<ProjectPlanResult> {
     const project = await this.requirePlanningProject(repositories, projectId);
     if (result.storyboard.projectId !== projectId) {
@@ -390,6 +412,7 @@ export class ProjectApplicationService {
       await this.appendEvent(repositories, {
         type: 'project.planning_started',
         projectId,
+        ...(traceId ? { traceId } : {}),
         payload: { previousStatus: workingProject.status },
       });
       workingProject = planningProject;
@@ -405,6 +428,7 @@ export class ProjectApplicationService {
       await this.appendEvent(repositories, {
         type: 'storyboard.superseded',
         projectId,
+        ...(traceId ? { traceId } : {}),
         payload: { revision: latestProposal.revision },
       });
     }
@@ -460,6 +484,7 @@ export class ProjectApplicationService {
     await this.appendEvent(repositories, {
       type: 'storyboard.proposed',
       projectId,
+      ...(traceId ? { traceId } : {}),
       payload: {
         revision: proposal.revision,
         shotCount: proposal.shots.length,
@@ -469,6 +494,7 @@ export class ProjectApplicationService {
     await this.appendEvent(repositories, {
       type: 'project.planned',
       projectId,
+      ...(traceId ? { traceId } : {}),
       payload: { status: awaitingApproval.status, revision: proposal.revision },
     });
     return {
@@ -481,9 +507,15 @@ export class ProjectApplicationService {
   async approveStoryboard(
     projectId: Uuid,
     proposalId?: Uuid,
+    traceId?: string,
   ): Promise<ApprovalResult> {
     return this.store.withTransaction((repositories) =>
-      this.approveStoryboardInTransaction(repositories, projectId, proposalId),
+      this.approveStoryboardInTransaction(
+        repositories,
+        projectId,
+        proposalId,
+        traceId,
+      ),
     );
   }
 
@@ -491,6 +523,7 @@ export class ProjectApplicationService {
     repositories: Repositories,
     projectId: Uuid,
     proposalId?: Uuid,
+    traceId?: string,
   ): Promise<ApprovalResult> {
     const project = await this.requireProject(repositories, projectId);
     if (project.status !== 'awaiting_storyboard_approval') {
@@ -561,6 +594,7 @@ export class ProjectApplicationService {
     await this.appendEvent(repositories, {
       type: 'storyboard.approved',
       projectId,
+      ...(traceId ? { traceId } : {}),
       payload: { revision: proposal.revision, shotCount: shots.length },
     });
     for (const shot of shots) {
@@ -568,12 +602,14 @@ export class ProjectApplicationService {
         type: 'shot.created',
         projectId,
         shotId: shot.id,
+        ...(traceId ? { traceId } : {}),
         payload: { ordinal: shot.ordinal, status: shot.status },
       });
     }
     await this.appendEvent(repositories, {
       type: 'project.ready_for_generation',
       projectId,
+      ...(traceId ? { traceId } : {}),
       payload: { status: readyProject.status },
     });
     return { project: readyProject, shots };
@@ -671,6 +707,7 @@ export class ProjectApplicationService {
       readonly type: DomainEventType;
       readonly projectId: Uuid;
       readonly shotId?: Uuid;
+      readonly traceId?: string;
       readonly payload: Readonly<Record<string, unknown>>;
     },
   ): Promise<void> {
@@ -683,6 +720,7 @@ export class ProjectApplicationService {
       payload: input.payload,
       clock: this.clock,
       ...(input.shotId ? { shotId: input.shotId } : {}),
+      ...(input.traceId ? { traceId: input.traceId } : {}),
     });
     await repositories.events.append(event);
     await repositories.outbox.enqueue(event);

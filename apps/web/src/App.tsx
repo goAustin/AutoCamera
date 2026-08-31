@@ -1004,6 +1004,7 @@ function ProjectStudioPage({
       )}
       {selectedShot && (
         <ShotWorkspace
+          key={selectedShot.id}
           token={token}
           projectId={validProjectId}
           shot={selectedShot}
@@ -1574,9 +1575,17 @@ function AttemptCard({
   const detailQuery = useQuery({
     queryKey: ['attempt', attempt.id],
     queryFn: () => getAttemptDetail(token, attempt.id),
-    refetchInterval: ACTIVE_ATTEMPT_STATUSES.has(attempt.status)
-      ? 2_000
-      : false,
+    refetchInterval: (query) => {
+      const detailStatus = query.state.data?.attempt.status;
+      const waitingForEvaluation =
+        attempt.status === 'awaiting_review' &&
+        query.state.data?.evaluation === undefined;
+      return ACTIVE_ATTEMPT_STATUSES.has(attempt.status) ||
+        ACTIVE_ATTEMPT_STATUSES.has(detailStatus ?? '') ||
+        waitingForEvaluation
+        ? 2_000
+        : false;
+    },
   });
   const detail = detailQuery.data ?? { attempt };
   const reviewMutation = useMutation({
@@ -2039,6 +2048,7 @@ function ShotWorkspace({
   const editorReady = executor?.readiness.ready === true;
   const canGenerate =
     editorReady &&
+    selectedRevision?.validationStatus !== 'invalid' &&
     (Boolean(currentGraphs()) ||
       Boolean(selectedRevision?.validationStatus === 'validated')) &&
     ['approved_for_generation', 'rejected', 'retryable'].includes(shot.status);

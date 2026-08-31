@@ -2,9 +2,13 @@ import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
-export interface ComfyObjectInfoResponse {
-  readonly nodes: Readonly<Record<string, unknown>>;
-}
+const DEFAULT_MAX_JSON_RESPONSE_BYTES = 8 * 1024 * 1024;
+const DEFAULT_MAX_OUTPUT_BYTES = 512 * 1024 * 1024;
+const DEFAULT_HISTORY_LIMIT = 100;
+
+export type ComfyObjectInfoResponse = Readonly<Record<string, unknown>>;
+
+export type ComfySystemStatsResponse = Readonly<Record<string, unknown>>;
 
 export interface ComfyHealthResponse {
   readonly service: 'fake-comfy';
@@ -24,6 +28,15 @@ export interface ComfyCapabilities {
   readonly supportsWebSocket: boolean;
   readonly supportsCancellation: boolean;
   readonly preservesExtraData: boolean;
+  readonly capabilityFingerprint: string;
+}
+
+export interface ComfyReadiness {
+  readonly ready: boolean;
+  readonly checkedAt: string;
+  readonly apiVersion?: string;
+  readonly capabilityFingerprint?: string;
+  readonly errorCode?: ComfyErrorCode;
 }
 
 export interface ComfyWorkflowValidation {
@@ -41,6 +54,8 @@ export interface ComfySubmitRequest {
 
 export interface ComfySubmitResponse {
   readonly promptId: string;
+  readonly queueNumber?: number;
+  readonly nodeErrors?: Readonly<Record<string, unknown>>;
 }
 
 export interface ComfyQueueResponse {
@@ -53,6 +68,7 @@ export interface ComfyOutputReference {
   readonly subfolder: string;
   readonly type: string;
   readonly mimeType: string;
+  readonly format?: string;
 }
 
 export interface ComfyHistoryRecord {
@@ -61,12 +77,16 @@ export interface ComfyHistoryRecord {
   readonly completed: boolean;
   readonly extraData: Readonly<Record<string, unknown>>;
   readonly outputs: readonly ComfyOutputReference[];
+  readonly workflow?: Readonly<Record<string, unknown>>;
   readonly errorCode?: string;
   readonly errorMessage?: string;
 }
 
 export type ComfyMessageType =
+  | 'status'
+  | 'feature_flags'
   | 'execution_start'
+  | 'execution_cached'
   | 'executing'
   | 'progress'
   | 'executed'
@@ -85,6 +105,7 @@ export interface ComfyEventStreamOptions {
 }
 
 export interface ComfyClient {
+  checkReady(): Promise<ComfyReadiness>;
   getCapabilities(): Promise<ComfyCapabilities>;
   getObjectInfo(): Promise<ComfyObjectInfoResponse>;
   validateWorkflow(
@@ -101,24 +122,130 @@ export interface ComfyClient {
   downloadOutput(output: ComfyOutputReference): Promise<Uint8Array>;
 }
 
-export const EMPTY_OBJECT_INFO: ComfyObjectInfoResponse = { nodes: {} };
+export const EMPTY_OBJECT_INFO: ComfyObjectInfoResponse = {};
 
-export class ComfySubmissionUncertainError extends Error {
-  constructor(message = 'ComfyUI submission outcome is uncertain.') {
+export type ComfyErrorCode =
+  | 'COMFY_CONFIGURATION_INVALID'
+  | 'COMFY_REQUEST_TIMEOUT'
+  | 'COMFY_NETWORK_ERROR'
+  | 'COMFY_HTTP_ERROR'
+  | 'COMFY_PROTOCOL_ERROR'
+  | 'COMFY_PROMPT_REJECTED'
+  | 'COMFY_SUBMISSION_UNCERTAIN'
+  | 'COMFY_STREAM_DISCONNECTED'
+  | 'COMFY_OUTPUT_INVALID'
+  | 'COMFY_OUTPUT_TOO_LARGE'
+  | 'COMFY_UNAVAILABLE';
+
+export class ComfyClientError extends Error {
+  readonly code: ComfyErrorCode;
+  readonly status?: number;
+  readonly retryable: boolean;
+
+  constructor(
+    code: ComfyErrorCode,
+    message: string,
+    options: { readonly status?: number; readonly retryable?: boolean } = {},
+  ) {
     super(message);
+    this.name = 'ComfyClientError';
+    this.code = code;
+    this.retryable = options.retryable ?? false;
+    if (options.status !== undefined) this.status = options.status;
+  }
+}
+
+export class ComfySubmissionUncertainError extends ComfyClientError {
+  constructor(message = 'ComfyUI submission outcome is uncertain.') {
+    super('COMFY_SUBMISSION_UNCERTAIN', message, { retryable: true });
     this.name = 'ComfySubmissionUncertainError';
   }
 }
 
-export class ComfyStreamDisconnectedError extends Error {
+export class ComfyStreamDisconnectedError extends ComfyClientError {
   constructor(message = 'The ComfyUI event stream disconnected.') {
-    super(message);
+    super('COMFY_STREAM_DISCONNECTED', message, { retryable: true });
     this.name = 'ComfyStreamDisconnectedError';
   }
 }
 
+export class ComfyRequestTimeoutError extends ComfyClientError {
+  constructor(message = 'ComfyUI request exceeded its deadline.') {
+    super('COMFY_REQUEST_TIMEOUT', message, { retryable: true });
+    this.name = 'ComfyRequestTimeoutError';
+  }
+}
+
+export class ComfyPromptRejectedError extends ComfyClientError {
+  constructor(message = 'ComfyUI rejected the prompt.') {
+    super('COMFY_PROMPT_REJECTED', message, { retryable: false });
+    this.name = 'ComfyPromptRejectedError';
+  }
+}
+
+export function objectInfoClasses(
+  value: unknown,
+): Readonly<Record<string, unknown>> {
+  if (!isRecord(value)) return {};
+  if (isRecord(value.nodes)) return value.nodes;
+  return value;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function normalizeForFingerprint(value: unknown, depth = 0): unknown {
+  if (depth > 12) return '[truncated]';
+  if (
+    value === null ||
+    typeof value === 'boolean' ||
+    typeof value === 'string'
+  ) {
+    return value;
+  }
+  if (typeof value === 'number') {
+    return Number.isFinite(value) ? value : null;
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => normalizeForFingerprint(item, depth + 1));
+  }
+  if (!isRecord(value)) return null;
+  return Object.fromEntries(
+    Object.keys(value)
+      .sort()
+      .map((key) => [key, normalizeForFingerprint(value[key], depth + 1)]),
+  );
+}
+
+export function normalizeComfyObjectInfo(
+  value: unknown,
+): Readonly<Record<string, unknown>> {
+  const classes = objectInfoClasses(value);
+  return Object.fromEntries(
+    Object.entries(classes)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([classType, definition]) => [
+        classType,
+        normalizeForFingerprint(definition),
+      ]),
+  );
+}
+
+export function computeComfyCapabilityFingerprint(value: unknown): string {
+  return createHash('sha256')
+    .update(JSON.stringify(normalizeComfyObjectInfo(value)), 'utf8')
+    .digest('hex');
+}
+
+// Keep the shorter names convenient for callers that only need a fingerprint.
+export const comfyCapabilityFingerprint = computeComfyCapabilityFingerprint;
+export const capabilityFingerprint = computeComfyCapabilityFingerprint;
+
 interface FakeJob {
   readonly promptId: string;
+  readonly queueNumber: number;
+  readonly workflow: Readonly<Record<string, unknown>>;
   readonly extraData: Readonly<Record<string, unknown>>;
   readonly scenario: ComfyScenario;
   readonly output: ComfyOutputReference;
@@ -228,9 +355,10 @@ export function createDeterministicFixtureBytes(seed: number): Uint8Array {
 
 function loadGeneratedFixtureBytes(seed: number): Uint8Array {
   try {
-    const bytes = readFileSync(
-      resolve(process.cwd(), '.data/fixtures/h3-t2v-fixture.mp4'),
-    );
+    const fixturePath = process.env.H3_MEDIA_FIXTURE_PATH
+      ? resolve(process.env.H3_MEDIA_FIXTURE_PATH)
+      : resolve(process.cwd(), '.data/fixtures/h3-t2v-fixture.mp4');
+    const bytes = readFileSync(fixturePath);
     if (bytes.byteLength > 0) return new Uint8Array(bytes);
   } catch {
     // The checked-in source tree intentionally does not contain generated media.
@@ -239,32 +367,83 @@ function loadGeneratedFixtureBytes(seed: number): Uint8Array {
 }
 
 export class DeterministicFakeComfyService {
-  readonly capabilities: ComfyCapabilities = {
-    apiVersion: '0.0.1-fake',
-    supportsWebSocket: true,
-    supportsCancellation: true,
-    preservesExtraData: true,
-  };
+  readonly capabilities: ComfyCapabilities;
   private readonly jobs = new Map<string, FakeJob>();
   private readonly listeners = new Set<EventListener>();
   private uncertainSubmissionSeen = new Set<string>();
   private readonly submissionCounts = new Map<string, number>();
   private readonly outputBytes: (seed: number) => Uint8Array;
+  private nextQueueNumber = 0;
 
   constructor(
     options: { readonly outputBytes?: (seed: number) => Uint8Array } = {},
   ) {
     this.outputBytes = options.outputBytes ?? loadGeneratedFixtureBytes;
+    this.capabilities = {
+      apiVersion: '0.0.1-fake',
+      supportsWebSocket: true,
+      supportsCancellation: true,
+      preservesExtraData: true,
+      capabilityFingerprint: computeComfyCapabilityFingerprint(
+        this.getObjectInfo(),
+      ),
+    };
   }
 
   getObjectInfo(): ComfyObjectInfoResponse {
     return {
-      nodes: {
-        CLIPTextEncode: {},
-        EmptyHunyuanLatentVideo: {},
-        KSampler: {},
-        SaveVideo: {},
+      UNETLoader: {
+        input: {
+          required: {
+            unet_name: [['minimax_h3_fl2va_pruned_int8_convrot.safetensors']],
+          },
+        },
       },
+      CLIPLoader: {
+        input: {
+          required: {
+            clip_name: [['qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors']],
+          },
+        },
+      },
+      VAELoader: {
+        input: {
+          required: {
+            vae_name: [
+              [
+                'minimax_h3_video_vae_fp16.safetensors',
+                'minimax_h3_audio_vae_fp32.safetensors',
+              ],
+            ],
+          },
+        },
+      },
+      MiniMaxH3ImageToVideo: {},
+      RandomNoise: {},
+      BasicScheduler: {},
+      KSamplerSelect: {},
+      BasicGuider: {},
+      SamplerCustomAdvanced: {},
+      VAEDecode: {},
+      VAEDecodeAudio: {},
+      CreateVideo: {},
+      SaveVideo: {},
+      // Retained for the Phase 3 compatibility client/tests.
+      CLIPTextEncode: {},
+      EmptyHunyuanLatentVideo: {},
+      KSampler: {},
+    };
+  }
+
+  getSystemStats(): ComfySystemStatsResponse {
+    return {
+      system: {
+        os: 'fake',
+        comfyui_version: this.capabilities.apiVersion,
+        python_version: '3.12.0-fake',
+        embedded_python: false,
+      },
+      devices: [],
     };
   }
 
@@ -287,7 +466,7 @@ export class DeterministicFakeComfyService {
         this.uncertainSubmissionSeen.add(correlationId);
         throw new ComfySubmissionUncertainError();
       }
-      return { promptId: existing.promptId };
+      return { promptId: existing.promptId, queueNumber: existing.queueNumber };
     }
     const promptId = `fake-${createHash('sha256')
       .update(`${correlationId}:${seed}:${canonicalize(request.workflow)}`)
@@ -301,6 +480,8 @@ export class DeterministicFakeComfyService {
     };
     const job: FakeJob = {
       promptId,
+      queueNumber: this.nextQueueNumber++,
+      workflow: { ...request.workflow },
       extraData: { ...request.extraData },
       scenario,
       output,
@@ -318,7 +499,7 @@ export class DeterministicFakeComfyService {
       throw new ComfySubmissionUncertainError();
     }
     this.schedule(job);
-    return { promptId };
+    return { promptId, queueNumber: job.queueNumber };
   }
 
   private schedule(job: FakeJob): void {
@@ -414,6 +595,29 @@ export class DeterministicFakeComfyService {
     };
   }
 
+  queueProtocol(): Readonly<{
+    readonly queue_pending: readonly (readonly unknown[])[];
+    readonly queue_running: readonly (readonly unknown[])[];
+  }> {
+    const entries = (status: 'pending' | 'running') =>
+      [...this.jobs.values()]
+        .filter((job) => job.status === status)
+        .map(
+          (job) =>
+            [
+              job.queueNumber,
+              job.promptId,
+              job.workflow,
+              job.extraData,
+              [],
+            ] as const,
+        );
+    return {
+      queue_pending: entries('pending'),
+      queue_running: entries('running'),
+    };
+  }
+
   history(promptId: string): ComfyHistoryRecord | null {
     const job = this.jobs.get(promptId);
     if (!job) return null;
@@ -423,6 +627,7 @@ export class DeterministicFakeComfyService {
       completed: job.completed,
       extraData: { ...job.extraData },
       outputs: job.completed && job.status === 'success' ? [job.output] : [],
+      workflow: { ...job.workflow },
       ...(job.errorCode ? { errorCode: job.errorCode } : {}),
       ...(job.errorMessage ? { errorMessage: job.errorMessage } : {}),
     };
@@ -562,6 +767,15 @@ export class FakeComfyClient implements ComfyClient {
     this.service = service;
   }
 
+  async checkReady(): Promise<ComfyReadiness> {
+    return {
+      ready: true,
+      checkedAt: new Date().toISOString(),
+      apiVersion: this.service.capabilities.apiVersion,
+      capabilityFingerprint: this.service.capabilities.capabilityFingerprint,
+    };
+  }
+
   async getCapabilities(): Promise<ComfyCapabilities> {
     return this.service.capabilities;
   }
@@ -573,7 +787,9 @@ export class FakeComfyClient implements ComfyClient {
   async validateWorkflow(
     workflow: Readonly<Record<string, unknown>>,
   ): Promise<ComfyWorkflowValidation> {
-    const available = new Set(Object.keys(this.service.getObjectInfo().nodes));
+    const available = new Set(
+      Object.keys(objectInfoClasses(this.service.getObjectInfo())),
+    );
     const missingClasses = Object.values(workflow)
       .map((node) =>
         typeof node === 'object' && node !== null && 'class_type' in node
@@ -619,7 +835,7 @@ export class FakeComfyClient implements ComfyClient {
   }
 }
 
-interface WebSocketLike {
+export interface ComfyWebSocketLike {
   onopen: (() => void) | null;
   onmessage: ((event: { readonly data: unknown }) => void) | null;
   onerror: (() => void) | null;
@@ -628,127 +844,546 @@ interface WebSocketLike {
   send(data: string): void;
 }
 
-interface WebSocketConstructor {
-  new (url: string): WebSocketLike;
+export interface ComfyWebSocketConstructor {
+  new (url: string): ComfyWebSocketLike;
 }
+
+export interface ComfyWebSocketFactoryOptions {
+  readonly headers: Readonly<Record<string, string>>;
+}
+
+/**
+ * A Node-side gateway adapter may use these headers for the WebSocket
+ * upgrade. The standard browser/Node WebSocket constructor cannot set
+ * arbitrary headers, so the default transport deliberately never places the
+ * bearer token in the URL. A production gateway must authenticate the
+ * upgrade using this factory, mTLS, or an equivalent worker-only identity.
+ */
+export type ComfyWebSocketFactory = (
+  url: string,
+  options: ComfyWebSocketFactoryOptions,
+) => ComfyWebSocketLike;
 
 export interface HttpWsComfyClientOptions {
   readonly baseUrl: string;
   readonly wsUrl: string;
   readonly clientId: string;
+  readonly authToken?: string;
+  readonly requestTimeoutMs?: number;
+  readonly maxJsonResponseBytes?: number;
+  readonly maxOutputBytes?: number;
+  readonly historyLimit?: number;
   readonly fetchImpl?: typeof fetch;
-  readonly webSocket?: WebSocketConstructor;
+  readonly webSocket?: ComfyWebSocketConstructor;
+  readonly webSocketFactory?: ComfyWebSocketFactory;
+}
+
+export function normalizeComfyQueueResponse(
+  value: unknown,
+): ComfyQueueResponse {
+  const record = isRecord(value) ? value : {};
+  return {
+    queuePending: queuePromptIds(record.queue_pending ?? record.queuePending),
+    queueRunning: queuePromptIds(record.queue_running ?? record.queueRunning),
+  };
+}
+
+function queuePromptIds(value: unknown): readonly string[] {
+  if (!Array.isArray(value)) return [];
+  const promptIds: string[] = [];
+  for (const item of value) {
+    const promptId =
+      typeof item === 'string'
+        ? item
+        : Array.isArray(item) && typeof item[1] === 'string'
+          ? item[1]
+          : isRecord(item) && typeof item.prompt_id === 'string'
+            ? item.prompt_id
+            : isRecord(item) && typeof item.promptId === 'string'
+              ? item.promptId
+              : undefined;
+    if (promptId && !promptIds.includes(promptId)) promptIds.push(promptId);
+  }
+  return promptIds;
+}
+
+function outputMimeType(filename: string, format: string | undefined): string {
+  const hint = `${format ?? ''} ${filename}`.toLowerCase();
+  if (hint.includes('webm')) return 'video/webm';
+  if (hint.includes('gif')) return 'image/gif';
+  if (hint.includes('mov')) return 'video/quicktime';
+  return 'video/mp4';
+}
+
+function collectOutputReferences(
+  value: unknown,
+  output: ComfyOutputReference[],
+  depth = 0,
+): void {
+  if (depth > 8) return;
+  if (Array.isArray(value)) {
+    for (const item of value) collectOutputReferences(item, output, depth + 1);
+    return;
+  }
+  if (!isRecord(value)) return;
+  if (typeof value.filename === 'string' && value.filename.length > 0) {
+    const format =
+      typeof value.format === 'string'
+        ? value.format
+        : typeof value.output_format === 'string'
+          ? value.output_format
+          : undefined;
+    output.push({
+      filename: value.filename,
+      subfolder: typeof value.subfolder === 'string' ? value.subfolder : '',
+      type: typeof value.type === 'string' ? value.type : 'output',
+      mimeType:
+        typeof value.mimeType === 'string'
+          ? value.mimeType
+          : typeof value.mime_type === 'string'
+            ? value.mime_type
+            : outputMimeType(value.filename, format),
+      ...(format ? { format } : {}),
+    });
+    return;
+  }
+  for (const child of Object.values(value)) {
+    collectOutputReferences(child, output, depth + 1);
+  }
+}
+
+function historyExtraData(
+  record: Readonly<Record<string, unknown>>,
+): Readonly<Record<string, unknown>> {
+  const direct = record.extra_data ?? record.extraData;
+  if (isRecord(direct)) return direct;
+  if (Array.isArray(record.prompt)) {
+    // Official history stores [number, prompt_id, prompt, extra_data, ...].
+    for (const index of [3, 1]) {
+      const candidate = record.prompt[index];
+      if (isRecord(candidate)) return candidate;
+    }
+  }
+  return {};
+}
+
+function historyWorkflow(
+  record: Readonly<Record<string, unknown>>,
+): Readonly<Record<string, unknown>> | undefined {
+  if (isRecord(record.workflow)) return record.workflow;
+  if (Array.isArray(record.prompt) && isRecord(record.prompt[2])) {
+    return record.prompt[2];
+  }
+  return undefined;
+}
+
+function normalizeHistoryRecord(
+  promptId: string,
+  value: unknown,
+): ComfyHistoryRecord {
+  if (!isRecord(value)) {
+    throw new ComfyClientError(
+      'COMFY_PROTOCOL_ERROR',
+      'ComfyUI history response had an invalid record.',
+    );
+  }
+  const statusRecord = isRecord(value.status) ? value.status : {};
+  const statusValue = String(
+    typeof value.status === 'string'
+      ? value.status
+      : (statusRecord.status_str ?? value.status_str ?? 'pending'),
+  ).toLowerCase();
+  const outputs: ComfyOutputReference[] = [];
+  collectOutputReferences(value.outputs, outputs);
+  const status: ComfyHistoryRecord['status'] =
+    statusValue === 'success'
+      ? 'success'
+      : statusValue === 'error' || statusValue === 'failed'
+        ? 'error'
+        : statusValue === 'interrupted'
+          ? 'interrupted'
+          : statusValue === 'running' || statusValue === 'executing'
+            ? 'running'
+            : statusRecord.completed === true
+              ? outputs.length > 0
+                ? 'success'
+                : 'error'
+              : 'pending';
+  const completed =
+    typeof statusRecord.completed === 'boolean'
+      ? statusRecord.completed
+      : typeof value.completed === 'boolean'
+        ? value.completed
+        : status === 'success' ||
+          status === 'error' ||
+          status === 'interrupted';
+  const errorCode =
+    typeof value.exception_type === 'string'
+      ? value.exception_type
+      : typeof value.error_code === 'string'
+        ? value.error_code
+        : undefined;
+  const errorMessage =
+    typeof value.exception_message === 'string'
+      ? value.exception_message
+      : typeof value.error_message === 'string'
+        ? value.error_message
+        : undefined;
+  const workflow = historyWorkflow(value);
+  return {
+    promptId,
+    status,
+    completed,
+    extraData: historyExtraData(value),
+    outputs,
+    ...(workflow ? { workflow } : {}),
+    ...(errorCode ? { errorCode } : {}),
+    ...(errorMessage ? { errorMessage } : {}),
+  };
+}
+
+function isHistoryRecord(value: unknown): value is Record<string, unknown> {
+  return (
+    isRecord(value) &&
+    (Object.hasOwn(value, 'status') || Object.hasOwn(value, 'outputs'))
+  );
+}
+
+function isTerminalMessage(message: ComfyMessage): boolean {
+  return (
+    message.type === 'execution_success' ||
+    message.type === 'execution_error' ||
+    message.type === 'execution_interrupted'
+  );
+}
+
+function parseComfyMessage(value: unknown): ComfyMessage | undefined {
+  if (
+    !isRecord(value) ||
+    typeof value.type !== 'string' ||
+    !isRecord(value.data)
+  ) {
+    return undefined;
+  }
+  const supported: ReadonlySet<string> = new Set([
+    'status',
+    'feature_flags',
+    'execution_start',
+    'execution_cached',
+    'executing',
+    'progress',
+    'executed',
+    'execution_success',
+    'execution_error',
+    'execution_interrupted',
+  ]);
+  if (!supported.has(value.type)) return undefined;
+  return { type: value.type as ComfyMessageType, data: value.data };
 }
 
 export class HttpWsComfyClient implements ComfyClient {
   private readonly baseUrl: string;
   private readonly wsUrl: string;
   private readonly clientId: string;
+  private readonly authToken?: string;
+  private readonly requestTimeoutMs: number;
+  private readonly maxJsonResponseBytes: number;
+  private readonly maxOutputBytes: number;
+  private readonly historyLimit: number;
   private readonly fetchImpl: typeof fetch;
-  private readonly webSocket: WebSocketConstructor;
+  private readonly webSocket?: ComfyWebSocketConstructor;
+  private readonly webSocketFactory?: ComfyWebSocketFactory;
 
   constructor(options: HttpWsComfyClientOptions) {
-    this.baseUrl = options.baseUrl.replace(/\/$/, '');
-    this.wsUrl = options.wsUrl;
+    const baseUrl = new URL(options.baseUrl);
+    const wsUrl = new URL(options.wsUrl);
+    if (!['http:', 'https:'].includes(baseUrl.protocol)) {
+      throw new ComfyClientError(
+        'COMFY_CONFIGURATION_INVALID',
+        'ComfyUI base URL must use HTTP or HTTPS.',
+      );
+    }
+    if (!['ws:', 'wss:'].includes(wsUrl.protocol)) {
+      throw new ComfyClientError(
+        'COMFY_CONFIGURATION_INVALID',
+        'ComfyUI WebSocket URL must use WS or WSS.',
+      );
+    }
+    if (!options.clientId.trim()) {
+      throw new ComfyClientError(
+        'COMFY_CONFIGURATION_INVALID',
+        'ComfyUI client ID must be non-blank.',
+      );
+    }
+    const requestTimeoutMs = options.requestTimeoutMs ?? 15_000;
+    const maxJsonResponseBytes =
+      options.maxJsonResponseBytes ?? DEFAULT_MAX_JSON_RESPONSE_BYTES;
+    const maxOutputBytes = options.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
+    const historyLimit = options.historyLimit ?? DEFAULT_HISTORY_LIMIT;
+    if (
+      !Number.isSafeInteger(requestTimeoutMs) ||
+      requestTimeoutMs < 100 ||
+      !Number.isSafeInteger(maxJsonResponseBytes) ||
+      maxJsonResponseBytes < 1 ||
+      !Number.isSafeInteger(maxOutputBytes) ||
+      maxOutputBytes < 1 ||
+      !Number.isSafeInteger(historyLimit) ||
+      historyLimit < 1
+    ) {
+      throw new ComfyClientError(
+        'COMFY_CONFIGURATION_INVALID',
+        'ComfyUI client limits are invalid.',
+      );
+    }
+    this.baseUrl = baseUrl.toString().replace(/\/$/, '');
+    this.wsUrl = wsUrl.toString();
     this.clientId = options.clientId;
+    if (options.authToken) this.authToken = options.authToken;
+    this.requestTimeoutMs = requestTimeoutMs;
+    this.maxJsonResponseBytes = maxJsonResponseBytes;
+    this.maxOutputBytes = maxOutputBytes;
+    this.historyLimit = historyLimit;
     this.fetchImpl = options.fetchImpl ?? fetch;
-    this.webSocket =
-      options.webSocket ??
-      (globalThis.WebSocket as unknown as WebSocketConstructor);
+    if (options.webSocket) {
+      this.webSocket = options.webSocket;
+    } else {
+      const globalWebSocket = (
+        globalThis as unknown as {
+          readonly WebSocket?: unknown;
+        }
+      ).WebSocket;
+      if (typeof globalWebSocket === 'function') {
+        this.webSocket = globalWebSocket as ComfyWebSocketConstructor;
+      }
+    }
+    if (options.webSocketFactory)
+      this.webSocketFactory = options.webSocketFactory;
+  }
+
+  async checkReady(): Promise<ComfyReadiness> {
+    const checkedAt = new Date().toISOString();
+    try {
+      const [systemStats, objectInfo] = await Promise.all([
+        this.getJson<unknown>('/system_stats'),
+        this.getObjectInfo(),
+      ]);
+      if (!isRecord(systemStats)) {
+        throw new ComfyClientError(
+          'COMFY_PROTOCOL_ERROR',
+          'ComfyUI system stats response was invalid.',
+        );
+      }
+      const system = isRecord(systemStats.system)
+        ? systemStats.system
+        : systemStats;
+      const apiVersion =
+        typeof system.comfyui_version === 'string'
+          ? system.comfyui_version
+          : 'unknown';
+      return {
+        ready: true,
+        checkedAt,
+        apiVersion,
+        capabilityFingerprint: computeComfyCapabilityFingerprint(objectInfo),
+      };
+    } catch (error) {
+      return {
+        ready: false,
+        checkedAt,
+        errorCode:
+          error instanceof ComfyClientError ? error.code : 'COMFY_UNAVAILABLE',
+      };
+    }
   }
 
   async getCapabilities(): Promise<ComfyCapabilities> {
+    const readiness = await this.checkReady();
+    if (!readiness.ready || !readiness.capabilityFingerprint) {
+      throw new ComfyClientError('COMFY_UNAVAILABLE', 'ComfyUI is not ready.', {
+        retryable: true,
+      });
+    }
     return {
-      apiVersion: 'official-subset',
+      apiVersion: readiness.apiVersion ?? 'unknown',
       supportsWebSocket: true,
       supportsCancellation: true,
       preservesExtraData: true,
+      capabilityFingerprint: readiness.capabilityFingerprint,
     };
   }
 
   async getObjectInfo(): Promise<ComfyObjectInfoResponse> {
-    return this.getJson<ComfyObjectInfoResponse>('/object_info');
+    const value = await this.getJson<unknown>('/object_info');
+    if (!isRecord(value)) {
+      throw new ComfyClientError(
+        'COMFY_PROTOCOL_ERROR',
+        'ComfyUI object information response was invalid.',
+      );
+    }
+    return objectInfoClasses(value);
   }
 
   async validateWorkflow(
     workflow: Readonly<Record<string, unknown>>,
   ): Promise<ComfyWorkflowValidation> {
     const info = await this.getObjectInfo();
-    const available = new Set(Object.keys(info.nodes));
-    const missingClasses = Object.values(workflow)
-      .map((node) =>
-        typeof node === 'object' && node !== null && 'class_type' in node
-          ? String((node as { class_type: unknown }).class_type)
-          : '',
-      )
-      .filter(
-        (classType) => classType.length === 0 || !available.has(classType),
-      );
+    const available = new Set(Object.keys(objectInfoClasses(info)));
+    const missingClasses = [
+      ...new Set(
+        Object.values(workflow)
+          .map((node) =>
+            isRecord(node) && 'class_type' in node
+              ? String(node.class_type)
+              : '',
+          )
+          .filter(
+            (classType) => classType.length === 0 || !available.has(classType),
+          ),
+      ),
+    ];
     return { valid: missingClasses.length === 0, missingClasses };
   }
 
   async submitPrompt(
     request: ComfySubmitRequest,
   ): Promise<ComfySubmitResponse> {
-    const response = await this.fetchImpl(`${this.baseUrl}/prompt`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
+    const extraData: Record<string, unknown> = { ...request.extraData };
+    if (
+      request.scenario !== undefined &&
+      !Object.hasOwn(extraData, 'scenario')
+    ) {
+      extraData.scenario = request.scenario;
+    }
+    if (request.seed !== undefined && !Object.hasOwn(extraData, 'seed')) {
+      extraData.seed = request.seed;
+    }
+    let body: string;
+    try {
+      body = JSON.stringify({
         prompt: request.workflow,
-        extra_data: request.extraData,
         client_id: request.clientId ?? this.clientId,
-      }),
-    });
-    if (response.status === 504) {
+        extra_data: extraData,
+      });
+    } catch {
+      throw new ComfyClientError(
+        'COMFY_PROTOCOL_ERROR',
+        'ComfyUI prompt payload is not valid JSON.',
+      );
+    }
+    let response: Response;
+    let value: Record<string, unknown>;
+    try {
+      response = await this.request('/prompt', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body,
+      });
+    } catch (error) {
+      if (
+        error instanceof ComfyRequestTimeoutError ||
+        (error instanceof ComfyClientError &&
+          error.code === 'COMFY_NETWORK_ERROR')
+      ) {
+        throw new ComfySubmissionUncertainError();
+      }
+      throw error;
+    }
+    if (response.status >= 500) {
       throw new ComfySubmissionUncertainError();
     }
-    const value = await this.parseResponse<Record<string, unknown>>(response);
-    const promptId = value.prompt_id ?? value.promptId;
-    if (typeof promptId !== 'string' || !promptId) {
-      throw new Error('Comfy submission response did not include a prompt ID.');
+    if (!response.ok) {
+      throw new ComfyPromptRejectedError();
     }
-    return { promptId };
-  }
-
-  async getQueue(): Promise<ComfyQueueResponse> {
-    const value = await this.getJson<Record<string, unknown>>('/prompt');
+    try {
+      value = await this.parseJsonResponse<Record<string, unknown>>(response);
+    } catch (error) {
+      if (
+        error instanceof ComfyRequestTimeoutError ||
+        (error instanceof ComfyClientError &&
+          error.code === 'COMFY_NETWORK_ERROR')
+      ) {
+        throw new ComfySubmissionUncertainError();
+      }
+      throw error;
+    }
+    if (Object.hasOwn(value, 'error')) {
+      throw new ComfyPromptRejectedError();
+    }
+    const promptId = value.prompt_id ?? value.promptId;
+    if (typeof promptId !== 'string' || promptId.length === 0) {
+      throw new ComfyClientError(
+        'COMFY_PROTOCOL_ERROR',
+        'ComfyUI submission response did not include a prompt ID.',
+      );
+    }
     return {
-      queuePending: this.stringArray(value.queue_pending ?? value.queuePending),
-      queueRunning: this.stringArray(value.queue_running ?? value.queueRunning),
+      promptId,
+      ...(typeof value.number === 'number'
+        ? { queueNumber: value.number }
+        : {}),
+      ...(isRecord(value.node_errors) ? { nodeErrors: value.node_errors } : {}),
     };
   }
 
+  async getQueue(): Promise<ComfyQueueResponse> {
+    let value: unknown;
+    try {
+      value = await this.getJson<unknown>('/queue');
+    } catch (error) {
+      // The pinned backend also retains GET /prompt as its legacy queue-info
+      // route. Prefer the official tuple endpoint and use the legacy route
+      // only when a gateway/backend does not expose /queue.
+      if (
+        !(error instanceof ComfyClientError) ||
+        error.code !== 'COMFY_HTTP_ERROR' ||
+        error.status !== 404
+      ) {
+        throw error;
+      }
+      value = await this.getJson<unknown>('/prompt');
+    }
+    return normalizeComfyQueueResponse(value);
+  }
+
   async getHistory(promptId: string): Promise<ComfyHistoryRecord | null> {
-    const response = await this.fetchImpl(
-      `${this.baseUrl}/history/${encodeURIComponent(promptId)}`,
+    const response = await this.request(
+      `/history/${encodeURIComponent(promptId)}`,
     );
     if (response.status === 404) return null;
-    const value = await this.parseResponse<Record<string, unknown>>(response);
-    return this.normalizeHistory(promptId, value[promptId] ?? value);
+    const value = await this.parseJsonResponse<unknown>(response);
+    if (isRecord(value) && Object.hasOwn(value, promptId)) {
+      return normalizeHistoryRecord(promptId, value[promptId]);
+    }
+    if (isHistoryRecord(value)) return normalizeHistoryRecord(promptId, value);
+    // ComfyUI returns an empty object for an unknown history identifier.
+    return null;
   }
 
   async findHistoryByCorrelation(
     correlationId: string,
   ): Promise<ComfyHistoryRecord | null> {
-    const queue = await this.getJson<Record<string, unknown>>('/history');
-    for (const [promptId, value] of Object.entries(queue)) {
-      const normalized = this.normalizeHistory(promptId, value);
-      if (normalized.extraData.correlation_id === correlationId)
+    const value = await this.getJson<unknown>(
+      `/history?max_items=${this.historyLimit}`,
+    );
+    if (!isRecord(value)) return null;
+    for (const [promptId, rawRecord] of Object.entries(value)) {
+      if (!isHistoryRecord(rawRecord)) continue;
+      const normalized = normalizeHistoryRecord(promptId, rawRecord);
+      if (normalized.extraData.correlation_id === correlationId) {
         return normalized;
+      }
     }
     return null;
   }
 
   async cancelPrompt(promptId?: string): Promise<void> {
-    const response = await this.fetchImpl(`${this.baseUrl}/interrupt`, {
+    const response = await this.request('/interrupt', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(promptId ? { prompt_id: promptId } : {}),
     });
     if (!response.ok) {
-      throw new Error(
-        `Comfy cancellation failed with status ${response.status}.`,
-      );
+      throw this.httpError(response.status);
     }
   }
 
@@ -756,43 +1391,117 @@ export class HttpWsComfyClient implements ComfyClient {
     const queue = new AsyncEventQueue<ComfyMessage>();
     const url = new URL(this.wsUrl);
     url.searchParams.set('clientId', this.clientId);
-    const socket = new this.webSocket(url.toString());
-    socket.onopen = () => undefined;
-    socket.onmessage = (event) => {
-      if (typeof event.data !== 'string') return;
-      try {
-        const message = JSON.parse(event.data) as ComfyMessage;
-        const promptId = String(message.data.prompt_id ?? '');
-        const matchesPrompt =
-          !options.promptId || promptId === options.promptId;
-        if (matchesPrompt) queue.push(message);
-        if (
-          matchesPrompt &&
-          (message.type === 'execution_success' ||
-            message.type === 'execution_error' ||
-            message.type === 'execution_interrupted')
-        ) {
-          queue.close();
+    let socket: ComfyWebSocketLike;
+    try {
+      const headers = this.authToken
+        ? { authorization: `Bearer ${this.authToken}` }
+        : {};
+      socket = this.webSocketFactory
+        ? this.webSocketFactory(url.toString(), { headers })
+        : this.webSocket
+          ? new this.webSocket(url.toString())
+          : (() => {
+              throw new ComfyClientError(
+                'COMFY_CONFIGURATION_INVALID',
+                'A WebSocket transport is not available.',
+              );
+            })();
+    } catch (error) {
+      queue.close(
+        error instanceof Error ? error : new ComfyStreamDisconnectedError(),
+      );
+      return queue;
+    }
+
+    let closedByConsumer = false;
+    let terminalObserved = false;
+    let openTimer: ReturnType<typeof setTimeout> | undefined = setTimeout(
+      () => {
+        if (terminalObserved || closedByConsumer) return;
+        try {
+          socket.close();
+        } finally {
+          queue.close(
+            new ComfyRequestTimeoutError('ComfyUI WebSocket open timed out.'),
+          );
         }
-      } catch {
-        queue.close(new Error('Comfy WebSocket message was not valid JSON.'));
+      },
+      this.requestTimeoutMs,
+    );
+    const cleanup = (): void => {
+      if (openTimer !== undefined) {
+        clearTimeout(openTimer);
+        openTimer = undefined;
+      }
+      options.signal?.removeEventListener('abort', onAbort);
+    };
+    const onAbort = (): void => {
+      closedByConsumer = true;
+      cleanup();
+      try {
+        socket.close();
+      } finally {
+        queue.close(options.signal?.reason);
       }
     };
-    socket.onerror = () => queue.close(new ComfyStreamDisconnectedError());
-    socket.onclose = () => queue.close();
-    const onAbort = (): void => {
-      socket.close();
-      queue.close(options.signal?.reason);
+    socket.onopen = () => {
+      if (openTimer !== undefined) {
+        clearTimeout(openTimer);
+        openTimer = undefined;
+      }
+    };
+    socket.onmessage = (event) => {
+      if (typeof event.data !== 'string') return;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(event.data);
+      } catch {
+        queue.close(
+          new ComfyClientError(
+            'COMFY_PROTOCOL_ERROR',
+            'ComfyUI WebSocket message was not valid JSON.',
+          ),
+        );
+        return;
+      }
+      const message = parseComfyMessage(parsed);
+      if (!message) return;
+      const promptId =
+        typeof message.data.prompt_id === 'string'
+          ? message.data.prompt_id
+          : '';
+      const matchesPrompt = !options.promptId || promptId === options.promptId;
+      if (!matchesPrompt) return;
+      queue.push(message);
+      if (isTerminalMessage(message)) {
+        terminalObserved = true;
+        cleanup();
+        queue.close();
+      }
+    };
+    socket.onerror = () => {
+      cleanup();
+      if (!closedByConsumer && !terminalObserved) {
+        queue.close(new ComfyStreamDisconnectedError());
+      }
+    };
+    socket.onclose = () => {
+      cleanup();
+      if (!closedByConsumer && !terminalObserved) {
+        queue.close(new ComfyStreamDisconnectedError());
+      }
     };
     options.signal?.addEventListener('abort', onAbort, { once: true });
+    if (options.signal?.aborted) onAbort();
     const iterator = queue[Symbol.asyncIterator]();
     return {
       [Symbol.asyncIterator](): AsyncIterator<ComfyMessage> {
         return {
           next: async () => iterator.next(),
           return: async () => {
+            closedByConsumer = true;
+            cleanup();
             socket.close();
-            options.signal?.removeEventListener('abort', onAbort);
             queue.close();
             return { value: undefined, done: true };
           },
@@ -802,108 +1511,159 @@ export class HttpWsComfyClient implements ComfyClient {
   }
 
   async downloadOutput(output: ComfyOutputReference): Promise<Uint8Array> {
+    validateOutputReference(output);
     const url = new URL(`${this.baseUrl}/view`);
     url.searchParams.set('filename', output.filename);
     url.searchParams.set('subfolder', output.subfolder);
     url.searchParams.set('type', output.type);
-    const response = await this.fetchImpl(url);
-    if (!response.ok) {
-      throw new Error(
-        `Comfy output download failed with status ${response.status}.`,
-      );
-    }
-    return new Uint8Array(await response.arrayBuffer());
+    const response = await this.request(url.toString());
+    if (!response.ok) throw this.httpError(response.status);
+    return this.readResponseBytes(response, this.maxOutputBytes, true);
   }
 
   private async getJson<Value>(path: string): Promise<Value> {
-    const response = await this.fetchImpl(`${this.baseUrl}${path}`);
-    return this.parseResponse<Value>(response);
+    const response = await this.request(path);
+    return this.parseJsonResponse<Value>(response);
   }
 
-  private async parseResponse<Value>(response: Response): Promise<Value> {
-    if (!response.ok) {
-      throw new Error(`Comfy request failed with status ${response.status}.`);
-    }
-    return (await response.json()) as Value;
-  }
-
-  private stringArray(value: unknown): readonly string[] {
-    return Array.isArray(value)
-      ? value.filter((item): item is string => typeof item === 'string')
-      : [];
-  }
-
-  private normalizeHistory(
-    promptId: string,
-    value: unknown,
-  ): ComfyHistoryRecord {
-    const record = value as Record<string, unknown>;
-    const statusRecord = (record.status ?? {}) as Record<string, unknown>;
-    const statusValue = String(
-      typeof record.status === 'string'
-        ? record.status
-        : (statusRecord.status_str ?? record.status_str ?? 'pending'),
+  private async parseJsonResponse<Value>(response: Response): Promise<Value> {
+    if (!response.ok) throw this.httpError(response.status);
+    const bytes = await this.readResponseBytes(
+      response,
+      this.maxJsonResponseBytes,
+      false,
     );
-    const status: ComfyHistoryRecord['status'] =
-      statusValue === 'success'
-        ? 'success'
-        : statusValue === 'error'
-          ? 'error'
-          : statusValue === 'interrupted'
-            ? 'interrupted'
-            : record.outputs
-              ? 'running'
-              : 'pending';
-    const extraData = (record.extra_data ?? record.extraData ?? {}) as Readonly<
-      Record<string, unknown>
-    >;
-    const rawOutputs = record.outputs;
-    const outputs = (
-      Array.isArray(rawOutputs)
-        ? rawOutputs
-        : Object.values((rawOutputs ?? {}) as Record<string, unknown>).flatMap(
-            (nodeOutput) => {
-              if (typeof nodeOutput !== 'object' || nodeOutput === null)
-                return [];
-              const outputRecord = nodeOutput as Record<string, unknown>;
-              return Object.values(outputRecord).flatMap((valueOutput) =>
-                Array.isArray(valueOutput) ? valueOutput : [],
-              );
-            },
-          )
-    )
-      .filter(
-        (output): output is ComfyOutputReference =>
-          typeof output === 'object' &&
-          output !== null &&
-          'filename' in output &&
-          typeof (output as { filename: unknown }).filename === 'string',
+    try {
+      return JSON.parse(new TextDecoder().decode(bytes)) as Value;
+    } catch {
+      throw new ComfyClientError(
+        'COMFY_PROTOCOL_ERROR',
+        'ComfyUI returned invalid JSON.',
+      );
+    }
+  }
+
+  private async readResponseBytes(
+    response: Response,
+    maxBytes: number,
+    output: boolean,
+  ): Promise<Uint8Array> {
+    const contentLength = Number(response.headers.get('content-length') ?? '');
+    if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+      throw new ComfyClientError(
+        output ? 'COMFY_OUTPUT_TOO_LARGE' : 'COMFY_PROTOCOL_ERROR',
+        output
+          ? 'ComfyUI output exceeded the configured size limit.'
+          : 'ComfyUI response exceeded the configured size limit.',
+      );
+    }
+    let timeoutId: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const bodyPromise = response.arrayBuffer();
+      const timeoutPromise = new Promise<ArrayBuffer>((_, reject) => {
+        timeoutId = setTimeout(
+          () => reject(new ComfyRequestTimeoutError()),
+          this.requestTimeoutMs,
+        );
+      });
+      const bytes = new Uint8Array(
+        await Promise.race([bodyPromise, timeoutPromise]),
+      );
+      if (bytes.byteLength > maxBytes) {
+        throw new ComfyClientError(
+          output ? 'COMFY_OUTPUT_TOO_LARGE' : 'COMFY_PROTOCOL_ERROR',
+          output
+            ? 'ComfyUI output exceeded the configured size limit.'
+            : 'ComfyUI response exceeded the configured size limit.',
+        );
+      }
+      return bytes;
+    } catch (error) {
+      if (error instanceof ComfyClientError) throw error;
+      throw new ComfyClientError(
+        'COMFY_NETWORK_ERROR',
+        'ComfyUI response body could not be read.',
+        { retryable: true },
+      );
+    } finally {
+      if (timeoutId !== undefined) clearTimeout(timeoutId);
+    }
+  }
+
+  private async request(
+    pathOrUrl: string,
+    init: RequestInit = {},
+  ): Promise<Response> {
+    const url = pathOrUrl.startsWith('http')
+      ? pathOrUrl
+      : `${this.baseUrl}${pathOrUrl}`;
+    const controller = new AbortController();
+    const headers = new Headers(init.headers);
+    if (this.authToken) {
+      headers.set('authorization', `Bearer ${this.authToken}`);
+    }
+    let timeoutId: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const responsePromise = this.fetchImpl(url, {
+        ...init,
+        headers,
+        signal: controller.signal,
+      });
+      const timeoutPromise = new Promise<Response>((_, reject) => {
+        timeoutId = setTimeout(() => {
+          controller.abort();
+          reject(new ComfyRequestTimeoutError());
+        }, this.requestTimeoutMs);
+      });
+      return await Promise.race([responsePromise, timeoutPromise]);
+    } catch (error) {
+      if (error instanceof ComfyClientError) throw error;
+      if (controller.signal.aborted) throw new ComfyRequestTimeoutError();
+      throw new ComfyClientError(
+        'COMFY_NETWORK_ERROR',
+        'ComfyUI request failed before a response was received.',
+        { retryable: true },
+      );
+    } finally {
+      if (timeoutId !== undefined) clearTimeout(timeoutId);
+    }
+  }
+
+  private httpError(status: number): ComfyClientError {
+    return new ComfyClientError(
+      'COMFY_HTTP_ERROR',
+      `ComfyUI request failed with HTTP status ${status}.`,
+      { status, retryable: status >= 500 },
+    );
+  }
+}
+
+function validateOutputReference(output: ComfyOutputReference): void {
+  const validPart = (value: string, allowSlash: boolean): boolean => {
+    if (
+      (!allowSlash && !value) ||
+      value.includes('\0') ||
+      value.startsWith('/') ||
+      value.startsWith('\\')
+    ) {
+      return false;
+    }
+    const segments = value.split(/[\\/]/u);
+    if (allowSlash && value.length === 0) return true;
+    return (
+      (allowSlash || segments.length === 1) &&
+      segments.every(
+        (segment) => segment.length > 0 && segment !== '..' && segment !== '.',
       )
-      .map((output) => ({
-        filename: output.filename,
-        subfolder: typeof output.subfolder === 'string' ? output.subfolder : '',
-        type: typeof output.type === 'string' ? output.type : 'output',
-        mimeType:
-          typeof output.mimeType === 'string' ? output.mimeType : 'video/mp4',
-      }));
-    return {
-      promptId,
-      status,
-      completed: Boolean(
-        statusRecord.completed ??
-          record.completed ??
-          (status === 'success' ||
-            status === 'error' ||
-            status === 'interrupted'),
-      ),
-      extraData,
-      outputs,
-      ...(record.exception_type
-        ? { errorCode: String(record.exception_type) }
-        : {}),
-      ...(record.exception_message
-        ? { errorMessage: String(record.exception_message) }
-        : {}),
-    };
+    );
+  };
+  if (
+    !validPart(output.filename, false) ||
+    !validPart(output.subfolder, true)
+  ) {
+    throw new ComfyClientError(
+      'COMFY_OUTPUT_INVALID',
+      'ComfyUI returned an unsafe output reference.',
+    );
   }
 }

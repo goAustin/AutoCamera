@@ -73,7 +73,8 @@ describe('Phase 2 PostgreSQL persistence', () => {
     const constraints = await pool.query<{ conname: string }>(
       `SELECT conname
        FROM pg_constraint
-       WHERE conname = ANY($1::text[])`,
+       WHERE connamespace = 'public'::regnamespace
+         AND conname = ANY($1::text[])`,
       [
         [
           'video_projects_budget_non_negative',

@@ -45,11 +45,17 @@ import { getApiConfig, type ApiConfig } from '@h3/config';
 import type { OperationalExecutorToolView } from '@h3/agent-tools';
 import {
   createTraceId,
-  OpenTelemetryTelemetry,
+  createBufferedTelemetry,
+  initializeCoreMetrics,
+  MetricsRegistry,
+  TraceContextRegistry,
   type AgentTelemetry,
+  type TelemetrySpanHandle,
+  type TraceId,
 } from '@h3/telemetry';
 import { createLocalArtifactStore, type ArtifactStore } from '@h3/object-store';
 import {
+  HttpWsComfyClient,
   type ComfyClient,
   type ComfyQueueResponse,
   type ComfyReadiness,
@@ -116,6 +122,8 @@ export interface ApiAppOptions {
   readonly store?: TransactionalStore;
   readonly planner?: PlanningAgent;
   readonly telemetry?: AgentTelemetry;
+  readonly metrics?: MetricsRegistry;
+  readonly traceContexts?: TraceContextRegistry;
   readonly planningScript?: FauxPlanningScript;
   readonly clock?: Clock;
   readonly idGenerator?: IdGenerator;
@@ -124,6 +132,31 @@ export interface ApiAppOptions {
   readonly evaluator?: MediaEvaluator;
   readonly generationWorker?: GenerationWorker;
   readonly startGenerationWorker?: boolean;
+  readonly operationalAdapter?: OperationalPiAdapter;
+  readonly operationalDispatcher?: OutboxDispatcher;
+  readonly startOperationalWorker?: boolean;
+}
+
+export interface StartApiOptions {
+  readonly comfyClient?: ComfyClient;
+}
+
+export function createConfiguredComfyClient(config: ApiConfig): ComfyClient {
+  switch (config.comfyMode) {
+    case 'fake':
+    case 'remote':
+      return new HttpWsComfyClient({
+        baseUrl: config.comfyBaseUrl,
+        wsUrl: config.comfyWsUrl,
+        clientId: `${config.comfyClientIdPrefix}-${config.gpuWorkerId}`,
+        requestTimeoutMs: config.comfyRequestTimeoutMs,
+        ...(config.comfyAuthToken ? { authToken: config.comfyAuthToken } : {}),
+      });
+    default: {
+      const mode: never = config.comfyMode;
+      throw new Error(`Unsupported ComfyUI mode: ${mode}`);
+    }
+  }
 }
 
 class HttpProblemError extends Error {
@@ -1245,11 +1278,62 @@ function problemTitle(code: string): string {
     .join(' ');
 }
 
+const requestTraceIds = new WeakMap<FastifyRequest, string>();
+
 function traceIdFor(request: FastifyRequest): string {
+  const existing = requestTraceIds.get(request);
+  if (existing) return existing;
   const supplied = headerValue(request, 'x-trace-id');
-  return supplied && /^[0-9a-f]{32}$/i.test(supplied)
-    ? supplied
-    : createTraceId();
+  const traceId =
+    supplied && /^[0-9a-f]{32}$/i.test(supplied) ? supplied : createTraceId();
+  requestTraceIds.set(request, traceId);
+  return traceId;
+}
+
+function requestOperationName(request: FastifyRequest): string {
+  const routeUrl = (request as unknown as { routeOptions?: { url?: string } })
+    .routeOptions?.url;
+  const path = (routeUrl ?? request.url).split('?')[0] ?? '';
+  if (request.method === 'POST' && path === '/v1/projects') {
+    return 'project.create';
+  }
+  if (request.method === 'POST' && path.endsWith('/plan')) {
+    return 'agent.plan';
+  }
+  if (request.method === 'POST' && path.endsWith('/storyboard/approve')) {
+    return 'storyboard.approve';
+  }
+  if (request.method === 'PUT' && path.endsWith('/workflow-draft')) {
+    return 'workflow.draft.save';
+  }
+  if (request.method === 'POST' && path.endsWith('/workflow-revisions')) {
+    return 'workflow.revision.create';
+  }
+  if (request.method === 'POST' && path.endsWith('/validate')) {
+    return 'workflow.revision.validate';
+  }
+  if (request.method === 'POST' && path.endsWith('/managed-attempts')) {
+    return 'attempt.create_managed';
+  }
+  if (request.method === 'POST' && path.endsWith('/attempts')) {
+    return 'attempt.create';
+  }
+  if (
+    request.method === 'POST' &&
+    (path.endsWith('/accept') || path.endsWith('/reject'))
+  ) {
+    return 'review.apply';
+  }
+  if (path.endsWith('/events/stream')) return 'sse.replay';
+  if (
+    path.includes('/operator/recommendations/') &&
+    (path.endsWith('/apply') || path.endsWith('/dismiss'))
+  ) {
+    return 'operator.action.apply';
+  }
+  if (path.endsWith('/operator/recommendations')) return 'operator.recommend';
+  if (path === '/metrics') return 'metrics.scrape';
+  return 'http.request';
 }
 
 function sendProblem(
@@ -1525,11 +1609,21 @@ export function buildApiApp(options: ApiAppOptions = {}): FastifyInstance {
   }
   const clock = options.clock ?? systemClock;
   const idGenerator = options.idGenerator ?? systemIdGenerator;
+  const telemetry =
+    options.telemetry ??
+    createBufferedTelemetry(config.otelExporterOtlpEndpoint);
+  const metrics = options.metrics ?? new MetricsRegistry();
+  initializeCoreMetrics(metrics);
+  const traceContexts =
+    options.traceContexts ?? new TraceContextRegistry(telemetry);
   const generationService = new GenerationApplicationService({
     store,
     tenantId: DEV_TENANT_ID,
     idGenerator,
     clock,
+    telemetry,
+    metrics,
+    executorMode: config.comfyMode,
     ...(options.comfyClient ? { comfyClient: options.comfyClient } : {}),
     artifactStore:
       options.artifactStore ?? createLocalArtifactStore(config.artifactRoot),
@@ -1542,9 +1636,10 @@ export function buildApiApp(options: ApiAppOptions = {}): FastifyInstance {
     clock,
     executor: generationService.comfyClient,
     requireExecutor: true,
+    telemetry,
+    metrics,
   });
   let projectService: ProjectApplicationService | undefined;
-  const telemetry = options.telemetry ?? new OpenTelemetryTelemetry();
   const planner =
     options.planner ??
     new PiPlanningAgent({
@@ -1556,6 +1651,7 @@ export function buildApiApp(options: ApiAppOptions = {}): FastifyInstance {
       model: config.piModel,
       maxConcurrentRuns: config.piMaxConcurrentRuns,
       telemetry,
+      metrics,
       ...(config.piApiKey ? { apiKey: config.piApiKey } : {}),
       ...(config.piBaseUrl ? { baseUrl: config.piBaseUrl } : {}),
       ...(options.planningScript ? { script: options.planningScript } : {}),
@@ -1608,6 +1704,7 @@ export function buildApiApp(options: ApiAppOptions = {}): FastifyInstance {
       provider: 'faux',
       model: 'h3-videoops-operator-v1',
       telemetry,
+      metrics,
       services: (repositories) =>
         createOperationalToolServices(repositories, DEV_TENANT_ID, {
           mode: config.comfyMode,
@@ -1654,6 +1751,40 @@ export function buildApiApp(options: ApiAppOptions = {}): FastifyInstance {
   const authToken =
     config.devAuthToken || (config.nodeEnv === 'test' ? 'test-token' : '');
   const schemas = baseRouteSchemas();
+  const requestRoots = new WeakMap<FastifyRequest, TelemetrySpanHandle>();
+  const requestOperations = new WeakMap<FastifyRequest, TelemetrySpanHandle>();
+
+  const safeMetric = (work: () => void): void => {
+    try {
+      work();
+    } catch {
+      // Metrics are diagnostic and must never change business behavior.
+    }
+  };
+
+  const finishRequestTelemetry = (
+    request: FastifyRequest,
+    statusCode: number,
+  ): void => {
+    const status = statusCode >= 400 ? 'error' : 'ok';
+    const operation = requestOperations.get(request);
+    if (operation) {
+      operation.setAttributes({
+        status,
+        code: String(statusCode),
+      });
+      operation.setStatus(status);
+      operation.end();
+      requestOperations.delete(request);
+    }
+    const root = requestRoots.get(request);
+    if (root) {
+      root.setAttributes({ status, code: String(statusCode) });
+      root.setStatus(status);
+      root.end();
+      requestRoots.delete(request);
+    }
+  };
 
   const app = Fastify({
     logger: {
@@ -1670,7 +1801,10 @@ export function buildApiApp(options: ApiAppOptions = {}): FastifyInstance {
     requestIdHeader: 'x-request-id',
   });
 
-  void app.register(cors, { origin: config.webOrigin });
+  void app.register(cors, {
+    origin: config.webOrigin,
+    methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  });
   void app.register(swagger, {
     openapi: {
       info: {
@@ -1713,6 +1847,20 @@ export function buildApiApp(options: ApiAppOptions = {}): FastifyInstance {
   void app.register(swaggerUi, { routePrefix: '/documentation' });
 
   app.addHook('onRequest', async (request) => {
+    const traceId = traceIdFor(request);
+    const root = traceContexts.startRoot('http.request', traceId as TraceId, {
+      operation: requestOperationName(request),
+    });
+    requestRoots.set(request, root);
+    const operationName = requestOperationName(request);
+    if (operationName !== 'http.request') {
+      requestOperations.set(
+        request,
+        traceContexts.start(operationName, traceId, {
+          operation: operationName,
+        }),
+      );
+    }
     if (!request.url.startsWith('/v1/')) {
       return;
     }
@@ -1736,9 +1884,33 @@ export function buildApiApp(options: ApiAppOptions = {}): FastifyInstance {
     }
   });
 
-  app.setErrorHandler((error, request, reply) =>
-    sendProblem(request, reply, error),
-  );
+  app.addHook('onSend', async (request, reply) => {
+    reply.header('x-trace-id', traceIdFor(request));
+  });
+  app.addHook('onResponse', async (request, reply) => {
+    finishRequestTelemetry(request, reply.statusCode);
+  });
+  app.addHook('onError', async (request, reply) => {
+    finishRequestTelemetry(
+      request,
+      reply.statusCode >= 400 ? reply.statusCode : 500,
+    );
+  });
+
+  app.setErrorHandler((error, request, reply) => {
+    if (
+      error instanceof GenerationApplicationError &&
+      (error.code === 'BUDGET_EXCEEDED' ||
+        error.code === 'ATTEMPT_LIMIT_REACHED')
+    ) {
+      safeMetric(() =>
+        metrics.increment('video_budget_denials_total', {
+          operation: 'generate',
+        }),
+      );
+    }
+    return sendProblem(request, reply, error);
+  });
 
   void app.register(async (routes) => {
     routes.get(
@@ -1773,6 +1945,13 @@ export function buildApiApp(options: ApiAppOptions = {}): FastifyInstance {
       },
     );
 
+    routes.get('/metrics', async (_request, reply) =>
+      reply
+        .code(200)
+        .type('text/plain; version=0.0.4')
+        .send(metrics.renderPrometheus()),
+    );
+
     routes.get(
       '/v1/executor',
       {
@@ -1793,6 +1972,13 @@ export function buildApiApp(options: ApiAppOptions = {}): FastifyInstance {
             errorCode: 'COMFY_UNAVAILABLE',
           };
         }
+        safeMetric(() =>
+          metrics.set(
+            'video_executor_ready',
+            { executor_mode: config.comfyMode },
+            readiness.ready ? 1 : 0,
+          ),
+        );
         let queue: { pending: number; running: number } = {
           pending: 0,
           running: 0,
@@ -1861,11 +2047,17 @@ export function buildApiApp(options: ApiAppOptions = {}): FastifyInstance {
                 title: body.title,
                 brief: body.brief,
                 targetDurationSeconds: body.targetDurationSeconds,
+                traceId: traceIdFor(request),
                 budgetMicrousd: parseBudget(
                   body,
                   service.defaultBudgetMicrousd,
                 ),
               },
+            );
+            safeMetric(() =>
+              metrics.increment('video_projects_total', {
+                status: project.status,
+              }),
             );
             return { status: 201, body: { project: projectResponse(project) } };
           },
@@ -1932,7 +2124,11 @@ export function buildApiApp(options: ApiAppOptions = {}): FastifyInstance {
           `project.plan:${projectId}`,
           body,
           async () => {
-            const result = await service.planProject(projectId);
+            const result = await service.planProject(
+              projectId,
+              undefined,
+              traceIdFor(request),
+            );
             return {
               status: 200,
               body: {
@@ -1978,6 +2174,7 @@ export function buildApiApp(options: ApiAppOptions = {}): FastifyInstance {
               repositories,
               projectId,
               body.proposalId as Uuid | undefined,
+              traceIdFor(request),
             );
             return {
               status: 200,
@@ -2083,6 +2280,7 @@ export function buildApiApp(options: ApiAppOptions = {}): FastifyInstance {
         const baseRevisionId = bodyUuid(body.baseRevisionId, 'baseRevisionId');
         const command = {
           idempotencyKey: key,
+          traceId: traceIdFor(request),
           editorGraphJson,
           ...(lastApiGraphJson !== undefined ? { lastApiGraphJson } : {}),
           ...(baseRevisionId !== undefined ? { baseRevisionId } : {}),
@@ -2136,6 +2334,7 @@ export function buildApiApp(options: ApiAppOptions = {}): FastifyInstance {
           shotId,
           {
             idempotencyKey: idempotencyKey(request),
+            traceId: traceIdFor(request),
             editorGraphJson: bodyGraph(
               body,
               'editorGraph',
@@ -2250,6 +2449,8 @@ export function buildApiApp(options: ApiAppOptions = {}): FastifyInstance {
                 existing.projectId,
                 existing.shotId,
                 revisionId,
+                undefined,
+                traceIdFor(request),
               );
             return {
               status: 200,
@@ -2294,6 +2495,7 @@ export function buildApiApp(options: ApiAppOptions = {}): FastifyInstance {
         },
       },
       async (request, reply) => {
+        safeMetric(() => metrics.set('video_sse_connections', {}, 1));
         const rawLastEventId = headerValue(request, 'last-event-id');
         let lastEventId = 0;
         if (rawLastEventId !== undefined) {
@@ -2329,7 +2531,7 @@ export function buildApiApp(options: ApiAppOptions = {}): FastifyInstance {
               )}\n\n`,
           )
           .join('');
-        return reply
+        const response = reply
           .code(200)
           .headers({
             'cache-control': 'no-cache, no-transform',
@@ -2338,6 +2540,8 @@ export function buildApiApp(options: ApiAppOptions = {}): FastifyInstance {
             'x-content-type-options': 'nosniff',
           })
           .send(`${frames}: heartbeat\n\n`);
+        safeMetric(() => metrics.set('video_sse_connections', {}, 0));
+        return response;
       },
     );
 
@@ -2543,6 +2747,8 @@ export function buildApiApp(options: ApiAppOptions = {}): FastifyInstance {
                     projectId,
                     sourceAttempt.shotId,
                     sourceAttempt.workflowRevisionId,
+                    undefined,
+                    traceIdFor(request),
                   );
                 if (validation.validation.errors.length > 0) {
                   throw new HttpProblemError(
@@ -2564,6 +2770,13 @@ export function buildApiApp(options: ApiAppOptions = {}): FastifyInstance {
                 expectedVersion,
                 toIsoUtc(clock.now()),
               );
+            safeMetric(() =>
+              metrics.increment('video_operator_recommendations_total', {
+                code: updated.recommendationCode,
+                status: updated.status,
+                severity: updated.severity,
+              }),
+            );
             if (retryAttemptId) {
               attempt = await generationService.retryAttemptInTransaction(
                 repositories,
@@ -2634,6 +2847,13 @@ export function buildApiApp(options: ApiAppOptions = {}): FastifyInstance {
                 body.expectedVersion ?? recommendation.version,
                 toIsoUtc(clock.now()),
               );
+            safeMetric(() =>
+              metrics.increment('video_operator_recommendations_total', {
+                code: updated.recommendationCode,
+                status: updated.status,
+                severity: updated.severity,
+              }),
+            );
             return {
               status: 200,
               body: { recommendation: recommendationResponse(updated) },
@@ -2726,11 +2946,11 @@ export function buildApiApp(options: ApiAppOptions = {}): FastifyInstance {
           );
         }
         const key = idempotencyKey(request);
-        const traceId = headerValue(request, 'x-trace-id');
+        const traceId = traceIdFor(request);
         const command: CreateManagedAttemptCommand = {
           idempotencyKey: key,
           workflowRevisionId,
-          ...(traceId ? { traceId } : {}),
+          traceId,
         };
         const response = await executeIdempotent(
           request,
@@ -2795,13 +3015,13 @@ export function buildApiApp(options: ApiAppOptions = {}): FastifyInstance {
           request.body,
         ) as CreateAttemptBody;
         const key = idempotencyKey(request);
-        const traceId = headerValue(request, 'x-trace-id');
+        const traceId = traceIdFor(request);
         const command: CreateAttemptCommand = {
           idempotencyKey: key,
           ...(body.seed !== undefined ? { seed: body.seed } : {}),
           ...(body.steps !== undefined ? { steps: body.steps } : {}),
           ...(body.scenario !== undefined ? { scenario: body.scenario } : {}),
-          ...(traceId ? { traceId } : {}),
+          traceId,
         };
         const response = await executeIdempotent(
           request,
@@ -3064,10 +3284,10 @@ export function buildApiApp(options: ApiAppOptions = {}): FastifyInstance {
           request.body,
         ) as RetryAttemptBody;
         const key = idempotencyKey(request);
-        const traceId = headerValue(request, 'x-trace-id');
+        const traceId = traceIdFor(request);
         const command: RetryAttemptCommand = {
           idempotencyKey: key,
-          ...(traceId ? { traceId } : {}),
+          traceId,
           ...(body.resolveUncertain ? { resolveUncertain: true } : {}),
         };
         const response = await executeIdempotent(
@@ -3098,7 +3318,10 @@ export function buildApiApp(options: ApiAppOptions = {}): FastifyInstance {
 
 export async function startApi(
   config: ApiConfig = getApiConfig(),
+  options: StartApiOptions = {},
 ): Promise<FastifyInstance> {
+  const comfyClient =
+    options.comfyClient ?? createConfiguredComfyClient(config);
   const pool = createDatabasePool(config.databaseUrl);
   await runMigrations(pool);
   const store = createPostgresStore(pool);
@@ -3110,6 +3333,7 @@ export async function startApi(
     config,
     databaseReady: () => checkDatabaseReady(pool),
     store,
+    comfyClient,
     startGenerationWorker: true,
     startOperationalWorker: true,
   });

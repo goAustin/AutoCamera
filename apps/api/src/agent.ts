@@ -44,7 +44,9 @@ import type { ProjectApplicationService } from './application.js';
 import type { GenerationApplicationService } from './generation.js';
 import {
   InMemoryTelemetry,
+  type MetricsRegistry,
   type AgentTelemetry,
+  type TraceId,
   type TelemetryAttributes,
   type TelemetrySpanHandle,
 } from '@h3/telemetry';
@@ -69,6 +71,7 @@ export interface PiPlanningAgentOptions {
   readonly maxConcurrentRuns?: number;
   readonly timeoutMs?: number;
   readonly telemetry?: AgentTelemetry;
+  readonly metrics?: MetricsRegistry;
   readonly script?: FauxPlanningScript;
   readonly enabledTools?: readonly PlanningToolName[];
   readonly projectService?: Pick<
@@ -459,6 +462,7 @@ export class PiPlanningAgent {
   private readonly modelName: string;
   private readonly timeoutMs: number;
   private readonly telemetry: AgentTelemetry;
+  private readonly metrics: MetricsRegistry | undefined;
   private readonly script: FauxPlanningScript | undefined;
   private readonly enabledTools: readonly PlanningToolName[];
   private readonly services: PlanningToolServices;
@@ -469,6 +473,7 @@ export class PiPlanningAgent {
     this.modelName = options.model ?? 'h3-videoops-storyboard-v1';
     this.timeoutMs = options.timeoutMs ?? 30_000;
     this.telemetry = options.telemetry ?? new InMemoryTelemetry();
+    this.metrics = options.metrics;
     this.script = options.script;
     this.enabledTools = options.enabledTools ?? ['get_video_project'];
     this.services = makeToolServices(options);
@@ -480,6 +485,7 @@ export class PiPlanningAgent {
       readonly projectId: Uuid;
       readonly tenantId: Uuid;
       readonly project: VideoProject;
+      readonly traceId?: string;
     },
     signal?: AbortSignal,
   ) {
@@ -513,11 +519,22 @@ export class PiPlanningAgent {
       repositories.agentRuns.create(run),
     );
 
-    const rootSpan = this.telemetry.startSpan('agent.run', {
-      provider: this.provider,
-      model: this.modelName,
-      status: 'running',
-    });
+    const rootSpan = this.telemetry.startRootSpan
+      ? this.telemetry.startRootSpan(
+          'agent.run',
+          {
+            provider: this.provider,
+            model: this.modelName,
+            status: 'running',
+          },
+          input.traceId as TraceId | undefined,
+        )
+      : this.telemetry.startSpan('agent.run', {
+          provider: this.provider,
+          model: this.modelName,
+          status: 'running',
+        });
+    const runStartedAt = Date.now();
     let terminalStatus: AgentRunStatus = 'failed';
     let failureCode: AgentRunFailureCode | undefined;
     let result: StoryboardProposalOutput | undefined;
@@ -796,6 +813,30 @@ export class PiPlanningAgent {
         await this.telemetry.flush();
       } catch {
         // Exporter failure must never fail the agent run.
+      }
+      if (this.metrics) {
+        const metricStatus =
+          terminalStatus === 'succeeded'
+            ? 'succeeded'
+            : terminalStatus === 'aborted'
+              ? 'aborted'
+              : terminalStatus === 'timed_out'
+                ? 'timed_out'
+                : 'failed';
+        try {
+          this.metrics.increment('pi_agent_runs_total', {
+            run_type: 'planning',
+            status: metricStatus,
+            provider: this.provider === 'faux' ? 'faux' : 'hosted',
+          });
+          this.metrics.observe(
+            'pi_agent_duration_seconds',
+            { run_type: 'planning', status: metricStatus },
+            Math.max(0, (Date.now() - runStartedAt) / 1_000),
+          );
+        } catch {
+          // Metrics are diagnostic and cannot change the planning result.
+        }
       }
       release();
     }
