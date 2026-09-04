@@ -20,6 +20,7 @@ import {
   type Shot,
   type StoryboardProposal,
   type StoryboardShotDefinition,
+  type ShotOrdinal,
   type Uuid,
   type VideoProject,
   isUuidV7,
@@ -224,7 +225,9 @@ export interface CreateProjectCommand {
   readonly title: string;
   readonly brief: string;
   readonly targetDurationSeconds: number;
-  readonly budgetMicrousd: MicroUsd;
+  readonly budgetMicrousd: MicroUsd | null;
+  readonly initialStatus?: VideoProject['status'];
+  readonly autoCreated?: boolean;
   readonly traceId?: string;
 }
 
@@ -240,9 +243,9 @@ export interface ApprovalResult {
 }
 
 export interface ProjectCost {
-  readonly budgetMicrousd: MicroUsd;
+  readonly budgetMicrousd: MicroUsd | null;
   readonly spentMicrousd: MicroUsd;
-  readonly remainingMicrousd: MicroUsd;
+  readonly remainingMicrousd: MicroUsd | null;
 }
 
 function withTimestamp<Value extends { readonly updatedAt: IsoUtcTimestamp }>(
@@ -296,6 +299,8 @@ export class ProjectApplicationService {
       brief: command.brief,
       targetDurationSeconds: command.targetDurationSeconds,
       budgetMicrousd: command.budgetMicrousd,
+      ...(command.initialStatus ? { status: command.initialStatus } : {}),
+      ...(command.autoCreated ? { autoCreated: true } : {}),
       now,
     });
     await repositories.projects.create(project);
@@ -305,6 +310,14 @@ export class ProjectApplicationService {
       ...(command.traceId ? { traceId: command.traceId } : {}),
       payload: { status: project.status },
     });
+    if (project.status === 'ready_for_generation') {
+      await this.appendEvent(repositories, {
+        type: 'project.ready_for_generation',
+        projectId: project.id,
+        ...(command.traceId ? { traceId: command.traceId } : {}),
+        payload: { status: project.status },
+      });
+    }
     return project;
   }
 
@@ -397,6 +410,10 @@ export class ProjectApplicationService {
     }
     const now = toIsoUtc(this.clock.now());
     let workingProject = project;
+    const existingShots = await repositories.shots.listByProject(projectId);
+    const hasOnlyImplicitShots =
+      existingShots.length > 0 &&
+      existingShots.every((shot) => shot.implicit === true);
     if (
       workingProject.status === 'draft' ||
       workingProject.status === 'awaiting_storyboard_approval'
@@ -414,6 +431,30 @@ export class ProjectApplicationService {
         projectId,
         ...(traceId ? { traceId } : {}),
         payload: { previousStatus: workingProject.status },
+      });
+      workingProject = planningProject;
+    } else if (hasOnlyImplicitShots && workingProject.status !== 'planning') {
+      // A direct graph-first run has already used the project for grouping
+      // and queued work. Let the planner demote that grouping state into the
+      // existing storyboard lifecycle without creating another shot row.
+      const planningProject: VideoProject = {
+        ...workingProject,
+        status: 'planning',
+        version: workingProject.version + 1,
+        updatedAt: now,
+      };
+      await repositories.projects.update(
+        planningProject,
+        workingProject.version,
+      );
+      await this.appendEvent(repositories, {
+        type: 'project.planning_started',
+        projectId,
+        ...(traceId ? { traceId } : {}),
+        payload: {
+          previousStatus: workingProject.status,
+          implicitShotCount: existingShots.length,
+        },
       });
       workingProject = planningProject;
     }
@@ -560,7 +601,7 @@ export class ProjectApplicationService {
     }
 
     const existingShots = await repositories.shots.listByProject(projectId);
-    if (existingShots.length > 0) {
+    if (existingShots.some((shot) => shot.implicit !== true)) {
       throw new ApplicationError(
         'STORYBOARD_ALREADY_MATERIALIZED',
         'The project storyboard has already been materialized into shots.',
@@ -570,21 +611,52 @@ export class ProjectApplicationService {
     }
 
     const now = toIsoUtc(this.clock.now());
-    const shots = proposal.shots.map((definition) =>
-      createShot({
-        id: this.idGenerator.next(),
-        projectId,
-        storyboardProposalId: proposal.id,
-        definition,
-        now,
-      }),
-    );
+    const shots: Shot[] = [];
+    const newShots: Shot[] = [];
+    for (const definition of proposal.shots) {
+      const implicitShot = existingShots.find(
+        (shot) => shot.ordinal === definition.ordinal,
+      );
+      if (implicitShot?.implicit === true) {
+        const promotedBase = createShot({
+          id: implicitShot.id,
+          projectId,
+          storyboardProposalId: proposal.id,
+          definition,
+          now,
+        });
+        const promoted: Shot = {
+          ...promotedBase,
+          status: implicitShot.status,
+          ...(implicitShot.acceptedAttemptId
+            ? { acceptedAttemptId: implicitShot.acceptedAttemptId }
+            : {}),
+          version: implicitShot.version + 1,
+          createdAt: implicitShot.createdAt,
+          updatedAt: now,
+        };
+        await repositories.shots.update(promoted, implicitShot.version);
+        shots.push(promoted);
+      } else {
+        const shot = createShot({
+          id: this.idGenerator.next(),
+          projectId,
+          storyboardProposalId: proposal.id,
+          definition,
+          now,
+        });
+        newShots.push(shot);
+        shots.push(shot);
+      }
+    }
     const approvedProposal = withTimestamp(
       transitionStoryboard(proposal, 'approved'),
       now,
     );
     await repositories.storyboards.update(approvedProposal, proposal.version);
-    await repositories.shots.createMany(shots);
+    if (newShots.length > 0) {
+      await repositories.shots.createMany(newShots);
+    }
     const readyProject = withTimestamp(
       transitionProject(project, 'ready_for_generation'),
       now,
@@ -597,7 +669,7 @@ export class ProjectApplicationService {
       ...(traceId ? { traceId } : {}),
       payload: { revision: proposal.revision, shotCount: shots.length },
     });
-    for (const shot of shots) {
+    for (const shot of newShots) {
       await this.appendEvent(repositories, {
         type: 'shot.created',
         projectId,
@@ -648,6 +720,81 @@ export class ProjectApplicationService {
     });
   }
 
+  async createImplicitShotInTransaction(
+    repositories: Repositories,
+    projectId: Uuid,
+    input: {
+      readonly purpose: string;
+      readonly prompt: string;
+      readonly durationSeconds: number;
+      readonly traceId?: string;
+    },
+  ): Promise<Shot> {
+    await this.requireProject(repositories, projectId);
+    const existingShots = await repositories.shots.listByProject(projectId);
+    // One implicit shot per run, so a project's run count is unbounded. The
+    // three-shot limit belongs to storyboard proposals, which are validated
+    // separately; it must not cap direct graph-first submissions.
+    const ordinal: ShotOrdinal = existingShots.reduce(
+      (highest, shot) => Math.max(highest, shot.ordinal),
+      0,
+    ) + 1;
+    const now = toIsoUtc(this.clock.now());
+    const shot = createShot({
+      id: this.idGenerator.next(),
+      projectId,
+      definition: {
+        ordinal,
+        purpose: input.purpose,
+        prompt: input.prompt,
+        durationSeconds: input.durationSeconds,
+        mode: 't2v',
+        qualityTier: 'preview',
+      },
+      implicit: true,
+      now,
+    });
+    await repositories.shots.createMany([shot]);
+    await this.appendEvent(repositories, {
+      type: 'shot.created',
+      projectId,
+      shotId: shot.id,
+      ...(input.traceId ? { traceId: input.traceId } : {}),
+      payload: { ordinal: shot.ordinal, status: shot.status, implicit: true },
+    });
+    return shot;
+  }
+
+  async prepareDirectRunProjectInTransaction(
+    repositories: Repositories,
+    projectId: Uuid,
+    traceId?: string,
+  ): Promise<VideoProject> {
+    const project = await this.requireProject(repositories, projectId);
+    if (
+      project.status !== 'draft' &&
+      project.status !== 'planning' &&
+      project.status !== 'awaiting_storyboard_approval'
+    ) {
+      return project;
+    }
+    const now = toIsoUtc(this.clock.now());
+    const readyProject: VideoProject = {
+      ...project,
+      status: 'ready_for_generation',
+      version: project.version + 1,
+      updatedAt: now,
+    };
+    await repositories.projects.update(readyProject, project.version);
+    await this.appendEvent(repositories, {
+      type: 'project.ready_for_generation',
+      projectId,
+      ...(traceId ? { traceId } : {}),
+      payload: { status: readyProject.status, directRun: true },
+    });
+    return readyProject;
+  }
+
   async getCost(projectId: Uuid): Promise<ProjectCost> {
     return this.store.withTransaction(async (repositories) => {
       const project = await this.requireProject(repositories, projectId);
@@ -691,6 +838,18 @@ export class ProjectApplicationService {
       project.status !== 'planning' &&
       project.status !== 'awaiting_storyboard_approval'
     ) {
+      const shots = await repositories.shots.listByProject(projectId);
+      const directRunGrouping =
+        shots.length > 0 && shots.every((shot) => shot.implicit === true);
+      if (
+        directRunGrouping &&
+        (project.status === 'ready_for_generation' ||
+          project.status === 'generating' ||
+          project.status === 'awaiting_final_review' ||
+          project.status === 'needs_attention')
+      ) {
+        return project;
+      }
       throw new ApplicationError(
         'PROJECT_NOT_READY_FOR_PLANNING',
         'The project is not available for storyboard planning.',

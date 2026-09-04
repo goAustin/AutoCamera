@@ -1,5 +1,25 @@
 # Changelog
 
+## Phase 7C — ComfyUI-first plugin inversion
+
+Evidence level: Offline fake. ComfyUI is the graph-shell entry point and the
+VideoOps panel is an exact-origin Studio iframe. The integration now exposes a
+managed Run action, run history/detail, pin/review, findings, revision restore,
+and read-only status surfaces while keeping the bearer token in Studio.
+
+- Added the inverted child/parent bridge contract with origin, nonce, replay,
+  payload-size, and credential-field validation.
+- Added the pinned-frontend plugin surfaces and native queue refusal without
+  monkey-patching unsupported frontend internals.
+- Added the ComfyUI-first browser acceptance test and screenshots.
+- Kept the standalone Studio fallback and Phase 5 routes available.
+
+Known limitation: the pinned frontend exposes no supported queue interception
+hook and its topbar badge metadata is static. Native queue controls are
+disabled; live status values are carried through the Studio-fed bottom-panel
+bridge. Remote ComfyUI compatibility and real H3 GPU generation remain
+deferred to Phase 8.
+
 ## v0.1.0-mvp — Phase 6 Offline fake release
 
 Evidence level: Offline fake. The release demonstrates the deterministic fake

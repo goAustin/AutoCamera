@@ -121,6 +121,7 @@ export interface WorkflowRevisionValidationResult {
 }
 
 const MAX_WORKFLOW_JSON_BYTES = 1_048_576;
+const MAX_PERSISTED_VALIDATION_ERRORS = 32;
 const APPLICATION_MUTATION_OPERATION_PREFIX = 'workflow-application.';
 
 function isPlainRecord(value: unknown): value is WorkflowGraph {
@@ -761,6 +762,9 @@ export class WorkflowApplicationService {
       parameters: validation.executionParameters,
     });
     const now = toIsoUtc(this.clock.now());
+    const persistedValidationErrors = validation.errors
+      .slice(0, MAX_PERSISTED_VALIDATION_ERRORS)
+      .map(({ code, message }) => ({ code, message }));
     const revision: WorkflowRevisionRecord = {
       id: this.idGenerator.next(),
       tenantId: this.tenantId,
@@ -786,10 +790,7 @@ export class WorkflowApplicationService {
       executionParametersJson: validation.executionParameters,
       validationStatus:
         validation.errors.length === 0 ? 'validated' : 'invalid',
-      validationErrorsJson: validation.errors.map(({ code, message }) => ({
-        code,
-        message,
-      })),
+      validationErrorsJson: persistedValidationErrors,
       validatedAt: now,
       ...(validation.executorFingerprint
         ? { executorFingerprint: validation.executorFingerprint }
@@ -923,10 +924,9 @@ export class WorkflowApplicationService {
       {
         validationStatus:
           validation.errors.length === 0 ? 'validated' : 'invalid',
-        validationErrorsJson: validation.errors.map(({ code, message }) => ({
-          code,
-          message,
-        })),
+        validationErrorsJson: validation.errors
+          .slice(0, MAX_PERSISTED_VALIDATION_ERRORS)
+          .map(({ code, message }) => ({ code, message })),
         validatedAt: toIsoUtc(this.clock.now()),
         executorFingerprint: validation.executorFingerprint ?? null,
       },

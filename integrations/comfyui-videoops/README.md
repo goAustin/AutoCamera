@@ -1,73 +1,120 @@
-# H3 VideoOps ComfyUI bridge
+# H3 VideoOps ComfyUI plugin
 
 This directory is a frontend-only ComfyUI custom-node package. It registers no
-execution nodes and never calls the VideoOps API. The authenticated Project
-Studio shell owns all API calls, including draft/revision creation and managed
-generation.
+Python execution nodes and never calls the VideoOps API. The Studio-origin
+iframe owns the VideoOps bearer token and authenticated API calls; the ComfyUI
+origin owns only the graph shell and a nonce-scoped postMessage bridge.
 
 The package is installed under `ComfyUI/custom_nodes/` and exports only
-`WEB_DIRECTORY`. ComfyUI loads `web/videoops.js`, which uses the supported
-`app.registerExtension()` and topbar command APIs. **Generate managed** calls
-the public `app.graphToPrompt()` method and exports both values:
+`WEB_DIRECTORY`. ComfyUI loads `web/videoops.js`, which uses the public APIs in
+the pinned frontend ref `3697a1bc3ba7f6b98a1ead888721f7676b536eb5`:
 
-- `workflow` as `editorGraph` for round-trip editing;
-- `output` as `apiGraph` for VideoOps validation and immutable revision storage.
+- `app.registerExtension()` for the topbar badge, action-bar button, and bottom
+  panel tab;
+- `app.extensionManager.registerSidebarTab()` for the VideoOps sidebar;
+- `app.graphToPrompt()` to export the current editor and API graph; and
+- `app.loadGraphData()` to restore an editor graph from a stored revision.
 
-## Managed iframe contract
+## Inverted containment
 
-Project Studio creates the browser-facing editor URL with these query
-parameters:
+ComfyUI is the top-level shell. The plugin creates an iframe to the Studio
+origin and appends only these safe context values to its URL:
 
 ```text
 videoopsManaged=1
-projectId=<opaque scoped resource id>
-shotId=<opaque scoped resource id>
 nonce=<fresh session nonce>
-parentOrigin=https%3A%2F%2Fstudio.example.com
-frontendVersion=<pinned frontend identifier>
+parentOrigin=<exact ComfyUI origin>
+frontendVersion=<pinned frontend ref>
 ```
 
-The bridge fails closed unless it is embedded, the managed flag and nonce are
-present, and `parentOrigin` is an exact `http` or `https` origin. It sends
-structured-clone messages to that origin only; it never uses `*`.
+The URL never contains a bearer token, private executor URL, model path, or
+raw credential. The Studio child reads its token from Studio session storage,
+not from the ComfyUI window. The plugin/runtime contains no authenticated
+`fetch`, API client, or `Authorization` header.
 
-Every message contains `source: "videoops-comfy-bridge"`, schema `version: 1`,
-`requestId`, and the session `nonce`. The bridge validates the exact origin,
-the parent `Window` object, schema version, message type, nonce, JSON shape,
-and a 2 MiB UTF-8 payload limit. Repeated `(type, requestId)` pairs are
-discarded. Graphs must be JSON objects; functions, cyclic values, non-finite
-numbers, and class instances are rejected.
+## Bridge contract
 
-Child-to-parent messages:
+`bridge-contract.js` is the single shared definition used by the ComfyUI
+parent, the Studio child, and `bridge-contract.test.ts`. Every message has
+`source: "videoops-comfy-bridge"`, schema `version: 1`, a request ID, and the
+session nonce. Both sides validate the exact origin and source window, message
+direction, JSON shape, credential fields, replay identity, and a 2 MiB UTF-8
+payload limit. `bridge.error` carries only a stable safe code.
 
-```json
-{
-  "source": "videoops-comfy-bridge",
-  "version": 1,
-  "type": "bridge.ready",
-  "requestId": "session-nonce",
-  "nonce": "session-nonce",
-  "frontendVersion": "pinned-frontend"
-}
+Studio child to ComfyUI parent:
+
+```text
+panel.ready       { }
+workflow.load     { editorGraph, revisionId? }
+run.status        { runId, status, evaluation? }
 ```
 
-```json
-{
-  "source": "videoops-comfy-bridge",
-  "version": 1,
-  "type": "workflow.exported",
-  "requestId": "export-unique-id",
-  "nonce": "session-nonce",
-  "editorGraph": {},
-  "apiGraph": {},
-  "frontendVersion": "pinned-frontend"
-}
+ComfyUI parent to Studio child:
+
+```text
+comfy.context     { frontendVersion }
+workflow.exported { editorGraph, apiGraph }
+bridge.error      { code }
 ```
 
-The parent may send `studio.context`, `workflow.load`, and `workflow.result`.
-Those messages carry no credential fields. A bridge error contains only a
-stable safe error code; raw graph data and exception text are not forwarded.
+The parent posts only to the exact Studio origin. The child posts only to the
+exact ComfyUI parent origin. Neither side uses `*`.
 
-The extension does not intercept or replace ComfyUI queue behavior. Direct
-browser submission is prevented by the authenticated reverse proxy described
-in [`infra/gpu-executor/README.md`](../../infra/gpu-executor/README.md).
+## Managed Run and queue limitation
+
+The pinned frontend was inspected before implementation. It provides no public
+queue-command override or interception callback. The plugin therefore does not
+monkey-patch queue internals. It disables the native queue button and queue-mode
+menu with a mutation-observer gate and exposes a clearly labelled public
+`Managed Run` action-bar button.
+
+`Managed Run` awaits public `app.graphToPrompt()`, sends `workflow.exported` to
+the Studio iframe, and lets Studio make the single authenticated `POST /v1/runs`
+request. Studio sends `run.status` back for the read-only topbar/bottom-panel
+status feed. The local H3 profile adapter resolves the pinned frontend's safe
+helper-node values in Studio before the 7A canonical execution graph is sent;
+ComfyUI still sends both public graph forms across the bridge.
+
+The topbar badge is a static managed-mode marker because the pinned
+`topbarBadges` metadata is static. Live executor readiness, active-run count,
+open findings, budget headroom, progress, and failure/trace details are carried
+by `run.status` and rendered by the Studio panel and bottom panel. Node-level
+durations are explicitly reported as not recorded in the durable Phase 7 feed.
+
+## Installation
+
+Copy only the frontend package into the separate pinned ComfyUI checkout:
+
+```sh
+export COMFY_ROOT=/srv/comfyui-h3
+export VIDEOOPS_ROOT=/path/to/deploy_Mh3
+install -d "$COMFY_ROOT/custom_nodes/comfyui-videoops/web"
+install -m 0644 "$VIDEOOPS_ROOT/integrations/comfyui-videoops/__init__.py" \
+  "$COMFY_ROOT/custom_nodes/comfyui-videoops/__init__.py"
+install -m 0644 "$VIDEOOPS_ROOT/integrations/comfyui-videoops/web/bridge-contract.js" \
+  "$COMFY_ROOT/custom_nodes/comfyui-videoops/web/bridge-contract.js"
+install -m 0644 "$VIDEOOPS_ROOT/integrations/comfyui-videoops/web/bridge-runtime.js" \
+  "$COMFY_ROOT/custom_nodes/comfyui-videoops/web/bridge-runtime.js"
+install -m 0644 "$VIDEOOPS_ROOT/integrations/comfyui-videoops/web/videoops.js" \
+  "$COMFY_ROOT/custom_nodes/comfyui-videoops/web/videoops.js"
+```
+
+Restart ComfyUI after installing the plugin. Serve the pinned editor route
+behind an exact-origin Studio embedding policy. Browser `POST /prompt`, queue
+mutation, interrupt, and other execution-control methods must be denied by the
+gateway; only the private VideoOps worker may submit to the executor.
+
+## Verification
+
+From this checkout, the offline inversion gate is:
+
+```sh
+pnpm comfy:frontend
+pnpm test:e2e e2e/comfy-inversion.spec.ts
+```
+
+The test proves the graph canvas opens first, the three VideoOps surfaces are
+present, the Studio iframe is genuinely cross-origin, no credential is
+reachable from the ComfyUI origin or iframe URL, browser `POST /prompt` returns
+405, and exactly one managed run is created. The full release remains
+**Offline fake** evidence; no GPU or real H3 generation is implied.

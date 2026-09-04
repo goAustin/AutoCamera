@@ -1,10 +1,12 @@
+import { unresolvableNodeClasses } from './App.js';
 import { describe, expect, it } from 'vitest';
 import { parseSseFrames } from './api.js';
 import {
   BRIDGE_SCHEMA_VERSION,
   BRIDGE_SOURCE,
   BridgeProtocolError,
-  validateParentBridgeEvent,
+  createPanelBridgeMessage,
+  validateComfyBridgeEvent,
 } from './bridge.js';
 import {
   buildFakeWorkflowGraphs,
@@ -47,14 +49,14 @@ describe('Project Studio browser contracts', () => {
     const message = {
       source: BRIDGE_SOURCE,
       version: BRIDGE_SCHEMA_VERSION,
-      type: 'bridge.ready',
-      requestId: 'ready-1',
+      type: 'comfy.context',
+      requestId: 'context-1',
       nonce: 'nonce-1',
       frontendVersion: 'pinned',
-    };
+    } as const;
     const seen = new Set<string>();
     expect(() =>
-      validateParentBridgeEvent(
+      validateComfyBridgeEvent(
         { origin: 'https://evil.test', source: frame, data: message },
         'https://studio.test',
         frame,
@@ -63,7 +65,7 @@ describe('Project Studio browser contracts', () => {
       ),
     ).toThrowError(BridgeProtocolError);
     expect(() =>
-      validateParentBridgeEvent(
+      validateComfyBridgeEvent(
         { origin: 'https://studio.test', source: {}, data: message },
         'https://studio.test',
         frame,
@@ -71,5 +73,64 @@ describe('Project Studio browser contracts', () => {
         seen,
       ),
     ).toThrowError(BridgeProtocolError);
+    expect(createPanelBridgeMessage('panel.ready', 'nonce-1')).toMatchObject({
+      type: 'panel.ready',
+      nonce: 'nonce-1',
+    });
+  });
+});
+
+describe('managed run graph fidelity guard', () => {
+  const resolved = {
+    '1': { class_type: 'MiniMaxH3ImageToVideo' },
+    '2': { class_type: 'SaveVideo' },
+  };
+
+  it('accepts an export made only of resolvable helper and profile nodes', () => {
+    expect(
+      unresolvableNodeClasses(
+        {
+          a: { class_type: 'ResolutionSelector' },
+          b: { class_type: 'ComfyMathExpression' },
+          c: { class_type: 'PrimitiveInt' },
+          d: { class_type: 'MiniMaxH3ImageToVideo' },
+          e: { class_type: 'SaveVideo' },
+        },
+        resolved,
+      ),
+    ).toEqual([]);
+  });
+
+  it('reports nodes the resolver cannot express', () => {
+    // Previously these were silently dropped: the rebuilt graph was submitted
+    // and hashed, so the audit record described a workflow the user never built.
+    expect(
+      unresolvableNodeClasses(
+        {
+          a: { class_type: 'MiniMaxH3ImageToVideo' },
+          b: { class_type: 'LoraLoader' },
+          c: { class_type: 'UpscaleModelLoader' },
+        },
+        resolved,
+      ),
+    ).toEqual(['LoraLoader', 'UpscaleModelLoader']);
+  });
+
+  it('deduplicates and ignores malformed nodes', () => {
+    expect(
+      unresolvableNodeClasses(
+        {
+          a: { class_type: 'LoraLoader' },
+          b: { class_type: 'LoraLoader' },
+          c: null,
+          d: { missing: true },
+        },
+        resolved,
+      ),
+    ).toEqual(['LoraLoader']);
+  });
+
+  it('treats a non-object export as empty rather than throwing', () => {
+    expect(unresolvableNodeClasses(undefined, resolved)).toEqual([]);
   });
 });

@@ -1,0 +1,20 @@
+{
+  "manifestVersion": 1,
+  "comfyuiCommit": "8a33128f2f8c5585c57486c07de481241e70a39c",
+  "comfyuiRepository": "https://github.com/Comfy-Org/ComfyUI.git",
+  "captureDate": "2026-09-04",
+  "rawCaptureSha256": "667e722139cf1b4d269c2f18d1882c39f9b9e6a1ee9f5e5f326a764cb848b02b",
+  "fixtureSha256": "0ca216feb2a82becea978fcb6b33bfe108704d78899a31c382e9445f76a64dd2",
+  "templateRepository": "https://github.com/Comfy-Org/workflow_templates.git",
+  "templateCommit": "d3b4a9e89573162b005961865164c18c8ae2206b",
+  "templatePath": "templates/video_minimax_h3_t2v.json",
+  "templateSha256": "2400b01a7c8acae3fed038c0372f08bacb90d2cdf915febadbe7e3f9802506ea",
+  "injectedModelFiles": {
+    "diffusionModel": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+    "textEncoder": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+    "videoVae": "minimax_h3_video_vae_fp16.safetensors",
+    "audioVae": "minimax_h3_audio_vae_fp32.safetensors",
+    "turboLora": "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors"
+  },
+  "nodeCount": 613
+}

@@ -5,6 +5,6 @@ export default {
   test: {
     ...baseConfig.test,
     include: ['**/*.integration.test.ts'],
-    exclude: ['**/node_modules/**', '**/dist/**'],
+    exclude: ['**/node_modules/**', '**/dist/**', '.data/comfy-frontend/**'],
   },
 };

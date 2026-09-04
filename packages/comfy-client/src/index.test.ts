@@ -16,6 +16,12 @@ const waitForTimers = async (): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, 5));
 
 describe('Comfy client contract', () => {
+  it('keeps the legacy fake object-info fingerprint stable', () => {
+    expect(
+      new DeterministicFakeComfyService().capabilities.capabilityFingerprint,
+    ).toBe('bdc5637c1238dc499167d6382eb44090e5a1ece4dbf0086996a54827a447b978');
+  });
+
   it.each([
     'success',
     'duplicate-events',

@@ -20,6 +20,7 @@ import {
   isTerminalGenerationAttempt,
   type ArtifactRecord,
   type AttemptFailureCode,
+  type AttemptReviewDecision,
   type EvaluationResult,
   type GenerationAttempt,
   type Shot,
@@ -195,6 +196,14 @@ export interface AttemptRepository {
   update(
     attempt: GenerationAttempt,
     expectedVersion: number,
+  ): Promise<GenerationAttempt>;
+  review(
+    tenantId: Uuid,
+    attemptId: Uuid,
+    decision: AttemptReviewDecision,
+    note: string | null,
+    author: string,
+    reviewedAt: string,
   ): Promise<GenerationAttempt>;
   claimNext(
     workerId: string,
@@ -672,8 +681,9 @@ interface ProjectRow extends QueryResultRow {
   brief: string;
   status: string;
   target_duration_seconds: string | number;
-  budget_microusd: string | number;
+  budget_microusd: string | number | null;
   spent_microusd: string | number;
+  auto_created: boolean;
   version: number;
   created_at: DatabaseTimestamp;
   updated_at: DatabaseTimestamp;
@@ -699,7 +709,7 @@ interface StoryboardRow extends QueryResultRow {
 interface ShotRow extends QueryResultRow {
   id: string;
   project_id: string;
-  storyboard_proposal_id: string;
+  storyboard_proposal_id: string | null;
   ordinal: number;
   purpose: string;
   prompt: string;
@@ -714,6 +724,8 @@ interface ShotRow extends QueryResultRow {
   required_asset_ids: unknown;
   status: string;
   accepted_attempt_id: string | null;
+  pinned_attempt_id: string | null;
+  implicit: boolean;
   version: number;
   created_at: DatabaseTimestamp;
   updated_at: DatabaseTimestamp;
@@ -749,6 +761,10 @@ interface AttemptRow extends QueryResultRow {
   failure_message: string | null;
   source_attempt_id: string | null;
   artifact_id: string | null;
+  review_decision: string | null;
+  review_note: string | null;
+  review_author: string | null;
+  reviewed_at: DatabaseTimestamp | null;
   version: number;
   created_at: DatabaseTimestamp;
   updated_at: DatabaseTimestamp;
@@ -1401,6 +1417,10 @@ function parseShotDefinitions(value: unknown): StoryboardProposal['shots'] {
 }
 
 function mapProject(row: ProjectRow): VideoProject {
+  const budgetMicrousd =
+    row.budget_microusd === null
+      ? null
+      : assertMicrousd(databaseNumber(row.budget_microusd));
   return {
     id: assertUuid(row.id),
     tenantId: assertUuid(row.tenant_id),
@@ -1408,8 +1428,9 @@ function mapProject(row: ProjectRow): VideoProject {
     brief: row.brief,
     status: parseProjectStatus(row.status),
     targetDurationSeconds: databaseNumber(row.target_duration_seconds),
-    budgetMicrousd: assertMicrousd(databaseNumber(row.budget_microusd)),
+    budgetMicrousd,
     spentMicrousd: assertMicrousd(databaseNumber(row.spent_microusd)),
+    ...(row.auto_created ? { autoCreated: true } : {}),
     version: row.version,
     createdAt: databaseTimestamp(row.created_at) as VideoProject['createdAt'],
     updatedAt: databaseTimestamp(row.updated_at) as VideoProject['updatedAt'],
@@ -1456,10 +1477,16 @@ function mapShot(row: ShotRow): Shot {
   const acceptedAttemptId = row.accepted_attempt_id
     ? assertUuid(row.accepted_attempt_id)
     : undefined;
+  const pinnedAttemptId = row.pinned_attempt_id
+    ? assertUuid(row.pinned_attempt_id)
+    : undefined;
+  const storyboardProposalId = row.storyboard_proposal_id
+    ? assertUuid(row.storyboard_proposal_id)
+    : undefined;
   const shot: Shot = {
     id: assertUuid(row.id),
     projectId: assertUuid(row.project_id),
-    storyboardProposalId: assertUuid(row.storyboard_proposal_id),
+    ...(storyboardProposalId ? { storyboardProposalId } : {}),
     ordinal: shotOrdinal(row.ordinal),
     purpose: row.purpose,
     prompt: row.prompt,
@@ -1482,11 +1509,13 @@ function mapShot(row: ShotRow): Shot {
     version: row.version,
     createdAt: databaseTimestamp(row.created_at) as Shot['createdAt'],
     updatedAt: databaseTimestamp(row.updated_at) as Shot['updatedAt'],
+    ...(row.implicit ? { implicit: true } : {}),
   };
-  if (acceptedAttemptId) {
-    return { ...shot, acceptedAttemptId };
-  }
-  return shot;
+  return {
+    ...shot,
+    ...(acceptedAttemptId ? { acceptedAttemptId } : {}),
+    ...(pinnedAttemptId ? { pinnedAttemptId } : {}),
+  };
 }
 
 function optionalDatabaseTimestamp(
@@ -1537,6 +1566,18 @@ function mapAttempt(row: AttemptRow): GenerationAttempt {
     ? assertUuid(row.source_attempt_id)
     : undefined;
   const artifactId = row.artifact_id ? assertUuid(row.artifact_id) : undefined;
+  const reviewDecision = row.review_decision ?? null;
+  if (
+    reviewDecision !== null &&
+    reviewDecision !== 'accepted' &&
+    reviewDecision !== 'rejected'
+  ) {
+    throw new RepositoryError(
+      'DATABASE_ERROR',
+      'Database returned an unknown attempt review decision.',
+    );
+  }
+  const reviewedAt = optionalDatabaseTimestamp(row.reviewed_at ?? null);
   const attempt: GenerationAttempt = {
     id: assertUuid(row.id),
     tenantId: assertUuid(row.tenant_id),
@@ -1594,6 +1635,16 @@ function mapAttempt(row: AttemptRow): GenerationAttempt {
     ...(failureMessage ? { failureMessage } : {}),
     ...(sourceAttemptId ? { sourceAttemptId } : {}),
     ...(artifactId ? { artifactId } : {}),
+    ...(reviewDecision ? { reviewDecision } : {}),
+    ...(row.review_note != null ? { reviewNote: row.review_note } : {}),
+    ...(row.review_author != null ? { reviewAuthor: row.review_author } : {}),
+    ...(reviewedAt
+      ? {
+          reviewedAt: reviewedAt as NonNullable<
+            GenerationAttempt['reviewedAt']
+          >,
+        }
+      : {}),
   };
   assertGenerationAttempt(attempt);
   return attempt;
@@ -2030,8 +2081,9 @@ class PostgresProjectRepository implements ProjectRepository {
     await this.executor.query(
       `INSERT INTO video_projects (
         id, tenant_id, title, brief, status, target_duration_seconds,
-        budget_microusd, spent_microusd, version, created_at, updated_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+        budget_microusd, spent_microusd, auto_created, version, created_at,
+        updated_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
       [
         project.id,
         project.tenantId,
@@ -2041,6 +2093,7 @@ class PostgresProjectRepository implements ProjectRepository {
         project.targetDurationSeconds,
         project.budgetMicrousd,
         project.spentMicrousd,
+        project.autoCreated ?? false,
         project.version,
         project.createdAt,
         project.updatedAt,
@@ -2080,9 +2133,10 @@ class PostgresProjectRepository implements ProjectRepository {
            target_duration_seconds = $4,
            budget_microusd = $5,
            spent_microusd = $6,
-           version = $7,
-           updated_at = $8
-       WHERE id = $9 AND tenant_id = $10 AND version = $11
+           auto_created = $7,
+           version = $8,
+           updated_at = $9
+       WHERE id = $10 AND tenant_id = $11 AND version = $12
        RETURNING *`,
       [
         project.title,
@@ -2091,6 +2145,7 @@ class PostgresProjectRepository implements ProjectRepository {
         project.targetDurationSeconds,
         project.budgetMicrousd,
         project.spentMicrousd,
+        project.autoCreated ?? false,
         project.version,
         project.updatedAt,
         project.id,
@@ -2226,14 +2281,14 @@ class PostgresShotRepository implements ShotRepository {
           id, project_id, storyboard_proposal_id, ordinal, purpose, prompt,
           duration_seconds, mode, quality_tier, visual_description,
           camera_direction, audio_direction, dialogue, acceptance_criteria,
-          required_asset_ids, status, accepted_attempt_id, version,
-          created_at, updated_at
+          required_asset_ids, status, accepted_attempt_id, pinned_attempt_id,
+          version, created_at, updated_at, implicit
         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-          $13, $14::jsonb, $15::jsonb, $16, $17, $18, $19, $20)`,
+          $13, $14::jsonb, $15::jsonb, $16, $17, $18, $19, $20, $21, $22)`,
         [
           shot.id,
           shot.projectId,
-          shot.storyboardProposalId,
+          shot.storyboardProposalId ?? null,
           shot.ordinal,
           shot.purpose,
           shot.prompt,
@@ -2248,9 +2303,11 @@ class PostgresShotRepository implements ShotRepository {
           databaseJson(shot.requiredAssetIds ?? []),
           shot.status,
           shot.acceptedAttemptId ?? null,
+          shot.pinnedAttemptId ?? null,
           shot.version,
           shot.createdAt,
           shot.updatedAt,
+          shot.implicit ?? false,
         ],
       );
     }
@@ -2285,19 +2342,35 @@ class PostgresShotRepository implements ShotRepository {
   async update(shot: Shot, expectedVersion: number): Promise<Shot> {
     const result = await this.executor.query<ShotRow>(
       `UPDATE shots
-       SET status = $1,
-           visual_description = $2,
-           camera_direction = $3,
-           audio_direction = $4,
-           dialogue = $5,
-           acceptance_criteria = $6::jsonb,
-           required_asset_ids = $7::jsonb,
-           accepted_attempt_id = $8,
-           version = $9,
-           updated_at = $10
-       WHERE id = $11 AND project_id = $12 AND version = $13
+       SET storyboard_proposal_id = $1,
+           ordinal = $2,
+           purpose = $3,
+           prompt = $4,
+           duration_seconds = $5,
+           mode = $6,
+           quality_tier = $7,
+           status = $8,
+           visual_description = $9,
+           camera_direction = $10,
+           audio_direction = $11,
+           dialogue = $12,
+           acceptance_criteria = $13::jsonb,
+           required_asset_ids = $14::jsonb,
+           accepted_attempt_id = $15,
+           pinned_attempt_id = $16,
+           implicit = $17,
+           version = $18,
+           updated_at = $19
+       WHERE id = $20 AND project_id = $21 AND version = $22
        RETURNING *`,
       [
+        shot.storyboardProposalId ?? null,
+        shot.ordinal,
+        shot.purpose,
+        shot.prompt,
+        shot.durationSeconds,
+        shot.mode,
+        shot.qualityTier,
         shot.status,
         shot.visualDescription ?? null,
         shot.cameraDirection ?? null,
@@ -2306,6 +2379,8 @@ class PostgresShotRepository implements ShotRepository {
         databaseJson(shot.acceptanceCriteria ?? []),
         databaseJson(shot.requiredAssetIds ?? []),
         shot.acceptedAttemptId ?? null,
+        shot.pinnedAttemptId ?? null,
+        shot.implicit ?? false,
         shot.version,
         shot.updatedAt,
         shot.id,
@@ -2340,11 +2415,12 @@ class PostgresAttemptRepository implements AttemptRepository {
         scenario, comfy_prompt_id, lease_owner, lease_expires_at, queued_at, submitted_at,
         finished_at, compute_seconds, estimated_cost_microusd, failure_code,
         failure_message, source_attempt_id, artifact_id, version, created_at,
-        updated_at, workflow_revision_id
+        updated_at, workflow_revision_id, review_decision, review_note,
+        review_author, reviewed_at
       ) VALUES (
         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
         $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29,
-        $30, $31, $32
+        $30, $31, $32, $33, $34, $35, $36
       )`,
       [
         attempt.id,
@@ -2379,6 +2455,10 @@ class PostgresAttemptRepository implements AttemptRepository {
         attempt.createdAt,
         attempt.updatedAt,
         attempt.workflowRevisionId ?? null,
+        attempt.reviewDecision ?? null,
+        attempt.reviewNote ?? null,
+        attempt.reviewAuthor ?? null,
+        attempt.reviewedAt ?? null,
       ],
     );
   }
@@ -2475,8 +2555,12 @@ class PostgresAttemptRepository implements AttemptRepository {
            artifact_id = $22,
            version = $23,
            updated_at = $24,
-           workflow_revision_id = $25
-       WHERE id = $26 AND tenant_id = $27 AND version = $28
+           workflow_revision_id = $25,
+           review_decision = $26,
+           review_note = $27,
+           review_author = $28,
+           reviewed_at = $29
+       WHERE id = $30 AND tenant_id = $31 AND version = $32
        RETURNING *`,
       [
         attempt.status,
@@ -2504,6 +2588,10 @@ class PostgresAttemptRepository implements AttemptRepository {
         attempt.version,
         attempt.updatedAt,
         attempt.workflowRevisionId ?? null,
+        attempt.reviewDecision ?? null,
+        attempt.reviewNote ?? null,
+        attempt.reviewAuthor ?? null,
+        attempt.reviewedAt ?? null,
         attempt.id,
         attempt.tenantId,
         expectedVersion,
@@ -2514,6 +2602,36 @@ class PostgresAttemptRepository implements AttemptRepository {
       throw new RepositoryError(
         'OPTIMISTIC_CONFLICT',
         'The generation attempt was modified by another transaction.',
+      );
+    }
+    return mapAttempt(row);
+  }
+
+  async review(
+    tenantId: Uuid,
+    attemptId: Uuid,
+    decision: AttemptReviewDecision,
+    note: string | null,
+    author: string,
+    reviewedAt: string,
+  ): Promise<GenerationAttempt> {
+    const result = await this.executor.query<AttemptRow>(
+      `UPDATE generation_attempts
+       SET review_decision = $1,
+           review_note = $2,
+           review_author = $3,
+           reviewed_at = $4,
+           version = version + 1,
+           updated_at = $5
+       WHERE tenant_id = $6 AND id = $7
+       RETURNING *`,
+      [decision, note, author, reviewedAt, reviewedAt, tenantId, attemptId],
+    );
+    const row = result.rows[0];
+    if (!row) {
+      throw new RepositoryError(
+        'NOT_FOUND',
+        'The generation attempt was not found in the requested tenant.',
       );
     }
     return mapAttempt(row);
@@ -4198,6 +4316,42 @@ class MemoryRepositories implements Repositories {
         }
         this.state.attempts.set(attempt.id, { ...attempt });
         return { ...attempt };
+      },
+      review: async (
+        tenantId,
+        attemptId,
+        decision,
+        note,
+        author,
+        reviewedAt,
+      ) => {
+        const current = this.state.attempts.get(attemptId);
+        if (!current || current.tenantId !== tenantId) {
+          throw new RepositoryError(
+            'NOT_FOUND',
+            'The generation attempt was not found in the requested tenant.',
+          );
+        }
+        if (decision !== 'accepted' && decision !== 'rejected') {
+          throw new RepositoryError(
+            'INVALID_ARGUMENT',
+            'Attempt review decision is unknown.',
+          );
+        }
+        const { reviewNote: _reviewNote, ...withoutReviewNote } = current;
+        const reviewed: GenerationAttempt = {
+          ...withoutReviewNote,
+          reviewDecision: decision,
+          ...(note !== null ? { reviewNote: note } : {}),
+          reviewAuthor: author,
+          reviewedAt: reviewedAt as NonNullable<
+            GenerationAttempt['reviewedAt']
+          >,
+          version: current.version + 1,
+          updatedAt: reviewedAt as GenerationAttempt['updatedAt'],
+        };
+        this.state.attempts.set(attemptId, reviewed);
+        return { ...reviewed };
       },
       claimNext: async (workerId, now, leaseExpiresAt) => {
         const activeStatuses = new Set([

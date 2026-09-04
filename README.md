@@ -1,25 +1,28 @@
 # H3 VideoOps
 
-H3 VideoOps is a local, durable video-operations control plane. Project
-Studio is the authenticated user entry point; VideoOps owns workflow
-revisions, queue policy, retries, artifacts, evaluation, and human review;
-ComfyUI is the visual editing and execution surface; Pi supplies bounded
-planning and operational recommendations; MiniMax H3 owns inference only.
+H3 VideoOps is a local, durable video-operations control plane. ComfyUI is the
+visual entry point and graph shell; the VideoOps panel is an exact-origin Studio
+iframe inside it. The bearer token stays in the Studio origin. VideoOps owns
+workflow revisions, queue policy, retries, artifacts, evaluation, and human
+review; Pi supplies bounded planning and operational recommendations; MiniMax H3
+owns inference only.
 
 ## Current release status
 
-**Phase 6 complete — `v0.1.0-mvp`, Offline fake evidence.** The complete local
-flow is deterministic, GPU-free, and reproducible: create a project, plan and
-approve a three-shot storyboard, save and validate an immutable managed
-revision, queue a fake clip, inspect the artifact and evaluation, and accept
-or reject it with durable recovery and operator evidence.
+**Phase 7C complete — `v0.1.0-mvp`, Offline fake evidence.** Phase 7A complete;
+Phase 7B complete and carried forward. The original local flow is deterministic,
+GPU-free, and reproducible. The ComfyUI-first path now opens the pinned graph canvas, mounts
+VideoOps as a Studio-origin sidebar iframe, disables native browser queueing,
+and sends a loaded graph through one managed `POST /v1/runs` call. The standalone
+Studio routes remain available as the fallback shell.
 
 The remote ComfyUI contract and a real MiniMax H3 GPU smoke run are explicitly
-deferred to **Phase 8**. This release generated no real H3 clip. A live ComfyUI
-editor/contract test and real H3 generation are separate evidence levels; the
-offline screenshots and metrics must not be read as GPU or H3 evidence.
+deferred to **Phase 8**. This release generated no real H3 clip. The pinned
+editor/catalogue screenshots are a separate shell-compatibility evidence set;
+all evidence remains Offline fake and must not be read as GPU or H3 inference
+evidence.
 
-![Project Studio — deterministic fake managed workflow](assets/screenshots/03-managed-workflow.png)
+![ComfyUI shell with VideoOps managed panel](assets/screenshots/comfy-frontend/05-videoops-managed-run.png)
 
 Offline evidence set: `01-project-create.png`, `02-storyboard-approved.png`,
 `03-managed-workflow.png`, `04-revision-history.png`, `05-attempt-progress.png`,
@@ -27,15 +30,32 @@ Offline evidence set: `01-project-create.png`, `02-storyboard-approved.png`,
 `08-completed-project.png`; the enabled local observability view is
 `09-grafana-dashboard.png` (full manifest: `EVIDENCE-MANIFEST.md`).
 
+ComfyUI-first inversion evidence: `comfy-frontend/04-videoops-sidebar.png` and
+`comfy-frontend/05-videoops-managed-run.png`.
+
+Separate pinned editor evidence: `comfy-frontend/01-editor-loaded.png`,
+`comfy-frontend/02-h3-template-open.png`, and
+`comfy-frontend/03-graph-to-prompt.png`. These are captured by the tagged
+`@comfy-frontend` spec after enabling the ignored build:
+
+```sh
+pnpm comfy:frontend
+pnpm test:e2e e2e/comfy-frontend.spec.ts
+```
+
+The fetch/build never runs in CI. Without `.data/comfy-frontend/dist`, the
+fake shell returns an actionable 503 on `/` and the tagged specs skip with
+that remediation; the untagged suite is unchanged.
+
 More current evidence is listed in [`EVIDENCE-MANIFEST.md`](EVIDENCE-MANIFEST.md).
 
 ## Architecture and ownership
 
 ```mermaid
 flowchart LR
-  U[User] --> S[Project Studio]
+  U[User] --> C[ComfyUI graph shell]
+  C --> S[Studio-origin VideoOps panel]
   S --> P[Pi package adapter]
-  S --> C[ComfyUI editor route]
   S --> A[VideoOps API]
   A --> D[(PostgreSQL authority)]
   D --> W[Durable worker]
@@ -53,9 +73,9 @@ flowchart LR
 
 | Component | Owns | Does not own |
 |---|---|---|
-| Project Studio | Authenticated project shell, storyboard approval, fake editor panel, review controls, trace display | Private executor credentials or direct execution submission |
+| Project Studio | Authenticated embedded panel, run history, revision loading, pin/review, findings, trace display, and standalone fallback routes | Private executor credentials or direct executor submission |
 | VideoOps API/worker | PostgreSQL state, immutable revisions, validation, budgets, leases, retries, reconciliation, artifacts, evaluation, SSE, review, operator policy | Model inference |
-| ComfyUI | Visual graph editor, graph-to-API export, queue and node execution on its host | Project policy, durable review, billing, or VideoOps authorization |
+| ComfyUI | Visual graph editor, public graph-to-API export, plugin surfaces, and host-side executor shell | VideoOps bearer token, project policy, durable review, billing, or VideoOps authorization |
 | Pi packages | Deterministic storyboard planning and bounded operational recommendations | Direct database, shell, filesystem, ComfyUI, token, or automatic remediation access |
 | MiniMax H3 | Inference when actually deployed on a compatible GPU host | Monitoring, queue durability, retries, artifacts, or human approval |
 
@@ -67,13 +87,17 @@ an inference dependency, not a monitoring service.
 
 ## Trust and route boundaries
 
-The browser calls the public VideoOps API and, in remote mode, an authenticated
-browser-facing ComfyUI editor route. Only the VideoOps worker can call the
-private ComfyUI `POST /prompt` route. The browser never receives
-`COMFY_BASE_URL`, `COMFY_WS_URL`, `COMFY_AUTH_TOKEN`, private hostnames, signed
-output paths, or a bearer token for ComfyUI. The bridge uses an exact parent
-origin, nonce, source window, schema, and payload-size check; it exports the
-editable graph and API graph without calling VideoOps itself.
+The browser opens the ComfyUI graph shell and the plugin mounts a Studio-origin
+iframe. Only the Studio iframe calls the public VideoOps API, using the token in
+its own origin. Only the VideoOps worker can call the private ComfyUI
+`POST /prompt` route. The browser never receives `COMFY_BASE_URL`,
+`COMFY_WS_URL`, `COMFY_AUTH_TOKEN`, private hostnames, signed output paths, or a
+ComfyUI bearer token. The bridge uses an exact parent origin, nonce, source
+window, schema, and payload-size check; ComfyUI exports the editable graph and
+API graph without calling VideoOps itself.
+
+The token isolation test records no credential in ComfyUI storage or globals,
+and confirms that the Studio iframe remains cross-origin.
 
 ## Modes and evidence levels
 
@@ -110,11 +134,13 @@ fixture, starts PostgreSQL, applies migrations, builds the workspace, and
 starts the API, worker, fake ComfyUI service, and Project Studio. No cloud
 account, paid provider, hosted LLM key, model download, or GPU is needed.
 
-Project Studio is at `http://127.0.0.1:5173`. API readiness is at
+Project Studio is at `http://127.0.0.1:5173` and supplies the embedded panel.
+The fake ComfyUI graph shell is at `http://127.0.0.1:8188`; open it first for
+the ComfyUI-first flow. API readiness is at
 `http://127.0.0.1:3000/health/ready`; fake ComfyUI readiness is at
 `http://127.0.0.1:8188/health`. Enter the local development token from `.env`
-in Project Studio. Every `/v1/*` request is authenticated and every repeatable
-mutation requires an `Idempotency-Key`.
+in the Studio panel when it opens inside ComfyUI. Every `/v1/*` request is
+authenticated and every repeatable mutation requires an `Idempotency-Key`.
 
 ## Five-minute offline demo
 
@@ -145,6 +171,7 @@ remote ComfyUI output directory.
 pnpm check
 pnpm test:integration
 pnpm test:e2e
+pnpm test:e2e e2e/comfy-inversion.spec.ts
 pnpm test:comfy-live                 # reports SKIP when no remote executor is configured
 pnpm observability:config
 pnpm security:scan
@@ -223,8 +250,12 @@ Known limitations are intentionally explicit: remote ComfyUI compatibility is
 not exercised in this environment; no H3 weights are bundled; no real H3 clip
 was generated; fake output is not a quality or throughput benchmark; and
 production billing, autoscaling, multitenancy, SLOs, and Kubernetes are not
-implemented. Phase 8 is the next execution document for the deferred remote
-ComfyUI and real-H3 work; the post-MVP roadmap remains otherwise unexecuted.
+implemented. The pinned frontend exposes no supported queue-command override,
+so native queue controls are disabled and the public `Managed Run` action is
+used; no frontend internals are patched. Its topbar badge metadata is static,
+so live readiness/count/budget values are shown in the Studio and bottom-panel
+status surfaces. Phase 8 remains reserved for the deferred remote ComfyUI and
+real-H3 work, and the post-MVP roadmap remains otherwise unexecuted.
 
 Resume-ready wording is in [`RESUME.md`](RESUME.md). Dependency attribution,
 license status, and migration notes are in [`DEPENDENCIES.md`](DEPENDENCIES.md)

@@ -2,25 +2,28 @@ export const BRIDGE_SOURCE = 'videoops-comfy-bridge';
 export const BRIDGE_SCHEMA_VERSION = 1;
 export const BRIDGE_MAX_PAYLOAD_BYTES = 2 * 1024 * 1024;
 
+// The Studio iframe is the child. ComfyUI is the top-level parent. Keep this
+// list deliberately small: adding a message is a protocol change, not a UI
+// convenience.
 export const BRIDGE_MESSAGE_TYPES = Object.freeze([
-  'bridge.ready',
-  'bridge.error',
-  'workflow.exported',
-  'studio.context',
+  'panel.ready',
   'workflow.load',
-  'workflow.result',
+  'run.status',
+  'comfy.context',
+  'workflow.exported',
+  'bridge.error',
 ]);
 
 const CHILD_MESSAGE_TYPES = new Set([
-  'bridge.ready',
-  'bridge.error',
-  'workflow.exported',
+  'panel.ready',
+  'workflow.load',
+  'run.status',
 ]);
 
 const PARENT_MESSAGE_TYPES = new Set([
-  'studio.context',
-  'workflow.load',
-  'workflow.result',
+  'comfy.context',
+  'workflow.exported',
+  'bridge.error',
 ]);
 
 const BASE_FIELDS = new Set([
@@ -32,29 +35,20 @@ const BASE_FIELDS = new Set([
 ]);
 
 const MESSAGE_FIELDS = Object.freeze({
-  'bridge.ready': new Set([...BASE_FIELDS, 'frontendVersion']),
-  'bridge.error': new Set([...BASE_FIELDS, 'code']),
-  'workflow.exported': new Set([
-    ...BASE_FIELDS,
-    'editorGraph',
-    'apiGraph',
-    'frontendVersion',
-  ]),
-  'studio.context': new Set([...BASE_FIELDS, 'projectId', 'shotId']),
+  'panel.ready': new Set([...BASE_FIELDS]),
   'workflow.load': new Set([...BASE_FIELDS, 'editorGraph', 'revisionId']),
-  'workflow.result': new Set([
-    ...BASE_FIELDS,
-    'status',
-    'code',
-    'message',
-    'revisionId',
-    'attemptId',
-  ]),
+  'run.status': new Set([...BASE_FIELDS, 'runId', 'status', 'evaluation']),
+  'comfy.context': new Set([...BASE_FIELDS, 'frontendVersion']),
+  'workflow.exported': new Set([...BASE_FIELDS, 'editorGraph', 'apiGraph']),
+  'bridge.error': new Set([...BASE_FIELDS, 'code']),
 });
 
 const SAFE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const SAFE_CODE_PATTERN = /^[A-Z][A-Z0-9_.:-]{0,63}$/u;
 const MAX_TEXT_LENGTH = 256;
+const CREDENTIAL_KEY_PATTERN =
+  /(?:^|[-_])(authorization|cookie|token|secret|password|api[-_]?key|bearer|credential)s?$/iu;
+const BEARER_VALUE_PATTERN = /^Bearer\s+[A-Za-z0-9._~+/=-]{8,}$/u;
 
 export class BridgeProtocolError extends Error {
   constructor(code) {
@@ -184,6 +178,28 @@ function safeOrigin(value) {
   return parsed.origin;
 }
 
+function rejectCredentialFields(value, ancestors = new Set()) {
+  if (value === null || typeof value !== 'object') {
+    if (typeof value === 'string' && BEARER_VALUE_PATTERN.test(value)) {
+      reject('CREDENTIAL_FIELD_FORBIDDEN');
+    }
+    return;
+  }
+  if (ancestors.has(value)) reject('GRAPH_INVALID');
+  ancestors.add(value);
+  if (Array.isArray(value)) {
+    for (const item of value) rejectCredentialFields(item, ancestors);
+  } else {
+    for (const [key, item] of Object.entries(value)) {
+      if (CREDENTIAL_KEY_PATTERN.test(key)) {
+        reject('CREDENTIAL_FIELD_FORBIDDEN');
+      }
+      rejectCredentialFields(item, ancestors);
+    }
+  }
+  ancestors.delete(value);
+}
+
 function parseData(data, maxPayloadBytes) {
   if (typeof data === 'string') {
     if (utf8ByteLength(data) > maxPayloadBytes) {
@@ -196,14 +212,10 @@ function parseData(data, maxPayloadBytes) {
     }
   }
 
-  if (!isRecord(data)) {
-    reject('MESSAGE_INVALID');
-  }
-
+  if (!isRecord(data)) reject('MESSAGE_INVALID');
   if (bridgePayloadByteLength(data) > maxPayloadBytes) {
     reject('PAYLOAD_TOO_LARGE');
   }
-
   return data;
 }
 
@@ -214,8 +226,8 @@ function validateFields(message, type) {
   }
 }
 
-function validateGraph(value) {
-  if (!isJsonObject(value)) reject('GRAPH_INVALID');
+function validateGraph(value, code = 'GRAPH_INVALID') {
+  if (!isJsonObject(value)) reject(code);
   return value;
 }
 
@@ -255,12 +267,37 @@ export function validateBridgeMessage(data, options = {}) {
   }
 
   validateFields(message, message.type);
+  rejectCredentialFields(message);
 
   switch (message.type) {
-    case 'bridge.ready':
-      if (message.frontendVersion !== undefined) {
-        safeText(message.frontendVersion, 'FRONTEND_VERSION_INVALID');
+    case 'panel.ready':
+      break;
+    case 'workflow.load':
+      validateGraph(message.editorGraph, 'EDITOR_GRAPH_INVALID');
+      if (message.revisionId !== undefined) {
+        safeId(message.revisionId, 'REVISION_ID_INVALID');
       }
+      break;
+    case 'run.status':
+      safeId(message.runId, 'RUN_ID_INVALID');
+      safeText(message.status, 'RUN_STATUS_INVALID');
+      if (
+        message.evaluation !== undefined &&
+        typeof message.evaluation !== 'string' &&
+        !isJsonObject(message.evaluation)
+      ) {
+        reject('EVALUATION_INVALID');
+      }
+      if (typeof message.evaluation === 'string') {
+        safeText(message.evaluation, 'EVALUATION_INVALID');
+      }
+      break;
+    case 'comfy.context':
+      safeText(message.frontendVersion, 'FRONTEND_VERSION_INVALID');
+      break;
+    case 'workflow.exported':
+      validateGraph(message.editorGraph, 'EDITOR_GRAPH_INVALID');
+      validateGraph(message.apiGraph, 'API_GRAPH_INVALID');
       break;
     case 'bridge.error':
       if (
@@ -268,28 +305,6 @@ export function validateBridgeMessage(data, options = {}) {
         !SAFE_CODE_PATTERN.test(message.code)
       ) {
         reject('ERROR_CODE_INVALID');
-      }
-      break;
-    case 'workflow.exported':
-      validateGraph(message.editorGraph);
-      validateGraph(message.apiGraph);
-      safeText(message.frontendVersion, 'FRONTEND_VERSION_INVALID');
-      break;
-    case 'studio.context':
-      safeId(message.projectId, 'CONTEXT_INVALID');
-      safeId(message.shotId, 'CONTEXT_INVALID');
-      break;
-    case 'workflow.load':
-      validateGraph(message.editorGraph);
-      if (message.revisionId !== undefined) {
-        safeId(message.revisionId, 'REVISION_ID_INVALID');
-      }
-      break;
-    case 'workflow.result':
-      safeText(message.status, 'RESULT_STATUS_INVALID');
-      for (const key of ['code', 'message', 'revisionId', 'attemptId']) {
-        if (message[key] !== undefined)
-          safeText(message[key], 'RESULT_INVALID');
       }
       break;
     default:
@@ -342,6 +357,10 @@ export class BridgeMessageGuard {
     }
     return message;
   }
+
+  reset() {
+    this.seen.clear();
+  }
 }
 
 export function createBridgeMessage(type, fields, options) {
@@ -349,7 +368,7 @@ export function createBridgeMessage(type, fields, options) {
     source: BRIDGE_SOURCE,
     version: BRIDGE_SCHEMA_VERSION,
     type,
-    requestId: options.requestId ?? options.nonce,
+    requestId: options.requestId ?? makeRequestId('message'),
     nonce: options.nonce,
     ...fields,
   };
@@ -358,6 +377,13 @@ export function createBridgeMessage(type, fields, options) {
     expectedNonce: options.nonce,
     maxPayloadBytes: options.maxPayloadBytes,
   });
+}
+
+export function makeRequestId(prefix = 'message') {
+  const random =
+    globalThis.crypto?.randomUUID?.() ??
+    `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+  return `${prefix}-${random}`.slice(0, 128);
 }
 
 export function readManagedBridgeContext(locationLike, referrer = '') {
@@ -375,54 +401,47 @@ export function readManagedBridgeContext(locationLike, referrer = '') {
   const nonce = url.searchParams.get('nonce');
   if (typeof nonce !== 'string' || !SAFE_ID_PATTERN.test(nonce)) return null;
 
-  let parentOrigin = url.searchParams.get('parentOrigin');
-  if (!parentOrigin && referrer) {
+  // The embedder is whoever actually framed this document. It is the only
+  // trustworthy signal available in-page: the parentOrigin query parameter is
+  // chosen by that embedder and a hostile page can declare any value it likes.
+  // A declared value is therefore only ever used to corroborate the embedder,
+  // never to replace it. `frame-ancestors` on the Studio response remains the
+  // authoritative control; this is the in-page backstop.
+  let embedderOrigin = null;
+  if (referrer) {
     try {
-      parentOrigin = new URL(referrer).origin;
+      embedderOrigin = new URL(referrer).origin;
     } catch {
-      parentOrigin = null;
+      embedderOrigin = null;
     }
   }
-  if (!parentOrigin) return null;
 
+  const declaredOrigin = url.searchParams.get('parentOrigin');
+  let parentOrigin;
+  if (declaredOrigin) {
+    // Fail closed when the declaration cannot be corroborated, and when it
+    // disagrees with the real embedder.
+    if (!embedderOrigin) return null;
+    try {
+      if (safeOrigin(declaredOrigin) !== embedderOrigin) return null;
+    } catch {
+      return null;
+    }
+    parentOrigin = embedderOrigin;
+  } else {
+    parentOrigin = embedderOrigin;
+  }
+  if (!parentOrigin) return null;
   try {
     parentOrigin = safeOrigin(parentOrigin);
   } catch {
     return null;
   }
 
-  const projectId = url.searchParams.get('projectId') ?? undefined;
-  const shotId = url.searchParams.get('shotId') ?? undefined;
-  if (
-    (projectId !== undefined && !SAFE_ID_PATTERN.test(projectId)) ||
-    (shotId !== undefined && !SAFE_ID_PATTERN.test(shotId))
-  ) {
-    return null;
-  }
-
-  const frontendVersion = url.searchParams.get('frontendVersion') ?? 'unknown';
-  if (
-    frontendVersion.length === 0 ||
-    frontendVersion.length > MAX_TEXT_LENGTH
-  ) {
-    return null;
-  }
-
+  const frontendVersion = url.searchParams.get('frontendVersion');
   return {
     nonce,
     parentOrigin,
-    ...(projectId ? { projectId } : {}),
-    ...(shotId ? { shotId } : {}),
-    frontendVersion,
+    ...(frontendVersion ? { frontendVersion } : {}),
   };
-}
-
-export function makeRequestId(prefix = 'message') {
-  const cryptoObject = globalThis.crypto;
-  if (cryptoObject && typeof cryptoObject.randomUUID === 'function') {
-    return `${prefix}-${cryptoObject.randomUUID()}`;
-  }
-  return `${prefix}-${Date.now().toString(36)}-${Math.random()
-    .toString(36)
-    .slice(2)}`;
 }

@@ -95,6 +95,10 @@ export const DOMAIN_EVENT_TYPES = [
   'project.budget_denied',
   'orphan.event',
   'project.completed',
+  'run.created',
+  'run.pinned',
+  'run.unpinned',
+  'run.reviewed',
 ] as const;
 export type DomainEventType = (typeof DOMAIN_EVENT_TYPES)[number];
 
@@ -145,8 +149,10 @@ export interface VideoProject {
   readonly brief: string;
   readonly status: ProjectStatus;
   readonly targetDurationSeconds: number;
-  readonly budgetMicrousd: MicroUsd;
+  /** NULL means this project has no budget enforcement. */
+  readonly budgetMicrousd: MicroUsd | null;
   readonly spentMicrousd: MicroUsd;
+  readonly autoCreated?: boolean;
   readonly version: number;
   readonly createdAt: IsoUtcTimestamp;
   readonly updatedAt: IsoUtcTimestamp;
@@ -184,12 +190,23 @@ export interface StoryboardProposal {
   readonly updatedAt: IsoUtcTimestamp;
 }
 
-export type ShotOrdinal = 1 | 2 | 3;
+/**
+ * A shot's position within its project. Storyboard shots are always 1-3, which
+ * `assertStoryboardProposal` enforces separately; implicit graph-first run
+ * shots continue past 3, so the entity type is any positive integer.
+ */
+export type ShotOrdinal = number;
+
+/** A shot definition whose ordinal is not restricted to the storyboard range. */
+export type ShotDefinition = Omit<StoryboardShotDefinition, 'ordinal'> & {
+  readonly ordinal: ShotOrdinal;
+};
 
 export interface Shot {
   readonly id: Uuid;
   readonly projectId: Uuid;
-  readonly storyboardProposalId: Uuid;
+  /** Absent only for an implicit graph-first run shot. */
+  readonly storyboardProposalId?: Uuid;
   readonly ordinal: ShotOrdinal;
   readonly purpose: string;
   readonly prompt: string;
@@ -203,7 +220,11 @@ export interface Shot {
   readonly acceptanceCriteria?: readonly string[];
   readonly requiredAssetIds?: readonly string[];
   readonly status: ShotStatus;
+  /** Set only by human acceptance; counts toward project completion. */
   readonly acceptedAttemptId?: Uuid;
+  /** Which attempt of this run is the keeper. No preconditions, reversible. */
+  readonly pinnedAttemptId?: Uuid;
+  readonly implicit?: boolean;
   readonly version: number;
   readonly createdAt: IsoUtcTimestamp;
   readonly updatedAt: IsoUtcTimestamp;
@@ -233,6 +254,9 @@ export const ATTEMPT_FAILURE_CODES = [
   'ATTEMPT_LIMIT_REACHED',
 ] as const;
 export type AttemptFailureCode = (typeof ATTEMPT_FAILURE_CODES)[number];
+
+export const ATTEMPT_REVIEW_DECISIONS = ['accepted', 'rejected'] as const;
+export type AttemptReviewDecision = (typeof ATTEMPT_REVIEW_DECISIONS)[number];
 
 export interface GenerationAttempt {
   readonly id: Uuid;
@@ -264,6 +288,10 @@ export interface GenerationAttempt {
   readonly failureMessage?: string;
   readonly sourceAttemptId?: Uuid;
   readonly artifactId?: Uuid;
+  readonly reviewDecision?: AttemptReviewDecision;
+  readonly reviewNote?: string;
+  readonly reviewAuthor?: string;
+  readonly reviewedAt?: IsoUtcTimestamp;
   readonly version: number;
   readonly createdAt: IsoUtcTimestamp;
   readonly updatedAt: IsoUtcTimestamp;
@@ -606,9 +634,10 @@ export function addMicrousd(...values: readonly MicroUsd[]): MicroUsd {
 }
 
 export function subtractMicrousd(
-  minuend: MicroUsd,
+  minuend: MicroUsd | null,
   subtrahend: MicroUsd,
-): MicroUsd {
+): MicroUsd | null {
+  if (minuend === null) return null;
   if (subtrahend > minuend) {
     throw new DomainError(
       'NEGATIVE_MONEY',
@@ -618,7 +647,11 @@ export function subtractMicrousd(
   return assertMicrousd(minuend - subtrahend);
 }
 
-export function formatMicrousdToUsd(value: MicroUsd): string {
+export function formatMicrousdToUsd(value: null): null;
+export function formatMicrousdToUsd(value: MicroUsd): string;
+export function formatMicrousdToUsd(value: MicroUsd | null): string | null;
+export function formatMicrousdToUsd(value: MicroUsd | null): string | null {
+  if (value === null) return null;
   assertMicrousd(value);
   const whole = Math.floor(value / MICRO_USD_PER_USD);
   const fraction = String(value % MICRO_USD_PER_USD).padStart(6, '0');
@@ -645,9 +678,14 @@ function assertProject(project: VideoProject): void {
       'The project target duration must allow three positive-duration shots.',
     );
   }
-  assertMicrousd(project.budgetMicrousd);
+  if (project.budgetMicrousd !== null) {
+    assertMicrousd(project.budgetMicrousd);
+  }
   assertMicrousd(project.spentMicrousd);
-  if (project.spentMicrousd > project.budgetMicrousd) {
+  if (
+    project.budgetMicrousd !== null &&
+    project.spentMicrousd > project.budgetMicrousd
+  ) {
     throw new DomainError(
       'INVALID_PROJECT',
       'Project spend cannot exceed its budget.',
@@ -664,7 +702,7 @@ function assertProject(project: VideoProject): void {
   assertUtcTimestamp(project.updatedAt);
 }
 
-function assertShotDefinition(definition: StoryboardShotDefinition): void {
+function assertShotDefinition(definition: ShotDefinition): void {
   if (
     !isFiniteNumber(definition.durationSeconds) ||
     definition.durationSeconds <= 0
@@ -823,13 +861,29 @@ function assertShot(shot: Shot): void {
   parseShotStatus(shot.status);
   assertUuid(shot.id);
   assertUuid(shot.projectId);
-  assertUuid(shot.storyboardProposalId);
-  if (![1, 2, 3].includes(shot.ordinal)) {
-    throw new DomainError('INVALID_SHOT', 'Shot ordinal must be 1, 2, or 3.');
+  if (shot.storyboardProposalId !== undefined) {
+    assertUuid(shot.storyboardProposalId);
+  } else if (shot.implicit !== true) {
+    throw new DomainError(
+      'INVALID_SHOT',
+      'A non-implicit shot must identify its storyboard proposal.',
+    );
+  }
+  if (shot.implicit !== undefined && typeof shot.implicit !== 'boolean') {
+    throw new DomainError('INVALID_SHOT', 'Shot implicit marker is invalid.');
+  }
+  if (!Number.isInteger(shot.ordinal) || shot.ordinal < 1) {
+    throw new DomainError(
+      'INVALID_SHOT',
+      'Shot ordinal must be a positive integer.',
+    );
   }
   assertShotDefinition(shot);
   if (shot.acceptedAttemptId) {
     assertUuid(shot.acceptedAttemptId);
+  }
+  if (shot.pinnedAttemptId) {
+    assertUuid(shot.pinnedAttemptId);
   }
   assertSafeInteger(shot.version, 'INVALID_SHOT');
   if (shot.version < 1) {
@@ -939,6 +993,35 @@ function assertAttempt(attempt: GenerationAttempt): void {
   }
   assertUuidIfPresent(attempt.sourceAttemptId);
   assertUuidIfPresent(attempt.artifactId);
+  if (
+    attempt.reviewDecision !== undefined &&
+    !ATTEMPT_REVIEW_DECISIONS.includes(attempt.reviewDecision)
+  ) {
+    throw new DomainError(
+      'INVALID_ATTEMPT',
+      'Attempt review decision is unknown.',
+    );
+  }
+  if (
+    attempt.reviewNote !== undefined &&
+    (typeof attempt.reviewNote !== 'string' ||
+      attempt.reviewNote.length > 2_000)
+  ) {
+    throw new DomainError(
+      'INVALID_ATTEMPT',
+      'Attempt review notes must be bounded.',
+    );
+  }
+  if (
+    attempt.reviewAuthor !== undefined &&
+    (!attempt.reviewAuthor.trim() || attempt.reviewAuthor.length > 200)
+  ) {
+    throw new DomainError(
+      'INVALID_ATTEMPT',
+      'Attempt review authors must be bounded.',
+    );
+  }
+  assertIsoIfPresent(attempt.reviewedAt);
   assertIsoIfPresent(attempt.leaseExpiresAt);
   assertIsoIfPresent(attempt.submittedAt);
   assertIsoIfPresent(attempt.finishedAt);
@@ -1157,7 +1240,9 @@ export interface CreateProjectInput {
   readonly title: string;
   readonly brief: string;
   readonly targetDurationSeconds: number;
-  readonly budgetMicrousd: MicroUsd;
+  readonly budgetMicrousd: MicroUsd | null;
+  readonly status?: ProjectStatus;
+  readonly autoCreated?: boolean;
   readonly now: IsoUtcTimestamp;
 }
 
@@ -1182,10 +1267,14 @@ export function createVideoProject(input: CreateProjectInput): VideoProject {
     tenantId: input.tenantId,
     title: input.title.trim(),
     brief: input.brief.trim(),
-    status: 'draft',
+    status: input.status ?? 'draft',
     targetDurationSeconds: input.targetDurationSeconds,
-    budgetMicrousd: assertMicrousd(input.budgetMicrousd),
+    budgetMicrousd:
+      input.budgetMicrousd === null
+        ? null
+        : assertMicrousd(input.budgetMicrousd),
     spentMicrousd: assertMicrousd(0),
+    ...(input.autoCreated ? { autoCreated: true } : {}),
     version: 1,
     createdAt: input.now,
     updatedAt: input.now,
@@ -1240,8 +1329,9 @@ export function createStoryboardProposal(
 export interface CreateShotInput {
   readonly id: Uuid;
   readonly projectId: Uuid;
-  readonly storyboardProposalId: Uuid;
-  readonly definition: StoryboardShotDefinition;
+  readonly storyboardProposalId?: Uuid;
+  readonly implicit?: boolean;
+  readonly definition: ShotDefinition;
   readonly now: IsoUtcTimestamp;
 }
 
@@ -1249,7 +1339,9 @@ export function createShot(input: CreateShotInput): Shot {
   const shot: Shot = {
     id: input.id,
     projectId: input.projectId,
-    storyboardProposalId: input.storyboardProposalId,
+    ...(input.storyboardProposalId
+      ? { storyboardProposalId: input.storyboardProposalId }
+      : {}),
     ordinal: input.definition.ordinal,
     purpose: input.definition.purpose,
     prompt: input.definition.prompt,
@@ -1257,6 +1349,7 @@ export function createShot(input: CreateShotInput): Shot {
     mode: input.definition.mode,
     qualityTier: input.definition.qualityTier,
     status: 'approved_for_generation',
+    ...(input.implicit ? { implicit: true } : {}),
     ...(input.definition.visualDescription !== undefined
       ? { visualDescription: input.definition.visualDescription }
       : {}),

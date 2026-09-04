@@ -160,9 +160,9 @@ export interface ProjectToolView {
   readonly brief: string;
   readonly status: VideoProject['status'];
   readonly targetDurationSeconds: number;
-  readonly budgetMicrousd: number;
+  readonly budgetMicrousd: number | null;
   readonly spentMicrousd: number;
-  readonly remainingMicrousd: number;
+  readonly remainingMicrousd: number | null;
 }
 
 export interface StoryboardToolView {
@@ -780,9 +780,9 @@ export type OperationalToolName = (typeof OPERATIONAL_TOOL_NAMES)[number];
 export interface OperationalProjectToolView {
   readonly id: Uuid;
   readonly status: VideoProject['status'];
-  readonly budgetMicrousd: number;
+  readonly budgetMicrousd: number | null;
   readonly spentMicrousd: number;
-  readonly remainingMicrousd: number;
+  readonly remainingMicrousd: number | null;
 }
 
 export interface OperationalShotToolView {

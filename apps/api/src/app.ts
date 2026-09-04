@@ -13,10 +13,12 @@ import {
   formatMicrousdToUsd,
   assertMicrousd,
   parseUsdToMicrousd,
+  subtractMicrousd,
   systemClock,
   systemIdGenerator,
   toIsoUtc,
   type Clock,
+  type ArtifactRecord,
   type DomainEvent,
   type EvaluationResult,
   type GenerationAttempt,
@@ -26,6 +28,7 @@ import {
   type StoryboardProposal,
   type Uuid,
   type VideoProject,
+  isGenerationAttemptStatus,
 } from '@h3/domain';
 import {
   checkDatabaseReady,
@@ -77,6 +80,7 @@ import {
   GenerationApplicationService,
   GenerationApplicationError,
   GenerationWorker,
+  PREVIEW_DURATION_SECONDS,
   type CreateAttemptCommand,
   type CreateManagedAttemptCommand,
   type RetryAttemptCommand,
@@ -262,6 +266,26 @@ const recommendationActionBodySchema = z
   // persisted recommendation is the only source of truth for the operation.
   .passthrough();
 
+const runBodySchema = z
+  .object({
+    editorGraph: z.unknown(),
+    apiGraph: z.unknown(),
+    label: z.string().trim().min(1).max(200).optional(),
+    projectId: z.string().uuid().optional(),
+    profileId: z.string().trim().min(1).max(128).optional(),
+    idempotencyKey: z.string().trim().min(1).max(200).optional(),
+    // Accepted for compatibility with graph clients, but deliberately ignored.
+    executionHash: z.string().optional(),
+  })
+  .strict();
+
+const runReviewBodySchema = z
+  .object({
+    decision: z.enum(['accepted', 'rejected']),
+    note: z.string().max(2_000).optional(),
+  })
+  .strict();
+
 type CreateAttemptBody = z.infer<typeof createAttemptBodySchema>;
 type RejectAttemptBody = z.infer<typeof rejectAttemptBodySchema>;
 type WorkflowDraftBody = z.infer<typeof workflowDraftBodySchema>;
@@ -269,9 +293,101 @@ type WorkflowRevisionBody = z.infer<typeof workflowRevisionBodySchema>;
 type ManagedAttemptBody = z.infer<typeof managedAttemptBodySchema>;
 type RetryAttemptBody = z.infer<typeof retryAttemptBodySchema>;
 type RecommendationActionBody = z.infer<typeof recommendationActionBodySchema>;
+type RunBody = z.infer<typeof runBodySchema>;
+type RunReviewBody = z.infer<typeof runReviewBodySchema>;
 
 type CreateProjectBody = z.infer<typeof createProjectBodySchema>;
 type ApproveStoryboardBody = z.infer<typeof approveStoryboardBodySchema>;
+
+export interface WorkflowRunMetadata {
+  readonly prompt: string;
+  readonly durationSeconds: number;
+}
+
+const DIRECT_RUN_PLACEHOLDER = 'Direct workflow submission.';
+
+function positiveNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0
+    ? value
+    : undefined;
+}
+
+function normalizedKey(value: string): string {
+  return value.replace(/[^a-z0-9]/gi, '').toLowerCase();
+}
+
+/** Derives only safe grouping metadata; introspection failures do not reject a run. */
+export function deriveWorkflowRunMetadata(
+  apiGraph: unknown,
+): WorkflowRunMetadata {
+  const promptKeys = new Set([
+    'text',
+    'prompt',
+    'positive',
+    'positiveprompt',
+    'positive_prompt',
+    'positiveprompttext',
+  ]);
+  const frameKeys = new Set([
+    'frames',
+    'framecount',
+    'numframes',
+    'videolength',
+    'length',
+    'durationframes',
+  ]);
+  const fpsKeys = new Set(['fps', 'framerate', 'framespersecond']);
+  let prompt: string | undefined;
+  let explicitDuration: number | undefined;
+  let frameCount: number | undefined;
+  let fps: number | undefined;
+  const visit = (value: unknown): void => {
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item);
+      return;
+    }
+    if (typeof value !== 'object' || value === null) return;
+    for (const [key, child] of Object.entries(value)) {
+      const normalized = normalizedKey(key);
+      if (
+        prompt === undefined &&
+        promptKeys.has(normalized) &&
+        typeof child === 'string' &&
+        child.trim()
+      ) {
+        prompt = child.trim().slice(0, 20_000);
+      }
+      const number = positiveNumber(child);
+      if (number !== undefined) {
+        if (normalized === 'durationseconds' || normalized === 'duration') {
+          explicitDuration ??= number;
+        } else if (frameKeys.has(normalized)) {
+          frameCount ??= number;
+        } else if (fpsKeys.has(normalized)) {
+          fps ??= number;
+        }
+      }
+      visit(child);
+    }
+  };
+  visit(apiGraph);
+  const derivedDuration =
+    explicitDuration ??
+    (frameCount !== undefined && fps !== undefined
+      ? frameCount / fps
+      : undefined);
+  const durationSeconds =
+    derivedDuration !== undefined &&
+    Number.isFinite(derivedDuration) &&
+    derivedDuration >= 3 &&
+    derivedDuration <= 3_600
+      ? derivedDuration
+      : PREVIEW_DURATION_SECONDS;
+  return {
+    prompt: prompt ?? DIRECT_RUN_PLACEHOLDER,
+    durationSeconds,
+  };
+}
 
 const projectJsonSchema = {
   type: 'object',
@@ -295,13 +411,14 @@ const projectJsonSchema = {
     brief: { type: 'string' },
     status: { type: 'string' },
     targetDurationSeconds: { type: 'number' },
-    budgetMicrousd: { type: 'integer' },
-    budgetUsd: { type: 'string' },
+    budgetMicrousd: { anyOf: [{ type: 'integer' }, { type: 'null' }] },
+    budgetUsd: { anyOf: [{ type: 'string' }, { type: 'null' }] },
     spentMicrousd: { type: 'integer' },
     spentUsd: { type: 'string' },
     version: { type: 'integer' },
     createdAt: { type: 'string', format: 'date-time' },
     updatedAt: { type: 'string', format: 'date-time' },
+    autoCreated: { type: 'boolean' },
   },
 } as const;
 
@@ -310,7 +427,6 @@ const shotJsonSchema = {
   required: [
     'id',
     'projectId',
-    'storyboardProposalId',
     'ordinal',
     'purpose',
     'prompt',
@@ -343,6 +459,7 @@ const shotJsonSchema = {
     },
     status: { type: 'string' },
     acceptedAttemptId: { type: 'string', format: 'uuid' },
+    implicit: { type: 'boolean' },
     version: { type: 'integer' },
     createdAt: { type: 'string', format: 'date-time' },
     updatedAt: { type: 'string', format: 'date-time' },
@@ -493,6 +610,10 @@ const attemptJsonSchema = {
     failureMessage: { type: 'string' },
     sourceAttemptId: { type: 'string', format: 'uuid' },
     artifactId: { type: 'string', format: 'uuid' },
+    reviewDecision: { type: 'string', enum: ['accepted', 'rejected'] },
+    reviewNote: { type: 'string' },
+    reviewAuthor: { type: 'string' },
+    reviewedAt: { type: 'string', format: 'date-time' },
     version: { type: 'integer' },
     createdAt: { type: 'string', format: 'date-time' },
     updatedAt: { type: 'string', format: 'date-time' },
@@ -542,7 +663,7 @@ function requestHash(operation: string, body: unknown): string {
 }
 
 function projectResponse(project: VideoProject): Record<string, unknown> {
-  return {
+  const response: Record<string, unknown> = {
     id: project.id,
     tenantId: project.tenantId,
     title: project.title,
@@ -557,6 +678,8 @@ function projectResponse(project: VideoProject): Record<string, unknown> {
     createdAt: project.createdAt,
     updatedAt: project.updatedAt,
   };
+  if (project.autoCreated) response.autoCreated = true;
+  return response;
 }
 
 function proposalResponse(
@@ -584,7 +707,6 @@ function shotResponse(shot: Shot): Record<string, unknown> {
   const response: Record<string, unknown> = {
     id: shot.id,
     projectId: shot.projectId,
-    storyboardProposalId: shot.storyboardProposalId,
     ordinal: shot.ordinal,
     purpose: shot.purpose,
     prompt: shot.prompt,
@@ -596,6 +718,9 @@ function shotResponse(shot: Shot): Record<string, unknown> {
     createdAt: shot.createdAt,
     updatedAt: shot.updatedAt,
   };
+  if (shot.storyboardProposalId) {
+    response.storyboardProposalId = shot.storyboardProposalId;
+  }
   for (const key of [
     'visualDescription',
     'cameraDirection',
@@ -610,6 +735,7 @@ function shotResponse(shot: Shot): Record<string, unknown> {
   if (shot.acceptedAttemptId) {
     response.acceptedAttemptId = shot.acceptedAttemptId;
   }
+  if (shot.implicit) response.implicit = true;
   return response;
 }
 
@@ -650,6 +776,10 @@ function attemptResponse(attempt: GenerationAttempt): Record<string, unknown> {
     ['failureMessage', attempt.failureMessage],
     ['sourceAttemptId', attempt.sourceAttemptId],
     ['artifactId', attempt.artifactId],
+    ['reviewDecision', attempt.reviewDecision],
+    ['reviewNote', attempt.reviewNote],
+    ['reviewAuthor', attempt.reviewAuthor],
+    ['reviewedAt', attempt.reviewedAt],
   ];
   for (const [key, value] of optional) {
     if (value !== undefined) response[key] = value;
@@ -669,6 +799,208 @@ function evaluationResponse(result: EvaluationResult): Record<string, unknown> {
     checks: result.checks,
     details: result.details,
     evaluatedAt: result.evaluatedAt,
+  };
+}
+
+interface RunAggregate {
+  readonly attempt: GenerationAttempt;
+  readonly project: VideoProject;
+  readonly revision: WorkflowRevisionRecord | null;
+  readonly artifact: ArtifactRecord | null;
+  readonly evaluation: EvaluationResult | null;
+  readonly pinned: boolean;
+  readonly events: readonly DomainEvent[];
+}
+
+function runAttemptResponse(
+  attempt: GenerationAttempt,
+): Record<string, unknown> {
+  const response = attemptResponse(attempt);
+  delete response.shotId;
+  return response;
+}
+
+function runRevisionResponse(
+  revision: WorkflowRevisionRecord | null,
+): Record<string, unknown> | null {
+  if (!revision) return null;
+  const response = workflowRevisionResponse(revision);
+  delete response.shotId;
+  return response;
+}
+
+function runArtifactResponse(
+  artifact: ArtifactRecord | null,
+): Record<string, unknown> | null {
+  if (!artifact) return null;
+  return {
+    id: artifact.id,
+    tenantId: artifact.tenantId,
+    projectId: artifact.projectId,
+    attemptId: artifact.attemptId,
+    objectKey: artifact.objectKey,
+    mimeType: artifact.mimeType,
+    byteSize: artifact.byteSize,
+    sha256: artifact.sha256,
+    createdAt: artifact.createdAt,
+  };
+}
+
+function runEvaluationResponse(
+  evaluation: EvaluationResult | null,
+): Record<string, unknown> | null {
+  if (!evaluation) return null;
+  const response = evaluationResponse(evaluation);
+  delete response.shotId;
+  return response;
+}
+
+function runReviewResponse(
+  attempt: GenerationAttempt,
+): Record<string, unknown> | null {
+  if (!attempt.reviewDecision) return null;
+  return {
+    decision: attempt.reviewDecision,
+    ...(attempt.reviewNote !== undefined ? { note: attempt.reviewNote } : {}),
+    ...(attempt.reviewAuthor !== undefined
+      ? { author: attempt.reviewAuthor }
+      : {}),
+    ...(attempt.reviewedAt ? { reviewedAt: attempt.reviewedAt } : {}),
+  };
+}
+
+function runEventResponse(event: DomainEvent): Record<string, unknown> {
+  const response = eventResponse(event);
+  delete response.shotId;
+  return response;
+}
+
+function runResponse(run: RunAggregate): Record<string, unknown> {
+  const budget = run.project.budgetMicrousd;
+  const remaining = subtractMicrousd(budget, run.project.spentMicrousd);
+  return {
+    runId: run.attempt.id,
+    projectId: run.project.id,
+    revisionId: run.revision?.id ?? run.attempt.workflowRevisionId ?? null,
+    executionHash: run.revision?.executionHash ?? run.attempt.workflowHash,
+    status: run.attempt.status,
+    validation: run.revision
+      ? {
+          status: run.revision.validationStatus,
+          errors: run.revision.validationErrorsJson,
+        }
+      : { status: 'not-recorded', errors: [] },
+    attempt: runAttemptResponse(run.attempt),
+    revision: runRevisionResponse(run.revision),
+    artifact: runArtifactResponse(run.artifact),
+    evaluation: runEvaluationResponse(run.evaluation),
+    evaluationStatus: run.evaluation?.status ?? 'not-run',
+    cost: {
+      estimatedCostMicrousd: run.attempt.estimatedCostMicrousd,
+      estimatedCostUsd: formatMicrousdToUsd(run.attempt.estimatedCostMicrousd),
+      projectBudgetMicrousd: budget,
+      projectBudgetUsd: formatMicrousdToUsd(budget),
+      projectSpentMicrousd: run.project.spentMicrousd,
+      projectSpentUsd: formatMicrousdToUsd(run.project.spentMicrousd),
+      projectRemainingMicrousd: remaining,
+      projectRemainingUsd: formatMicrousdToUsd(remaining),
+    },
+    review: runReviewResponse(run.attempt),
+    pinned: run.pinned,
+    project: projectResponse(run.project),
+    events: run.events.map(runEventResponse),
+  };
+}
+
+/**
+ * Per-request memo for lookups that repeat across the runs of one project.
+ * Without it, aggregating a page of N runs re-reads the same project row, shot
+ * rows, and the entire project event log N times.
+ */
+interface RunLookupCache {
+  readonly projects: Map<string, VideoProject | null>;
+  readonly shots: Map<string, Shot | null>;
+  readonly events: Map<string, readonly DomainEvent[]>;
+}
+
+function createRunLookupCache(): RunLookupCache {
+  return { projects: new Map(), shots: new Map(), events: new Map() };
+}
+
+async function memoize<T>(
+  cache: Map<string, T> | undefined,
+  key: string,
+  load: () => Promise<T>,
+): Promise<T> {
+  if (!cache) return load();
+  const cached = cache.get(key);
+  if (cached !== undefined) return cached;
+  const value = await load();
+  cache.set(key, value);
+  return value;
+}
+
+async function loadRunAggregate(
+  repositories: Repositories,
+  tenantId: Uuid,
+  attemptId: Uuid,
+  cache?: RunLookupCache,
+): Promise<RunAggregate | null> {
+  const attempt = await repositories.attempts.findById(tenantId, attemptId);
+  if (!attempt) return null;
+  const project = await memoize(cache?.projects, attempt.projectId, () =>
+    repositories.projects.findById(tenantId, attempt.projectId),
+  );
+  const shot = await memoize(
+    cache?.shots,
+    `${attempt.projectId}:${attempt.shotId}`,
+    () => repositories.shots.findById(attempt.projectId, attempt.shotId),
+  );
+  if (!project || !shot) return null;
+  const revision = attempt.workflowRevisionId
+    ? await repositories.workflowRevisions.findById(
+        tenantId,
+        attempt.projectId,
+        attempt.shotId,
+        attempt.workflowRevisionId,
+      )
+    : null;
+  const artifact = await repositories.artifacts.findByAttempt(
+    tenantId,
+    attempt.id,
+  );
+  const evaluation = await repositories.evaluations.findByAttempt(
+    tenantId,
+    attempt.id,
+  );
+  const revisionId = revision?.id;
+  const projectEvents = await memoize(cache?.events, project.id, () =>
+    repositories.events.listByProject(project.id),
+  );
+  const events = projectEvents
+    .filter((event) => {
+      const payload = event.payload;
+      return (
+        event.attemptId === attempt.id ||
+        event.shotId === shot.id ||
+        payload.runId === attempt.id ||
+        (revisionId !== undefined &&
+          (payload.revisionId === revisionId ||
+            payload.workflowRevisionId === revisionId)) ||
+        (project.autoCreated === true && event.type === 'project.created')
+      );
+    })
+    .sort(
+      (left, right) => (left.eventSequence ?? 0) - (right.eventSequence ?? 0),
+    );
+  return {
+    attempt,
+    project,
+    revision,
+    artifact,
+    evaluation,
+    pinned: shot.pinnedAttemptId === attempt.id,
+    events,
   };
 }
 
@@ -864,6 +1196,13 @@ const SSE_PAYLOAD_KEYS = new Set([
   'acceptedShotCount',
   'shotCount',
   'ordinal',
+  'runId',
+  'projectId',
+  'revisionId',
+  'executionHash',
+  'autoCreatedProject',
+  'evaluationStatusAtPin',
+  'decision',
 ]);
 
 function sanitizedEventSummary(event: DomainEvent): Record<string, unknown> {
@@ -964,6 +1303,7 @@ function resourceParam(
   name:
     | 'shotId'
     | 'attemptId'
+    | 'runId'
     | 'artifactId'
     | 'revisionId'
     | 'recommendationId',
@@ -1139,8 +1479,9 @@ function headerValue(
   return typeof value === 'string' ? value : undefined;
 }
 
-function idempotencyKey(request: FastifyRequest): string {
-  const key = headerValue(request, 'idempotency-key')?.trim();
+function idempotencyKey(request: FastifyRequest, fallback?: string): string {
+  const key =
+    headerValue(request, 'idempotency-key')?.trim() ?? fallback?.trim();
   if (!key) {
     throw new HttpProblemError(
       'IDEMPOTENCY_KEY_REQUIRED',
@@ -1171,8 +1512,9 @@ async function executeIdempotent(
   operation: string,
   body: unknown,
   mutation: (repositories: Repositories) => Promise<IdempotentResponse>,
+  keyOverride?: string,
 ): Promise<IdempotentResponse> {
-  const key = idempotencyKey(request);
+  const key = idempotencyKey(request, keyOverride);
   const hash = requestHash(operation, body);
   return service.withTransaction(async (repositories) => {
     const reservation = await repositories.idempotency.reserve(
@@ -1270,6 +1612,53 @@ async function executeAsyncIdempotent(
   }
 }
 
+function queryValue(request: FastifyRequest, name: string): string | undefined {
+  const query = request.query as Record<string, unknown> | undefined;
+  const value = query?.[name];
+  if (value === undefined) return undefined;
+  if (typeof value !== 'string' || value.length > 200) {
+    throw new HttpProblemError(
+      'INVALID_QUERY',
+      `The ${name} query parameter is invalid.`,
+      422,
+      false,
+    );
+  }
+  return value;
+}
+
+function queryBoolean(
+  request: FastifyRequest,
+  name: string,
+): boolean | undefined {
+  const value = queryValue(request, name);
+  if (value === undefined) return undefined;
+  if (value === 'true') return true;
+  if (value === 'false') return false;
+  throw new HttpProblemError(
+    'INVALID_QUERY',
+    `${name} must be true or false.`,
+    422,
+    false,
+  );
+}
+
+function queryLimit(request: FastifyRequest): number {
+  const query = request.query as Record<string, unknown> | undefined;
+  const raw = query?.limit;
+  if (raw === undefined) return 50;
+  const limit = typeof raw === 'number' ? raw : Number(raw);
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+    throw new HttpProblemError(
+      'INVALID_QUERY',
+      'limit must be an integer between 1 and 100.',
+      422,
+      false,
+    );
+  }
+  return limit;
+}
+
 function problemTitle(code: string): string {
   return code
     .toLowerCase()
@@ -1297,6 +1686,25 @@ function requestOperationName(request: FastifyRequest): string {
   if (request.method === 'POST' && path === '/v1/projects') {
     return 'project.create';
   }
+  if (request.method === 'POST' && path === '/v1/runs') {
+    return 'run.create';
+  }
+  if (
+    request.method === 'POST' &&
+    (path.endsWith('/pin') || path.endsWith('/review'))
+  ) {
+    return path.endsWith('/pin') ? 'run.pin' : 'run.review';
+  }
+  if (request.method === 'DELETE' && path.endsWith('/pin')) {
+    return 'run.unpin';
+  }
+  if (
+    request.method === 'GET' &&
+    (path === '/v1/runs' || path.match(/^\/v1\/runs\/[^/]+$/))
+  ) {
+    return 'run.read';
+  }
+  if (path === '/v1/events/stream') return 'sse.replay';
   if (request.method === 'POST' && path.endsWith('/plan')) {
     return 'agent.plan';
   }
@@ -1469,6 +1877,30 @@ function baseRouteSchemas() {
     },
   } as const;
   return {
+    runResponse: {
+      type: 'object',
+      required: [
+        'runId',
+        'projectId',
+        'revisionId',
+        'executionHash',
+        'status',
+        'validation',
+      ],
+      additionalProperties: true,
+    },
+    runsResponse: {
+      type: 'object',
+      required: ['runs'],
+      properties: {
+        runs: {
+          type: 'array',
+          items: { type: 'object', additionalProperties: true },
+        },
+        nextSince: { type: 'string' },
+      },
+      additionalProperties: true,
+    },
     projectResponse: {
       type: 'object',
       properties: { project: projectJsonSchema },
@@ -1506,12 +1938,12 @@ function baseRouteSchemas() {
     costResponse: {
       type: 'object',
       properties: {
-        budgetMicrousd: { type: 'integer' },
-        budgetUsd: { type: 'string' },
+        budgetMicrousd: { anyOf: [{ type: 'integer' }, { type: 'null' }] },
+        budgetUsd: { anyOf: [{ type: 'string' }, { type: 'null' }] },
         spentMicrousd: { type: 'integer' },
         spentUsd: { type: 'string' },
-        remainingMicrousd: { type: 'integer' },
-        remainingUsd: { type: 'string' },
+        remainingMicrousd: { anyOf: [{ type: 'integer' }, { type: 'null' }] },
+        remainingUsd: { anyOf: [{ type: 'string' }, { type: 'null' }] },
       },
     },
     attemptResponse: {
@@ -1801,6 +2233,22 @@ export function buildApiApp(options: ApiAppOptions = {}): FastifyInstance {
     requestIdHeader: 'x-request-id',
   });
 
+  app.addHook('onRoute', (routeOptions) => {
+    const url = routeOptions.url;
+    const legacyRoute =
+      url === '/v1/projects' ||
+      url.startsWith('/v1/projects/') ||
+      url.startsWith('/v1/shots/') ||
+      url.startsWith('/v1/attempts/');
+    if (!legacyRoute) {
+      return;
+    }
+    routeOptions.schema = {
+      ...(routeOptions.schema ?? {}),
+      deprecated: true,
+    };
+  });
+
   void app.register(cors, {
     origin: config.webOrigin,
     methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
@@ -2009,6 +2457,687 @@ export function buildApiApp(options: ApiAppOptions = {}): FastifyInstance {
             queueRunning: queue.running,
           },
         };
+      },
+    );
+
+    routes.post(
+      '/v1/runs',
+      {
+        schema: {
+          tags: ['generation'],
+          summary: 'Submit a graph-first durable run',
+          body: {
+            type: 'object',
+            required: ['editorGraph', 'apiGraph'],
+            properties: {
+              editorGraph: { type: 'object', additionalProperties: true },
+              apiGraph: { type: 'object', additionalProperties: true },
+              label: { type: 'string', minLength: 1, maxLength: 200 },
+              projectId: { type: 'string', format: 'uuid' },
+              profileId: { type: 'string', minLength: 1, maxLength: 128 },
+              idempotencyKey: { type: 'string', minLength: 1, maxLength: 200 },
+              executionHash: { type: 'string' },
+            },
+            additionalProperties: false,
+          },
+          response: { 201: schemas.runResponse, 422: schemas.runResponse },
+        },
+      },
+      async (request, reply) => {
+        const body = parseBody(runBodySchema, request.body) as RunBody;
+        const suppliedHeaderKey = headerValue(
+          request,
+          'idempotency-key',
+        )?.trim();
+        if (
+          suppliedHeaderKey &&
+          body.idempotencyKey &&
+          suppliedHeaderKey !== body.idempotencyKey
+        ) {
+          throw new HttpProblemError(
+            'IDEMPOTENCY_KEY_CONFLICT',
+            'The Idempotency-Key header and body value must match.',
+            422,
+            false,
+          );
+        }
+        const key = idempotencyKey(request, body.idempotencyKey);
+        const projectId = body.projectId
+          ? bodyUuid(body.projectId, 'projectId')
+          : undefined;
+        const traceId = traceIdFor(request);
+        const metadata = deriveWorkflowRunMetadata(body.apiGraph);
+        const directMutationKey = (suffix: string): string =>
+          createHash('sha256')
+            .update(`run:${key}:${suffix}`, 'utf8')
+            .digest('hex');
+        let budgetDenialScope:
+          | { readonly projectId: Uuid; readonly shotId: Uuid }
+          | undefined;
+        await service.withTransaction((repositories) =>
+          repositories.tenants.ensure(
+            service.tenantId,
+            'Development tenant',
+            toIsoUtc(clock.now()),
+          ),
+        );
+        let response: IdempotentResponse;
+        try {
+          response = await executeIdempotent(
+            request,
+            service,
+            'run.create',
+            body,
+            async (repositories) => {
+              let project: VideoProject;
+              if (projectId) {
+                const existing = await repositories.projects.findById(
+                  service.tenantId,
+                  projectId,
+                );
+                if (!existing) {
+                  throw new HttpProblemError(
+                    'PROJECT_NOT_FOUND',
+                    'The requested project was not found.',
+                    404,
+                    false,
+                  );
+                }
+                project = existing;
+              } else {
+                const now = toIsoUtc(clock.now());
+                project = await service.createProjectInTransaction(
+                  repositories,
+                  {
+                    title: body.label ?? `Run ${now}`,
+                    brief: 'Direct workflow submission.',
+                    targetDurationSeconds: metadata.durationSeconds,
+                    budgetMicrousd: null,
+                    initialStatus: 'ready_for_generation',
+                    autoCreated: true,
+                    traceId,
+                  },
+                );
+              }
+              project = await service.prepareDirectRunProjectInTransaction(
+                repositories,
+                project.id,
+                traceId,
+              );
+              const shot = await service.createImplicitShotInTransaction(
+                repositories,
+                project.id,
+                {
+                  purpose: body.label ?? 'Direct run',
+                  prompt: metadata.prompt,
+                  durationSeconds: metadata.durationSeconds,
+                  traceId,
+                },
+              );
+              budgetDenialScope = { projectId: project.id, shotId: shot.id };
+              const draft =
+                await workflowService.saveWorkflowDraftInTransaction(
+                  repositories,
+                  project.id,
+                  shot.id,
+                  {
+                    idempotencyKey: directMutationKey('draft'),
+                    editorGraphJson: body.editorGraph as WorkflowGraph,
+                    lastApiGraphJson: body.apiGraph as WorkflowGraph,
+                    ...(body.profileId ? { profileId: body.profileId } : {}),
+                    authorType: 'direct_run',
+                    authorId: 'direct-run',
+                    traceId,
+                  },
+                );
+              const revisionResult =
+                await workflowService.createWorkflowRevisionInTransaction(
+                  repositories,
+                  project.id,
+                  shot.id,
+                  {
+                    idempotencyKey: directMutationKey('revision'),
+                    editorGraphJson: body.editorGraph as WorkflowGraph,
+                    apiGraphJson: body.apiGraph as WorkflowGraph,
+                    ...(body.profileId ? { profileId: body.profileId } : {}),
+                    source: 'comfy_editor',
+                    authorType: 'direct_run',
+                    authorId: 'direct-run',
+                    traceId,
+                  },
+                );
+              const revision = revisionResult.revision;
+              if (revisionResult.validation.errors.length > 0) {
+                return {
+                  status: 422,
+                  body: {
+                    runId: null,
+                    projectId: project.id,
+                    revisionId: revision.id,
+                    executionHash: revision.executionHash,
+                    status: 'invalid',
+                    validation: {
+                      status: revision.validationStatus,
+                      errors: revision.validationErrorsJson,
+                    },
+                  },
+                };
+              }
+              const attempt =
+                await generationService.createManagedAttemptInTransaction(
+                  repositories,
+                  project.id,
+                  shot.id,
+                  {
+                    idempotencyKey: directMutationKey('attempt'),
+                    workflowRevisionId: revision.id,
+                    traceId,
+                  },
+                );
+              await generationService.appendEvent(repositories, {
+                type: 'run.created',
+                projectId: project.id,
+                shotId: shot.id,
+                attemptId: attempt.id,
+                traceId,
+                payload: {
+                  runId: attempt.id,
+                  projectId: project.id,
+                  revisionId: revision.id,
+                  executionHash: revision.executionHash,
+                  autoCreatedProject: project.autoCreated === true,
+                },
+              });
+              // Keep the draft in scope for auditability even though the response
+              // intentionally exposes only the run-level records.
+              void draft;
+              return {
+                status: 201,
+                body: {
+                  runId: attempt.id,
+                  projectId: project.id,
+                  revisionId: revision.id,
+                  executionHash: revision.executionHash,
+                  status: attempt.status,
+                  validation: {
+                    status: revision.validationStatus,
+                    errors: revision.validationErrorsJson,
+                  },
+                },
+              };
+            },
+            key,
+          );
+        } catch (error) {
+          if (
+            error instanceof GenerationApplicationError &&
+            error.code === 'BUDGET_EXCEEDED' &&
+            budgetDenialScope
+          ) {
+            await generationService.recordBudgetDenialAfterRollback(
+              budgetDenialScope.projectId,
+              budgetDenialScope.shotId,
+              traceId,
+            );
+          }
+          throw error;
+        }
+        return reply.code(response.status as 201 | 422).send(response.body);
+      },
+    );
+
+    routes.get(
+      '/v1/runs',
+      {
+        schema: {
+          tags: ['generation'],
+          summary: 'List denormalized graph-first runs',
+          querystring: {
+            type: 'object',
+            properties: {
+              status: { type: 'string' },
+              reviewed: { type: 'string', enum: ['true', 'false'] },
+              pinned: { type: 'string', enum: ['true', 'false'] },
+              evaluation: {
+                type: 'string',
+                enum: ['passed', 'failed', 'not-run'],
+              },
+              projectId: { type: 'string', format: 'uuid' },
+              since: { type: 'string', maxLength: 200 },
+              limit: { type: 'integer', minimum: 1, maximum: 100 },
+            },
+            additionalProperties: false,
+          },
+          response: { 200: schemas.runsResponse },
+        },
+      },
+      async (request) => {
+        const status = queryValue(request, 'status');
+        if (status && !isGenerationAttemptStatus(status)) {
+          throw new HttpProblemError(
+            'INVALID_QUERY',
+            'status is not a recognized run lifecycle status.',
+            422,
+            false,
+          );
+        }
+        const evaluation = queryValue(request, 'evaluation');
+        if (
+          evaluation !== undefined &&
+          evaluation !== 'passed' &&
+          evaluation !== 'failed' &&
+          evaluation !== 'not-run'
+        ) {
+          throw new HttpProblemError(
+            'INVALID_QUERY',
+            'evaluation must be passed, failed, or not-run.',
+            422,
+            false,
+          );
+        }
+        const projectFilter = queryValue(request, 'projectId');
+        let projectIdFilter: Uuid | undefined;
+        if (projectFilter !== undefined) {
+          try {
+            projectIdFilter = assertProjectUuid(projectFilter);
+          } catch {
+            throw new HttpProblemError(
+              'INVALID_QUERY',
+              'projectId is invalid.',
+              422,
+              false,
+            );
+          }
+        }
+        const reviewed = queryBoolean(request, 'reviewed');
+        const pinned = queryBoolean(request, 'pinned');
+        const limit = queryLimit(request);
+        const since = queryValue(request, 'since');
+        // Ordering, filtering and pagination all run against attempt rows,
+        // which already carry status, review decision and creation time. Only
+        // the requested page is then expanded into a full aggregate, so the
+        // request cost tracks `limit` rather than the tenant's whole history.
+        const { pageRuns, hasMore } = await service.withTransaction(
+          async (repositories) => {
+            const projects = projectIdFilter
+              ? ([
+                  await repositories.projects.findById(
+                    service.tenantId,
+                    projectIdFilter,
+                  ),
+                ].filter(Boolean) as VideoProject[])
+              : await repositories.projects.listByTenant(service.tenantId);
+
+            const candidates: GenerationAttempt[] = [];
+            const pinnedAttemptIds = new Set<string>();
+            for (const project of projects) {
+              if (pinned !== undefined) {
+                for (const shot of await repositories.shots.listByProject(
+                  project.id,
+                )) {
+                  if (shot.pinnedAttemptId) {
+                    pinnedAttemptIds.add(shot.pinnedAttemptId);
+                  }
+                }
+              }
+              candidates.push(
+                ...(await repositories.attempts.listByProject(
+                  service.tenantId,
+                  project.id,
+                )),
+              );
+            }
+
+            let ordered = candidates
+              .filter((attempt) => {
+                if (status && attempt.status !== status) return false;
+                if (
+                  reviewed !== undefined &&
+                  (attempt.reviewDecision !== undefined) !== reviewed
+                ) {
+                  return false;
+                }
+                if (
+                  pinned !== undefined &&
+                  pinnedAttemptIds.has(attempt.id) !== pinned
+                ) {
+                  return false;
+                }
+                return true;
+              })
+              .sort(
+                (left, right) =>
+                  right.createdAt.localeCompare(left.createdAt) ||
+                  right.id.localeCompare(left.id),
+              );
+
+            if (since !== undefined) {
+              const cursorIndex = ordered.findIndex(
+                (attempt) => attempt.id === since,
+              );
+              if (cursorIndex >= 0) {
+                ordered = ordered.slice(cursorIndex + 1);
+              } else {
+                const sinceTime = Date.parse(since);
+                if (!Number.isFinite(sinceTime)) {
+                  throw new HttpProblemError(
+                    'INVALID_QUERY',
+                    'since must be a run cursor or ISO timestamp.',
+                    422,
+                    false,
+                  );
+                }
+                ordered = ordered.filter(
+                  (attempt) => Date.parse(attempt.createdAt) < sinceTime,
+                );
+              }
+            }
+
+            // Expand lazily: the evaluation filter needs the aggregate, so keep
+            // pulling candidates until the page is full or they run out.
+            const cache = createRunLookupCache();
+            const collected: RunAggregate[] = [];
+            for (const attempt of ordered) {
+              if (collected.length > limit) break;
+              const aggregate = await loadRunAggregate(
+                repositories,
+                service.tenantId,
+                attempt.id,
+                cache,
+              );
+              if (!aggregate) continue;
+              if (
+                evaluation &&
+                (aggregate.evaluation?.status ?? 'not-run') !== evaluation
+              ) {
+                continue;
+              }
+              collected.push(aggregate);
+            }
+            return {
+              pageRuns: collected.slice(0, limit),
+              hasMore: collected.length > limit,
+            };
+          },
+        );
+        return {
+          runs: pageRuns.map(runResponse),
+          ...(hasMore && pageRuns.length > 0
+            ? { nextSince: pageRuns[pageRuns.length - 1]?.attempt.id }
+            : {}),
+        };
+      },
+    );
+
+    routes.get(
+      '/v1/runs/:runId',
+      {
+        schema: {
+          tags: ['generation'],
+          summary: 'Get one fully denormalized graph-first run',
+          params: {
+            type: 'object',
+            required: ['runId'],
+            properties: { runId: { type: 'string', format: 'uuid' } },
+          },
+          response: { 200: schemas.runResponse },
+        },
+      },
+      async (request) => {
+        const runId = resourceParam(request, 'runId');
+        const aggregate = await service.withTransaction((repositories) =>
+          loadRunAggregate(repositories, service.tenantId, runId),
+        );
+        if (!aggregate) {
+          throw new HttpProblemError(
+            'RUN_NOT_FOUND',
+            'The requested run was not found.',
+            404,
+            false,
+          );
+        }
+        return runResponse(aggregate);
+      },
+    );
+
+    routes.post(
+      '/v1/runs/:runId/pin',
+      {
+        schema: {
+          tags: ['generation'],
+          summary: 'Pin a run as the keeper without lifecycle gates',
+          params: {
+            type: 'object',
+            required: ['runId'],
+            properties: { runId: { type: 'string', format: 'uuid' } },
+          },
+          response: { 200: schemas.runResponse },
+        },
+      },
+      async (request, reply) => {
+        const runId = resourceParam(request, 'runId');
+        const response = await executeIdempotent(
+          request,
+          service,
+          `run.pin:${runId}`,
+          {},
+          async (repositories) => {
+            await generationService.pinAttemptInTransaction(
+              repositories,
+              runId,
+            );
+            const aggregate = await loadRunAggregate(
+              repositories,
+              service.tenantId,
+              runId,
+            );
+            if (!aggregate) {
+              throw new HttpProblemError(
+                'RUN_NOT_FOUND',
+                'The requested run was not found.',
+                404,
+                false,
+              );
+            }
+            return { status: 200, body: runResponse(aggregate) };
+          },
+        );
+        return reply.code(response.status as 200).send(response.body);
+      },
+    );
+
+    routes.delete(
+      '/v1/runs/:runId/pin',
+      {
+        schema: {
+          tags: ['generation'],
+          summary: 'Unpin a run without lifecycle gates',
+          params: {
+            type: 'object',
+            required: ['runId'],
+            properties: { runId: { type: 'string', format: 'uuid' } },
+          },
+          response: { 200: schemas.runResponse },
+        },
+      },
+      async (request, reply) => {
+        const runId = resourceParam(request, 'runId');
+        const response = await executeIdempotent(
+          request,
+          service,
+          `run.unpin:${runId}`,
+          {},
+          async (repositories) => {
+            await generationService.unpinAttemptInTransaction(
+              repositories,
+              runId,
+            );
+            const aggregate = await loadRunAggregate(
+              repositories,
+              service.tenantId,
+              runId,
+            );
+            if (!aggregate) {
+              throw new HttpProblemError(
+                'RUN_NOT_FOUND',
+                'The requested run was not found.',
+                404,
+                false,
+              );
+            }
+            return { status: 200, body: runResponse(aggregate) };
+          },
+        );
+        return reply.code(response.status as 200).send(response.body);
+      },
+    );
+
+    routes.post(
+      '/v1/runs/:runId/review',
+      {
+        schema: {
+          tags: ['generation'],
+          summary: 'Annotate a run review without changing lifecycle status',
+          params: {
+            type: 'object',
+            required: ['runId'],
+            properties: { runId: { type: 'string', format: 'uuid' } },
+          },
+          body: {
+            type: 'object',
+            required: ['decision'],
+            properties: {
+              decision: { type: 'string', enum: ['accepted', 'rejected'] },
+              note: { type: 'string', maxLength: 2_000 },
+            },
+            additionalProperties: false,
+          },
+          response: { 200: schemas.runResponse },
+        },
+      },
+      async (request, reply) => {
+        const runId = resourceParam(request, 'runId');
+        const body = parseBody(
+          runReviewBodySchema,
+          request.body,
+        ) as RunReviewBody;
+        const rawAuthor = headerValue(request, 'x-operator-id')?.trim();
+        const author = rawAuthor || 'development-user';
+        if (author.length > 200) {
+          throw new HttpProblemError(
+            'INVALID_REVIEW_AUTHOR',
+            'The review author is too long.',
+            422,
+            false,
+          );
+        }
+        const response = await executeIdempotent(
+          request,
+          service,
+          `run.review:${runId}`,
+          body,
+          async (repositories) => {
+            await generationService.reviewAttemptInTransaction(
+              repositories,
+              runId,
+              body.decision,
+              body.note?.trim() || null,
+              author,
+            );
+            const aggregate = await loadRunAggregate(
+              repositories,
+              service.tenantId,
+              runId,
+            );
+            if (!aggregate) {
+              throw new HttpProblemError(
+                'RUN_NOT_FOUND',
+                'The requested run was not found.',
+                404,
+                false,
+              );
+            }
+            return { status: 200, body: runResponse(aggregate) };
+          },
+        );
+        return reply.code(response.status as 200).send(response.body);
+      },
+    );
+
+    routes.get(
+      '/v1/events/stream',
+      {
+        schema: {
+          tags: ['generation'],
+          summary: 'Replay tenant-scoped run events over SSE',
+        },
+      },
+      async (request, reply) => {
+        safeMetric(() => metrics.set('video_sse_connections', {}, 1));
+        const rawLastEventId = headerValue(request, 'last-event-id');
+        let lastEventId = 0;
+        if (rawLastEventId !== undefined) {
+          if (!/^\d+$/.test(rawLastEventId.trim())) {
+            throw new HttpProblemError(
+              'INVALID_LAST_EVENT_ID',
+              'Last-Event-ID must be a durable numeric event sequence.',
+              400,
+              false,
+            );
+          }
+          lastEventId = Number(rawLastEventId);
+          if (!Number.isSafeInteger(lastEventId)) {
+            throw new HttpProblemError(
+              'INVALID_LAST_EVENT_ID',
+              'Last-Event-ID is outside the supported sequence range.',
+              400,
+              false,
+            );
+          }
+        }
+        const events = await service.withTransaction(async (repositories) => {
+          const projects = await repositories.projects.listByTenant(
+            service.tenantId,
+          );
+          const values: DomainEvent[] = [];
+          for (const project of projects) {
+            values.push(
+              ...(await repositories.events.listByProject(project.id)),
+            );
+          }
+          return values.sort(
+            (left, right) =>
+              (left.eventSequence ?? 0) - (right.eventSequence ?? 0),
+          );
+        });
+        const frames = events
+          .map((event, index) => ({
+            event,
+            sequence: event.eventSequence ?? index + 1,
+          }))
+          .filter(({ sequence }) => sequence > lastEventId)
+          .map(
+            ({ event, sequence }) =>
+              `id: ${sequence}\nevent: ${event.type}\ndata: ${JSON.stringify(
+                (() => {
+                  const summary = sanitizedEventSummary(event);
+                  delete summary.shotId;
+                  return summary;
+                })(),
+              )}\n\n`,
+          )
+          .join('');
+        const response = reply
+          .code(200)
+          .headers({
+            'cache-control': 'no-cache, no-transform',
+            connection: 'keep-alive',
+            'content-type': 'text/event-stream; charset=utf-8',
+            'x-content-type-options': 'nosniff',
+          })
+          .send(`${frames}: heartbeat\n\n`);
+        safeMetric(() => metrics.set('video_sse_connections', {}, 0));
+        return response;
       },
     );
 

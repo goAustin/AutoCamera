@@ -33,6 +33,7 @@ const commonEnvironment = {
   API_HOST: '127.0.0.1',
   API_PORT: String(apiPort),
   WEB_ORIGIN: webOrigin,
+  VIDEOOPS_STUDIO_ORIGIN: webOrigin,
   FAKE_COMFY_HOST: '127.0.0.1',
   FAKE_COMFY_PORT: String(fakeComfyPort),
   WEB_HOST: '127.0.0.1',

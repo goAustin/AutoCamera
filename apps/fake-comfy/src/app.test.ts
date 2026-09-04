@@ -2,6 +2,7 @@ import { EventEmitter } from 'node:events';
 import { afterEach, describe, expect, it } from 'vitest';
 import { getFakeComfyConfig } from '@h3/config';
 import {
+  computeComfyCapabilityFingerprint,
   DeterministicFakeComfyService,
   HttpWsComfyClient,
 } from '@h3/comfy-client';
@@ -35,6 +36,10 @@ describe('fake ComfyUI shell', () => {
     expect(systemStats.json().system.comfyui_version).toBe('0.0.1-fake');
     expect(objectInfo.statusCode).toBe(200);
     expect(objectInfo.json()).not.toHaveProperty('nodes');
+    expect(Object.keys(objectInfo.json())).toHaveLength(613);
+    expect(objectInfo.json().UNETLoader.input.required.unet_name[0]).toEqual([
+      'minimax_h3_fl2va_pruned_int8_convrot.safetensors',
+    ]);
     expect(Object.keys(objectInfo.json())).toEqual(
       expect.arrayContaining([
         'UNETLoader',
@@ -52,6 +57,67 @@ describe('fake ComfyUI shell', () => {
         'SaveVideo',
       ]),
     );
+    const apiObjectInfo = await app.inject({
+      method: 'GET',
+      url: '/api/object_info',
+    });
+    expect(apiObjectInfo.statusCode).toBe(200);
+    expect(apiObjectInfo.json()).toEqual(objectInfo.json());
+    expect(computeComfyCapabilityFingerprint(objectInfo.json())).toBe(
+      '4da7d9759f98506d8f8ac52e802e17fabe7917e8a058df1c3c325bde8390d90e',
+    );
+  });
+
+  it('returns an actionable 503 when the ignored frontend build is absent', async () => {
+    app = buildFakeComfyApp({
+      config: getFakeComfyConfig({ NODE_ENV: 'test', LOG_LEVEL: 'silent' }),
+      frontendRoot: '.data/phase-7b-frontend-not-present',
+    });
+
+    const response = await app.inject({ method: 'GET', url: '/' });
+    expect(response.statusCode).toBe(503);
+    expect(response.body).toContain('pnpm comfy:frontend');
+    expect(response.body).toContain('.data/comfy-frontend/');
+    expect(
+      (await app.inject({ method: 'GET', url: '/health' })).statusCode,
+    ).toBe(200);
+    expect(
+      (await app.inject({ method: 'GET', url: '/api/object_info' })).statusCode,
+    ).toBe(200);
+  });
+
+  it('exposes only the VideoOps browser extension and keeps browser queueing disabled', async () => {
+    app = buildFakeComfyApp({
+      config: getFakeComfyConfig({ NODE_ENV: 'test', LOG_LEVEL: 'silent' }),
+    });
+    const extensions = await app.inject({
+      method: 'GET',
+      url: '/extensions',
+    });
+    expect(extensions.statusCode).toBe(200);
+    expect(extensions.json()).toEqual([
+      '/extensions/comfyui-videoops/web/videoops.js',
+    ]);
+
+    const extension = await app.inject({
+      method: 'GET',
+      url: '/extensions/comfyui-videoops/web/videoops.js',
+    });
+    expect(extension.statusCode).toBe(200);
+    expect(extension.body).toContain('Managed Run');
+    expect(extension.body).not.toContain('authorization');
+
+    const browserQueue = await app.inject({
+      method: 'POST',
+      url: '/prompt',
+      headers: {
+        origin: 'http://127.0.0.1:38188',
+        'content-type': 'application/json',
+      },
+      payload: { prompt: {} },
+    });
+    expect(browserQueue.statusCode).toBe(405);
+    expect(browserQueue.json()).toEqual({ error: 'browser queue disabled' });
   });
 
   it('keeps health public and protects the executor protocol with a bearer token', async () => {

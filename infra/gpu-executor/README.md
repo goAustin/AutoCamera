@@ -35,7 +35,7 @@ Use the appropriate vendor-supported PyTorch wheel when the requirements file
 does not select it for the host CUDA version. Record the Python, CUDA, GPU,
 PyTorch, and ComfyUI commit in the deployment evidence.
 
-## 2. Install the VideoOps browser bridge
+## 2. Install the VideoOps browser plugin
 
 Copy only the frontend-only integration package from the checked-out VideoOps
 source tree into ComfyUI's custom-node directory. This package has no Python
@@ -54,11 +54,12 @@ install -m 0644 "$VIDEOOPS_ROOT/integrations/comfyui-videoops/web/videoops.js" \
   "$COMFY_ROOT/custom_nodes/comfyui-videoops/web/videoops.js"
 ```
 
-Restart ComfyUI after installing the bridge. The browser-facing route must
-load the pinned frontend and the extension from this custom-node directory.
-Open it only as a Project Studio iframe with a fresh nonce and an exact
-`parentOrigin`; do not append a bearer token, private executor URL, or model
-path to the iframe URL.
+Restart ComfyUI after installing the plugin. The browser-facing route must load
+the pinned frontend and the extension from this custom-node directory. ComfyUI
+is the top-level graph shell; the plugin embeds a Studio-origin iframe with a
+fresh nonce and exact `parentOrigin`. The VideoOps bearer token is held only by
+that Studio iframe and must never enter the ComfyUI origin. Do not append a
+bearer token, private executor URL, or model path to the iframe URL.
 
 ## 3. Place models and persist executor data
 
@@ -109,7 +110,9 @@ COMFY_REQUEST_TIMEOUT_MS=15000
 The `COMFY_AUTH_TOKEN` value belongs only to the VideoOps worker and gateway.
 Do not put it in an iframe URL, browser JavaScript, logs, traces, or the
 public `/v1/executor` response. The browser receives only the safe
-`COMFY_FRONTEND_URL` route from that response.
+`COMFY_FRONTEND_URL` route from that response. The separate VideoOps bearer
+token likewise remains in the Studio origin and is never copied into ComfyUI
+storage, globals, DOM, or bridge messages.
 
 Run the pinned executor using the host's approved CUDA launch options, for
 example:
@@ -192,7 +195,7 @@ configure an exact origin allowlist for CORS and bridge messages, preserve the
 authenticated WebSocket gateway, and keep the private worker route on the
 internal network.
 
-## 6. Verify readiness, bridge loading, and the live protocol
+## 6. Verify readiness, plugin loading, and the live protocol
 
 From the private worker network, verify the safe readiness surface and record
 the results without recording tokens, raw model paths, prompts, or output
@@ -212,16 +215,22 @@ curl --fail --silent --show-error \
 
 Check that `/object_info` contains the required H3 node classes and exact
 loader choices from `pin-manifest.json`. In an authenticated browser session,
-open the `/comfy/` route inside Project Studio with a fresh nonce and verify:
+open the `/comfy/` route as the top-level shell with a fresh nonce and verify:
 
 1. the pinned frontend loads without a direct private hostname;
-2. the bridge sends `bridge.ready` to the exact Project Studio origin;
-3. **Generate managed** produces one `workflow.exported` message containing
-   both `workflow`-derived editor data and `output`-derived API data;
-4. no bearer token, private URL, raw filesystem path, or graph payload appears
-   in the browser console or network URL;
+2. the plugin creates a Studio-origin iframe and receives `panel.ready` from
+   the exact child window before sending `comfy.context`;
+3. **Managed Run** calls public `graphToPrompt()` and produces one
+   `workflow.exported` message containing both editor and API graph data;
+4. the Studio child alone calls VideoOps, while no VideoOps bearer token,
+   private URL, raw filesystem path, or credential appears in the ComfyUI
+   origin, console, or network URL;
 5. browser `POST /comfy/prompt`, queue mutation, and interrupt requests return
-   the gateway's denial response.
+   the gateway's denial response;
+6. the Studio child sends `run.status` back to the plugin for the read-only
+   topbar/bottom-panel feed. The pinned frontend has no supported queue
+   interception API, so native controls are disabled and no queue internals are
+   patched.
 
 From the VideoOps checkout, run the opt-in live contract check only when this
 private pinned executor is available:

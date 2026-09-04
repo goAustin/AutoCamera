@@ -29,7 +29,8 @@ const resume = await requiredText('RESUME.md');
 const changelog = await requiredText('CHANGELOG.md');
 
 for (const phrase of [
-  'Phase 6 complete',
+  'Phase 7C complete',
+  'Phase 7B complete',
   'Offline fake',
   'Phase 8',
   'Project Studio',
@@ -38,9 +39,13 @@ for (const phrase of [
   'MiniMax H3',
   'Pi',
   'pnpm demo:seed',
+  'pnpm comfy:frontend',
+  '@comfy-frontend',
   'pnpm test:e2e',
   'pnpm observability:up',
   'pnpm security:scan',
+  'ComfyUI-first',
+  'token isolation',
 ]) {
   if (!readme.includes(phrase)) {
     throw new Error(`README is missing required release language: ${phrase}`);
@@ -79,6 +84,9 @@ for (const phrase of [
   'secret review',
   'demo-project',
   'h3-videoops-phase6',
+  'pinned ComfyUI editor',
+  'H3 inference',
+  '@comfy-frontend',
 ]) {
   if (!evidence.toLowerCase().includes(phrase.toLowerCase())) {
     throw new Error(`Evidence manifest is missing: ${phrase}`);
@@ -130,10 +138,35 @@ for (const name of screenshotNames) {
   }
 }
 
+const editorScreenshotNames = [
+  'comfy-frontend/01-editor-loaded.png',
+  'comfy-frontend/02-h3-template-open.png',
+  'comfy-frontend/03-graph-to-prompt.png',
+];
+for (const name of editorScreenshotNames) {
+  const path = `assets/screenshots/${name}`;
+  if (!(await exists(path))) throw new Error(`Screenshot is missing: ${path}`);
+  if (!readme.includes(name)) {
+    throw new Error(`README does not reference screenshot: ${name}`);
+  }
+}
+
+const inversionScreenshotNames = [
+  'comfy-frontend/04-videoops-sidebar.png',
+  'comfy-frontend/05-videoops-managed-run.png',
+];
+for (const name of inversionScreenshotNames) {
+  const path = `assets/screenshots/${name}`;
+  if (!(await exists(path))) throw new Error(`Screenshot is missing: ${path}`);
+  if (!evidence.includes(name)) {
+    throw new Error(`Evidence manifest does not reference screenshot: ${name}`);
+  }
+}
+
 if (readme.includes('Phase 5 local implementation in progress')) {
   throw new Error('README still contains bootstrap-era Phase 5 status.');
 }
 
 console.log(
-  `PASS documentation: release docs, ${screenshotNames.length} offline screenshots, and status language validated.`,
+  `PASS documentation: release docs, ${screenshotNames.length} offline screenshots, ${editorScreenshotNames.length} editor screenshots, and status language validated.`,
 );

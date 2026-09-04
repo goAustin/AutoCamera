@@ -11,6 +11,7 @@ import {
   transitionShot,
   type ArtifactRecord,
   type AttemptFailureCode,
+  type AttemptReviewDecision,
   type Clock,
   type DomainEvent,
   type EvaluationResult,
@@ -84,6 +85,7 @@ export type GenerationApplicationErrorCode =
   | 'WORKFLOW_REVISION_INVALID'
   | 'SUBMISSION_UNCERTAIN'
   | 'INVALID_REVIEW_REASON'
+  | 'INVALID_REVIEW_DECISION'
   | 'PERSISTENCE_UNAVAILABLE'
   | 'GENERATION_FAILED';
 
@@ -133,6 +135,17 @@ export interface AttemptReviewResult {
   readonly project: VideoProject;
 }
 
+export interface RunPinResult {
+  readonly attempt: GenerationAttempt;
+  readonly shot: Shot;
+  readonly project: VideoProject;
+  readonly evaluationStatusAtPin: 'passed' | 'failed' | 'not-run';
+}
+
+export interface RunReviewResult {
+  readonly attempt: GenerationAttempt;
+}
+
 export interface GenerationApplicationServiceOptions {
   readonly store: TransactionalStore;
   readonly comfyClient?: ComfyClient;
@@ -155,6 +168,23 @@ function updatedAt<Value extends { readonly updatedAt: IsoUtcTimestamp }>(
   clock: Clock,
 ): Value {
   return { ...value, updatedAt: toIsoUtc(clock.now()) };
+}
+
+/**
+ * Stamp a record that is being persisted outside a status transition.
+ * `shots.update` writes `shot.version` while matching `expectedVersion`, so an
+ * update that does not bump the version freezes it and lets two concurrent
+ * writers both satisfy the optimistic-locking predicate. `transition()` bumps
+ * for status changes; annotation-only writes must use this.
+ */
+function revise<
+  Value extends { readonly updatedAt: IsoUtcTimestamp; readonly version: number },
+>(value: Value, clock: Clock): Value {
+  return {
+    ...value,
+    version: value.version + 1,
+    updatedAt: toIsoUtc(clock.now()),
+  };
 }
 
 function clearLease(attempt: GenerationAttempt): GenerationAttempt {
@@ -637,7 +667,7 @@ export class GenerationApplicationService {
       project.spentMicrousd,
       this.estimatedAttemptCostMicrousd,
     );
-    if (nextSpend > project.budgetMicrousd) {
+    if (project.budgetMicrousd !== null && nextSpend > project.budgetMicrousd) {
       await this.appendEvent(repositories, {
         type: 'project.budget_denied',
         projectId: project.id,
@@ -723,6 +753,37 @@ export class GenerationApplicationService {
     return attempt;
   }
 
+  /**
+   * Budget denial is detected inside the caller's transaction, which rolls
+   * back the attempted run graph. Preserve the denial fact in a follow-up
+   * transaction so the project timeline remains truthful without retaining a
+   * partial attempt or shot.
+   */
+  async recordBudgetDenialAfterRollback(
+    projectId: Uuid,
+    shotId: Uuid,
+    traceId?: string,
+  ): Promise<void> {
+    await this.store.withTransaction(async (repositories) => {
+      const project = await repositories.projects.findById(
+        this.tenantId,
+        projectId,
+      );
+      if (!project) return;
+      const shot = await repositories.shots.findById(projectId, shotId);
+      await this.appendEvent(repositories, {
+        type: 'project.budget_denied',
+        projectId,
+        ...(shot ? { shotId } : {}),
+        ...(traceId ? { traceId } : {}),
+        payload: {
+          reason: 'budget',
+          estimatedCostMicrousd: this.estimatedAttemptCostMicrousd,
+        },
+      });
+    });
+  }
+
   async createAttemptInTransaction(
     repositories: Repositories,
     shotId: Uuid,
@@ -779,7 +840,7 @@ export class GenerationApplicationService {
       project.spentMicrousd,
       this.estimatedAttemptCostMicrousd,
     );
-    if (nextSpend > project.budgetMicrousd) {
+    if (project.budgetMicrousd !== null && nextSpend > project.budgetMicrousd) {
       await this.appendEvent(repositories, {
         type: 'project.budget_denied',
         projectId: project.id,
@@ -904,6 +965,127 @@ export class GenerationApplicationService {
     });
   }
 
+  async pinAttemptInTransaction(
+    repositories: Repositories,
+    attemptId: Uuid,
+  ): Promise<RunPinResult> {
+    const attempt = await this.requireAttempt(repositories, attemptId);
+    const shot = await repositories.shots.findById(
+      attempt.projectId,
+      attempt.shotId,
+    );
+    const project = await repositories.projects.findById(
+      this.tenantId,
+      attempt.projectId,
+    );
+    if (!shot || !project) {
+      throw new GenerationApplicationError(
+        'ATTEMPT_NOT_FOUND',
+        'The attempt parent record was not found.',
+        404,
+      );
+    }
+    const evaluation = await repositories.evaluations.findByAttempt(
+      this.tenantId,
+      attemptId,
+    );
+    const evaluationStatusAtPin = evaluation?.status ?? 'not-run';
+    // Pinning marks the keeper. It must not touch `acceptedAttemptId`, which
+    // records human acceptance and is what project completion counts.
+    const pinnedShot = revise(
+      { ...shot, pinnedAttemptId: attempt.id },
+      this.clock,
+    );
+    const persistedShot = await repositories.shots.update(
+      pinnedShot,
+      shot.version,
+    );
+    await this.appendEvent(repositories, {
+      type: 'run.pinned',
+      projectId: project.id,
+      shotId: shot.id,
+      attemptId: attempt.id,
+      payload: {
+        runId: attempt.id,
+        evaluationStatusAtPin,
+      },
+    });
+    return {
+      attempt,
+      shot: persistedShot,
+      project,
+      evaluationStatusAtPin,
+    };
+  }
+
+  async unpinAttemptInTransaction(
+    repositories: Repositories,
+    attemptId: Uuid,
+  ): Promise<{ readonly attempt: GenerationAttempt; readonly shot: Shot }> {
+    const attempt = await this.requireAttempt(repositories, attemptId);
+    const shot = await repositories.shots.findById(
+      attempt.projectId,
+      attempt.shotId,
+    );
+    if (!shot) {
+      throw new GenerationApplicationError(
+        'ATTEMPT_NOT_FOUND',
+        'The attempt parent shot was not found.',
+        404,
+      );
+    }
+    let persistedShot = shot;
+    if (shot.pinnedAttemptId === attempt.id) {
+      const { pinnedAttemptId: _pinnedAttemptId, ...withoutPin } = shot;
+      persistedShot = await repositories.shots.update(
+        revise(withoutPin, this.clock),
+        shot.version,
+      );
+      await this.appendEvent(repositories, {
+        type: 'run.unpinned',
+        projectId: attempt.projectId,
+        shotId: shot.id,
+        attemptId: attempt.id,
+        payload: { runId: attempt.id },
+      });
+    }
+    return { attempt, shot: persistedShot };
+  }
+
+  async reviewAttemptInTransaction(
+    repositories: Repositories,
+    attemptId: Uuid,
+    decision: AttemptReviewDecision,
+    note: string | null,
+    author: string,
+  ): Promise<RunReviewResult> {
+    if (decision !== 'accepted' && decision !== 'rejected') {
+      throw new GenerationApplicationError(
+        'INVALID_REVIEW_DECISION',
+        'The run review decision is invalid.',
+        422,
+      );
+    }
+    const attempt = await this.requireAttempt(repositories, attemptId);
+    const reviewedAt = toIsoUtc(this.clock.now());
+    const reviewed = await repositories.attempts.review(
+      this.tenantId,
+      attempt.id,
+      decision,
+      note,
+      author,
+      reviewedAt,
+    );
+    await this.appendEvent(repositories, {
+      type: 'run.reviewed',
+      projectId: attempt.projectId,
+      shotId: attempt.shotId,
+      attemptId: attempt.id,
+      payload: { runId: attempt.id, decision },
+    });
+    return { attempt: reviewed };
+  }
+
   async acceptAttempt(attemptId: Uuid): Promise<AttemptReviewResult> {
     return this.store.withTransaction((repositories) =>
       this.acceptAttemptInTransaction(repositories, attemptId),
@@ -962,7 +1144,10 @@ export class GenerationApplicationService {
       updatedAt(transitionGenerationAttempt(attempt, 'accepted'), this.clock),
     );
     const acceptedShot = updatedAt(
-      transitionShot({ ...shot, acceptedAttemptId: attempt.id }, 'accepted'),
+      transitionShot(
+        { ...shot, acceptedAttemptId: attempt.id, pinnedAttemptId: attempt.id },
+        'accepted',
+      ),
       this.clock,
     );
     const shots = await repositories.shots.listByProject(project.id);
@@ -1475,7 +1660,11 @@ export class GenerationWorker {
       if (isTerminalGenerationAttempt(loadedAttempt.status)) return;
       let attempt = loadedAttempt;
       const project = await this.currentProject(attempt.projectId);
-      if (!project || project.spentMicrousd > project.budgetMicrousd) {
+      if (
+        !project ||
+        (project.budgetMicrousd !== null &&
+          project.spentMicrousd > project.budgetMicrousd)
+      ) {
         await this.failAttempt(
           claimed.id,
           'failed',

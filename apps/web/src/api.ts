@@ -221,6 +221,58 @@ export interface Cost {
   readonly remainingUsd: string;
 }
 
+export interface RunCost {
+  readonly estimatedCostMicrousd: number;
+  readonly estimatedCostUsd: string;
+  readonly projectBudgetMicrousd: number | null;
+  readonly projectBudgetUsd: string | null;
+  readonly projectSpentMicrousd: number;
+  readonly projectSpentUsd: string;
+  readonly projectRemainingMicrousd: number | null;
+  readonly projectRemainingUsd: string | null;
+}
+
+export interface RunReview {
+  readonly decision: 'accepted' | 'rejected';
+  readonly note?: string;
+  readonly author?: string;
+  readonly reviewedAt?: string;
+}
+
+export interface RunRecord {
+  readonly runId: string;
+  readonly projectId: string;
+  readonly revisionId: string | null;
+  readonly executionHash: string;
+  readonly status: string;
+  readonly validation: {
+    readonly status: string;
+    readonly errors: readonly WorkflowValidationError[];
+  };
+  readonly attempt: Omit<Attempt, 'shotId'>;
+  readonly revision: Omit<WorkflowRevision, 'shotId'> | null;
+  readonly artifact: Record<string, unknown> | null;
+  readonly evaluation: Evaluation | null;
+  readonly evaluationStatus: 'passed' | 'failed' | 'not-run';
+  readonly cost: RunCost;
+  readonly review: RunReview | null;
+  readonly pinned: boolean;
+  readonly project: Project;
+  readonly events: readonly ProjectEvent[];
+}
+
+export interface CreateRunResponse {
+  readonly runId: string | null;
+  readonly projectId: string;
+  readonly revisionId: string;
+  readonly executionHash: string;
+  readonly status: string;
+  readonly validation: {
+    readonly status: string;
+    readonly errors: readonly WorkflowValidationError[];
+  };
+}
+
 export interface ProjectEvent {
   readonly id: string;
   readonly eventSequence?: number;
@@ -448,6 +500,87 @@ export function approveStoryboard(
 
 export function getExecutor(token: string): Promise<ExecutorInfo> {
   return request(token, '/v1/executor');
+}
+
+export function listRuns(
+  token: string,
+  filters: {
+    readonly status?: string;
+    readonly reviewed?: boolean;
+    readonly pinned?: boolean;
+    readonly evaluation?: 'passed' | 'failed' | 'not-run';
+    readonly projectId?: string;
+    readonly since?: string;
+    readonly limit?: number;
+  } = {},
+): Promise<{
+  readonly runs: readonly RunRecord[];
+  readonly nextSince?: string;
+}> {
+  const query = new URLSearchParams();
+  if (filters.status) query.set('status', filters.status);
+  if (filters.reviewed !== undefined)
+    query.set('reviewed', String(filters.reviewed));
+  if (filters.pinned !== undefined) query.set('pinned', String(filters.pinned));
+  if (filters.evaluation) query.set('evaluation', filters.evaluation);
+  if (filters.projectId) query.set('projectId', filters.projectId);
+  if (filters.since) query.set('since', filters.since);
+  if (filters.limit !== undefined) query.set('limit', String(filters.limit));
+  const suffix = query.toString() ? `?${query.toString()}` : '';
+  return request(token, `/v1/runs${suffix}`);
+}
+
+export function getRun(token: string, runId: string): Promise<RunRecord> {
+  return request(token, `/v1/runs/${pathSegment(runId)}`);
+}
+
+export function createRun(
+  token: string,
+  body: {
+    readonly editorGraph: WorkflowGraph;
+    readonly apiGraph: WorkflowGraph;
+    readonly label?: string;
+    readonly projectId?: string;
+    readonly profileId?: string;
+    readonly idempotencyKey?: string;
+    readonly executionHash?: string;
+  },
+  idempotencyKey?: string,
+): Promise<CreateRunResponse> {
+  const headerKey =
+    idempotencyKey ?? body.idempotencyKey ?? createIdempotencyKey('run-create');
+  return request(token, '/v1/runs', {
+    method: 'POST',
+    body,
+    headers: { 'idempotency-key': headerKey },
+  });
+}
+
+export function pinRun(token: string, runId: string): Promise<RunRecord> {
+  return request(
+    token,
+    `/v1/runs/${pathSegment(runId)}/pin`,
+    mutationOptions('run-pin', {}),
+  );
+}
+
+export function unpinRun(token: string, runId: string): Promise<RunRecord> {
+  return request(token, `/v1/runs/${pathSegment(runId)}/pin`, {
+    method: 'DELETE',
+    headers: { 'idempotency-key': createIdempotencyKey('run-unpin') },
+  });
+}
+
+export function reviewRun(
+  token: string,
+  runId: string,
+  body: { readonly decision: 'accepted' | 'rejected'; readonly note?: string },
+): Promise<RunRecord> {
+  return request(
+    token,
+    `/v1/runs/${pathSegment(runId)}/review`,
+    mutationOptions('run-review', body),
+  );
 }
 
 export function getWorkflowDraft(

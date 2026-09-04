@@ -18,6 +18,8 @@
     "test:integration": "vitest run --config vitest.integration.config.ts",
     "test:e2e": "node --experimental-strip-types scripts/test-e2e.ts",
     "test:comfy-live": "node --experimental-strip-types scripts/test-comfy-live.ts",
+    "comfy:frontend": "bash scripts/fetch-comfy-frontend.sh",
+    "comfy:capture-object-info": "node --experimental-strip-types scripts/capture-object-info.ts",
     "demo:seed": "node --experimental-strip-types scripts/demo.ts seed",
     "demo:reset": "node --experimental-strip-types scripts/demo.ts reset",
     "demo:screenshots": "node --experimental-strip-types scripts/test-e2e.ts e2e/demo-screenshots.spec.ts",

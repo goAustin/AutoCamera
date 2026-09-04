@@ -6,6 +6,7 @@ import {
   BridgeMessageGuard,
   BridgeProtocolError,
   createBridgeMessage,
+  readManagedBridgeContext,
   validateBridgeMessage,
 } from './bridge-contract.js';
 import { createVideoOpsBridge } from './bridge-runtime.js';
@@ -21,26 +22,55 @@ function protocolError(action: () => unknown, code: string): void {
   throw new Error(`Expected bridge protocol error ${code}.`);
 }
 
-function message(type: string, fields: Record<string, unknown> = {}) {
+function message(
+  type: string,
+  fields: Record<string, unknown> = {},
+  direction: 'child' | 'parent' | 'any' = 'any',
+) {
   return createBridgeMessage(type, fields, {
     nonce: 'session-nonce',
-    requestId: `${type}-request`,
+    requestId: `${type.replaceAll('.', '-')}-request`,
+    direction,
   });
 }
 
-function fakeWindow() {
+function fakeParentWindow() {
   const listeners = new Set<(event: unknown) => void>();
   const posted: Array<{ message: unknown; targetOrigin: string }> = [];
-  const parent = {
+  const parentWindow = {
     postMessage(value: unknown, targetOrigin: string) {
       posted.push({ message: value, targetOrigin });
     },
   };
-  const windowRef = {
-    parent,
-    location: {
-      href: 'https://comfy.example.test/?videoopsManaged=1&projectId=project-1&shotId=shot-1&nonce=session-nonce&parentOrigin=https%3A%2F%2Fstudio.example.test&frontendVersion=frontend-pin',
+  const frameWindow = {
+    postMessage(value: unknown, targetOrigin: string) {
+      posted.push({ message: value, targetOrigin });
     },
+  };
+  const body = {
+    appendChild(element: unknown) {
+      (element as { parentElement?: unknown }).parentElement = body;
+    },
+  };
+  const documentRef = {
+    body,
+    querySelector: () => null,
+    createElement: () => ({
+      contentWindow: frameWindow,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      setAttribute: () => {},
+      remove: () => {},
+      style: {},
+      className: '',
+      title: '',
+      src: '',
+      hidden: false,
+    }),
+  };
+  const windowRef = {
+    location: { href: 'http://comfy.example.test/' },
+    __VIDEOOPS_STUDIO_ORIGIN__: 'https://studio.example.test',
     addEventListener(_type: string, listener: (event: unknown) => void) {
       listeners.add(listener);
     },
@@ -51,36 +81,33 @@ function fakeWindow() {
       for (const listener of listeners) listener(event);
     },
   };
-  return { parent, posted, windowRef };
+  return { frameWindow, parentWindow, posted, windowRef, documentRef };
 }
 
 describe('ComfyUI VideoOps bridge contract', () => {
-  it('requires the exact origin, source window, schema, and session nonce', () => {
-    const { parent } = fakeWindow();
+  it('requires the exact origin, source window, schema, direction, and nonce', () => {
+    const source = {};
     const guard = new BridgeMessageGuard({
       allowedOrigin: 'https://studio.example.test',
-      expectedSource: parent,
+      expectedSource: source,
       expectedNonce: 'session-nonce',
-      direction: 'parent',
+      direction: 'child',
     });
-    const valid = message('studio.context', {
-      projectId: 'project-1',
-      shotId: 'shot-1',
-    });
+    const valid = message('panel.ready', {}, 'child');
 
     expect(
       guard.accept({
         origin: 'https://studio.example.test',
-        source: parent,
+        source,
         data: valid,
       }).type,
-    ).toBe('studio.context');
+    ).toBe('panel.ready');
     protocolError(
       () =>
         guard.accept({
           origin: 'https://evil.example.test',
-          source: parent,
-          data: message('workflow.result', { status: 'queued' }),
+          source,
+          data: message('panel.ready', {}, 'child'),
         }),
       'ORIGIN_MISMATCH',
     );
@@ -89,21 +116,17 @@ describe('ComfyUI VideoOps bridge contract', () => {
         guard.accept({
           origin: 'https://studio.example.test',
           source: {},
-          data: message('workflow.result', { status: 'queued' }),
+          data: message('panel.ready', {}, 'child'),
         }),
       'SOURCE_MISMATCH',
     );
     protocolError(
       () =>
-        guard.accept({
-          origin: 'https://studio.example.test',
-          source: parent,
-          data: message('workflow.result', {
-            status: 'queued',
-            nonce: 'stale-nonce',
-          }),
-        }),
-      'NONCE_MISMATCH',
+        validateBridgeMessage(
+          message('comfy.context', { frontendVersion: 'pinned' }, 'parent'),
+          { direction: 'child' },
+        ),
+      'MESSAGE_DIRECTION_INVALID',
     );
     protocolError(
       () =>
@@ -113,20 +136,31 @@ describe('ComfyUI VideoOps bridge contract', () => {
         }),
       'SCHEMA_VERSION_UNSUPPORTED',
     );
+    protocolError(
+      () =>
+        validateBridgeMessage(
+          {
+            ...valid,
+            nonce: 'stale-nonce',
+          },
+          { expectedNonce: 'session-nonce' },
+        ),
+      'NONCE_MISMATCH',
+    );
   });
 
-  it('rejects malformed JSON, duplicates, unknown types, and oversize payloads', () => {
-    const { parent } = fakeWindow();
+  it('rejects malformed JSON, duplicates, unknown fields, credentials, and oversize payloads', () => {
+    const source = {};
     const guard = new BridgeMessageGuard({
       allowedOrigin: 'https://studio.example.test',
-      expectedSource: parent,
+      expectedSource: source,
       expectedNonce: 'session-nonce',
-      direction: 'parent',
+      direction: 'child',
     });
     const event = {
       origin: 'https://studio.example.test',
-      source: parent,
-      data: message('workflow.result', { status: 'queued' }),
+      source,
+      data: message('panel.ready', {}, 'child'),
     };
     guard.accept(event);
     protocolError(() => guard.accept(event), 'DUPLICATE_MESSAGE');
@@ -137,141 +171,237 @@ describe('ComfyUI VideoOps bridge contract', () => {
     protocolError(
       () =>
         validateBridgeMessage({
-          ...message('workflow.result', { status: 'queued' }),
+          ...message('panel.ready'),
           type: 'unknown.message',
         }),
       'MESSAGE_TYPE_INVALID',
     );
     protocolError(
       () =>
+        validateBridgeMessage({
+          ...message('panel.ready'),
+          extra: true,
+        }),
+      'UNKNOWN_FIELD',
+    );
+    protocolError(
+      () =>
         validateBridgeMessage(
-          message('workflow.result', {
-            status: 'queued',
-            message: 'x'.repeat(BRIDGE_MAX_PAYLOAD_BYTES),
+          message('workflow.load', {
+            editorGraph: { nested: { authorization: 'Bearer secret-value' } },
+          }),
+        ),
+      'CREDENTIAL_FIELD_FORBIDDEN',
+    );
+    protocolError(
+      () =>
+        validateBridgeMessage(
+          message('workflow.load', {
+            editorGraph: { nested: { access_token: 'secret-value' } },
+          }),
+        ),
+      'CREDENTIAL_FIELD_FORBIDDEN',
+    );
+    protocolError(
+      () =>
+        validateBridgeMessage(
+          message('run.status', {
+            runId: 'run-1',
+            status: 'running',
+            evaluation: { detail: 'x'.repeat(BRIDGE_MAX_PAYLOAD_BYTES) },
           }),
         ),
       'PAYLOAD_TOO_LARGE',
     );
   });
 
-  it('exports both graphToPrompt properties through the exact parent origin', () => {
-    const { parent, posted, windowRef } = fakeWindow();
+  it('keeps the parent runtime on the Comfy side and awaits the public graph export API', async () => {
+    const { frameWindow, posted, windowRef, documentRef } = fakeParentWindow();
+    const loaded: unknown[] = [];
     const errors: string[] = [];
-    const app = {
-      graphToPrompt: () => ({
-        workflow: { nodes: [{ id: 1, type: 'SaveVideo' }] },
-        output: { '1': { class_type: 'SaveVideo', inputs: {} } },
-      }),
-      loadGraphData: () => {},
-    };
+    let resolveGraph: ((value: unknown) => void) | undefined;
+    const graphReady = new Promise((resolve) => {
+      resolveGraph = resolve;
+    });
     const bridge = createVideoOpsBridge({
-      app,
+      app: {
+        graphToPrompt: async () => graphReady,
+        loadGraphData: (graph: unknown) => loaded.push(graph),
+      },
       windowRef,
+      documentRef,
       onProtocolError: (code: string) => errors.push(code),
     });
 
     expect(bridge.enabled).toBe(true);
-    expect(posted).toHaveLength(1);
+    expect(posted).toHaveLength(0);
+    windowRef.dispatch({
+      origin: 'https://studio.example.test',
+      source: frameWindow,
+      data: { ...message('panel.ready', {}, 'child'), nonce: bridge.nonce },
+    });
     expect(posted[0]?.targetOrigin).toBe('https://studio.example.test');
     expect(posted[0]?.message).toMatchObject({
       source: BRIDGE_SOURCE,
       version: 1,
-      type: 'bridge.ready',
-      nonce: 'session-nonce',
+      type: 'comfy.context',
+      nonce: bridge.nonce,
+      frontendVersion: expect.any(String),
     });
 
-    windowRef.dispatch({
-      origin: 'https://studio.example.test',
-      source: parent,
-      data: message('studio.context', {
-        projectId: 'project-1',
-        shotId: 'shot-1',
-      }),
+    const exportPromise = bridge.exportCurrentWorkflow();
+    resolveGraph?.({
+      workflow: { nodes: [{ id: 1, type: 'SaveVideo' }] },
+      output: { '1': { class_type: 'SaveVideo', inputs: {} } },
     });
-    expect(bridge.exportCurrentWorkflow()).toBe(true);
+    await expect(exportPromise).resolves.toBe(true);
     const exportMessage = posted[1]?.message as Record<string, unknown>;
     expect(exportMessage).toMatchObject({
       type: 'workflow.exported',
-      nonce: 'session-nonce',
+      nonce: bridge.nonce,
       editorGraph: { nodes: [{ id: 1, type: 'SaveVideo' }] },
       apiGraph: { '1': { class_type: 'SaveVideo', inputs: {} } },
     });
     expect(exportMessage).not.toHaveProperty('token');
-    expect(exportMessage).not.toHaveProperty('privateExecutorUrl');
-    expect(errors).toEqual([]);
+    expect(exportMessage).not.toHaveProperty('authorization');
 
+    windowRef.dispatch({
+      origin: 'https://studio.example.test',
+      source: frameWindow,
+      data: {
+        ...message('workflow.load', { editorGraph: { nodes: [] } }, 'child'),
+        nonce: bridge.nonce,
+      },
+    });
+    await Promise.resolve();
+    expect(loaded).toEqual([{ nodes: [] }]);
+    expect(errors).toEqual([]);
     bridge.destroy();
-    expect(bridge.exportCurrentWorkflow()).toBe(false);
-    expect(posted).toHaveLength(2);
   });
 
-  it('loads only validated parent graphs and ignores an iframe from another origin', () => {
-    const { parent, windowRef } = fakeWindow();
-    const loaded: unknown[] = [];
+  it('fails closed for an unexpected source and never sends a wildcard target origin', () => {
+    const { posted, windowRef, documentRef } = fakeParentWindow();
     const errors: string[] = [];
     const bridge = createVideoOpsBridge({
-      app: {
-        graphToPrompt: () => ({ workflow: {}, output: {} }),
-        loadGraphData: (graph: unknown) => loaded.push(graph),
-      },
+      app: { graphToPrompt: async () => ({ workflow: {}, output: {} }) },
       windowRef,
+      documentRef,
       onProtocolError: (code: string) => errors.push(code),
     });
     windowRef.dispatch({
       origin: 'https://studio.example.test',
-      source: parent,
-      data: message('studio.context', {
-        projectId: 'project-1',
-        shotId: 'shot-1',
-      }),
+      source: {},
+      data: message('panel.ready', {}, 'child'),
     });
-    windowRef.dispatch({
-      origin: 'https://studio.example.test',
-      source: parent,
-      data: message('workflow.load', { editorGraph: { nodes: [] } }),
-    });
-    windowRef.dispatch({
-      origin: 'https://evil.example.test',
-      source: parent,
-      data: message('workflow.load', { editorGraph: { token: 'nope' } }),
-    });
-
-    expect(loaded).toEqual([{ nodes: [] }]);
-    expect(errors).toContain('ORIGIN_MISMATCH');
+    expect(errors).toContain('SOURCE_MISMATCH');
+    expect(posted.every((entry) => entry.targetOrigin !== '*')).toBe(true);
     bridge.destroy();
   });
+});
 
-  it('starts a fresh duplicate ledger after an iframe reload', () => {
-    const first = fakeWindow();
-    const firstBridge = createVideoOpsBridge({
-      app: { loadGraphData: () => {} },
-      windowRef: first.windowRef,
-    });
-    const context = {
-      origin: 'https://studio.example.test',
-      source: first.parent,
-      data: message('studio.context', {
-        projectId: 'project-1',
-        shotId: 'shot-1',
-      }),
+describe('readManagedBridgeContext embedder corroboration', () => {
+  const managed = (parentOrigin?: string) =>
+    `https://studio.example.com/panel?videoopsManaged=1&nonce=session-nonce${
+      parentOrigin ? `&parentOrigin=${encodeURIComponent(parentOrigin)}` : ''
+    }`;
+
+  it('accepts a declared parentOrigin that matches the real embedder', () => {
+    const context = readManagedBridgeContext(
+      managed('https://comfy.example.com'),
+      'https://comfy.example.com/index.html',
+    );
+    expect(context?.parentOrigin).toBe('https://comfy.example.com');
+  });
+
+  it('rejects a declared parentOrigin that disagrees with the embedder', () => {
+    // A hostile page frames Studio and declares someone else's origin; without
+    // corroboration the panel would accept its messages and post run status
+    // back to it.
+    expect(
+      readManagedBridgeContext(
+        managed('https://attacker.example'),
+        'https://comfy.example.com/index.html',
+      ),
+    ).toBeNull();
+  });
+
+  it('rejects a declared parentOrigin that cannot be corroborated', () => {
+    expect(readManagedBridgeContext(managed('https://comfy.example.com'), '')).toBeNull();
+  });
+
+  it('falls back to the embedder when no origin is declared', () => {
+    const context = readManagedBridgeContext(
+      managed(),
+      'https://comfy.example.com/index.html',
+    );
+    expect(context?.parentOrigin).toBe('https://comfy.example.com');
+  });
+
+  it('rejects when neither a declaration nor an embedder is available', () => {
+    expect(readManagedBridgeContext(managed(), '')).toBeNull();
+  });
+});
+
+describe('sidebar mount lifecycle', () => {
+  function container() {
+    const children: unknown[] = [];
+    return {
+      children,
+      appendChild(element: unknown) {
+        children.push(element);
+        (element as { parentElement?: unknown }).parentElement = this;
+      },
     };
-    first.windowRef.dispatch(context);
-    firstBridge.destroy();
+  }
 
-    const second = fakeWindow();
-    const secondBridge = createVideoOpsBridge({
-      app: { loadGraphData: () => {} },
-      windowRef: second.windowRef,
+  it('re-attaches after the sidebar tab is unmounted', () => {
+    const { windowRef, documentRef } = fakeParentWindow();
+    const bridge = createVideoOpsBridge({
+      app: { graphToPrompt: async () => ({}), loadGraphData: () => {} },
+      windowRef,
+      documentRef,
     });
-    second.windowRef.dispatch({
-      ...context,
-      source: second.parent,
-    });
+    expect(bridge.enabled).toBe(true);
 
-    expect(secondBridge.getCurrentContext()).toEqual({
-      projectId: 'project-1',
-      shotId: 'shot-1',
+    const first = container();
+    expect(bridge.attach(first)).toBe(true);
+    expect(first.children).toHaveLength(1);
+
+    // ComfyUI destroys the custom sidebar tab on every tab switch. That must
+    // unmount the panel, not end the session: tearing the bridge down here left
+    // attach() returning false forever, blanking the panel and killing Managed
+    // Run until a full page reload.
+    expect(bridge.detach?.()).toBe(true);
+
+    const second = container();
+    expect(bridge.attach(second)).toBe(true);
+    expect(second.children).toHaveLength(1);
+  });
+
+  it('stops attaching only once the session is genuinely destroyed', () => {
+    const { windowRef, documentRef } = fakeParentWindow();
+    const bridge = createVideoOpsBridge({
+      app: { graphToPrompt: async () => ({}), loadGraphData: () => {} },
+      windowRef,
+      documentRef,
     });
-    secondBridge.destroy();
+    expect(bridge.attach(container())).toBe(true);
+    bridge.destroy();
+    expect(bridge.attach(container())).toBe(false);
+    expect(bridge.detach?.()).toBe(false);
+  });
+
+  it('exposes a no-op detach on a disabled bridge', () => {
+    const disabled = createVideoOpsBridge({
+      app: {},
+      windowRef: {
+        location: { href: 'http://comfy.example.test/' },
+        addEventListener: () => {},
+        removeEventListener: () => {},
+      },
+      documentRef: { body: {}, querySelector: () => null, createElement: () => ({}) },
+    });
+    expect(disabled.enabled).toBe(false);
+    expect(() => disabled.detach?.()).not.toThrow();
   });
 });

@@ -1,48 +1,58 @@
 # Release status
 
-## Phase 6 — Resume-ready Project Studio release
+## Phase 7C — ComfyUI-first plugin inversion
 
-Status: complete for the Offline fake evidence level (v0.1.0-mvp).
-
-Phase 5's local Project Studio, fake ComfyUI, managed workflow, durable worker,
-artifact/evaluation, recovery, and browser acceptance work is preserved and
-green. The pinned remote ComfyUI contract was not available in this environment
-and is intentionally deferred, together with real MiniMax H3 GPU generation, to
-Phase 8. The release makes no H3-generation claim.
+Status: complete for the **Offline fake** evidence level (`v0.1.0-mvp`).
+Phase 7A and Phase 7B are complete and preserved. ComfyUI now opens as the
+graph shell, the VideoOps sidebar is a Studio-origin iframe, native browser
+queueing is refused, and the managed panel records runs through the 7A API.
+The VideoOps bearer token never enters the ComfyUI origin.
 
 ### Completed gates
 
-- distributed trace context, stable spans, payload redaction, and exporter
-  isolation;
-- exact core Prometheus families with centralized bounded label validation;
-- optional pinned OTel Collector, Tempo, Prometheus, and Grafana stack;
-- deterministic fake seed, guarded reset, five-minute demo, and evidence
-  manifest;
-- Project Studio architecture/trust-boundary documentation and eight
-  secret-reviewed offline screenshots;
-- exact source pins, package/runtime record, license status, and truthful
-  resume bullets;
-- unit, integration, fake-Comfy, workflow, API/SSE/artifact, Pi, bridge, and
-  browser verification commands.
+- pinned frontend ref `3697a1bc3ba7f6b98a1ead888721f7676b536eb5` verified for
+  the public extension APIs used by the plugin;
+- shared reversed bridge contract with exact origin/source/nonce/replay/size
+  validation and credential-field rejection;
+- ComfyUI entry canvas, VideoOps left sidebar iframe, bottom status tab, and
+  topbar managed badge;
+- Studio-only token storage and authenticated API calls;
+- native queue and queue-mode controls disabled; public `Managed Run` action
+  exported through `app.graphToPrompt()`;
+- empty-state H3 template load, brief on-ramp, run history/detail, revision
+  restore, pin, review, findings, progress, and trace display;
+- standalone Studio fallback retained, with Phase 5 routes left available for
+  legacy callers;
+- updated ComfyUI-first screenshots and evidence manifest.
 
 ### Verification record
 
 | Check | Result |
 |---|---|
 | Frozen install | PASS |
-| Prerequisite audit | PASS — Node 24.20.0, pnpm 9.15.0, Compose, ffmpeg/ffprobe, ports, and PostgreSQL |
-| Unit suite | PASS — 25 files / 141 tests |
-| PostgreSQL integration/restart suite | PASS — 5 files / 11 tests |
-| Fake-Comfy HTTP/WebSocket contract | PASS |
-| Browser E2E in fake mode | PASS — 5 tests, including 8 deterministic Project Studio captures |
-| Grafana evidence | PASS — provisioned 11-panel dashboard rendered and visually reviewed |
+| Unit suite | PASS — 26 files, 152 tests |
+| Typecheck and production build | PASS |
+| Formatting | PASS — one expected large fixture warning |
+| Full browser gate | PASS — 9/9 tests; includes the ComfyUI inversion flow, token isolation, 405 queue refusal, one managed run, pin/review, and revision restore |
+| Token isolation output | PASS — `storageHasCredential: false`, `globalsHaveCredential: false`, `crossOriginProtected: true` |
 | Live ComfyUI contract | SKIP — no configured pinned remote executor |
-| Observability config and local stack | PASS — 4 pinned services, 11 panels; Grafana/Prometheus/Tempo readiness verified |
-| Secret scan | PASS — 163 tracked/intentional files inspected |
-| Documentation/evidence validation | PASS — 9 evidence screenshots and status language |
 | Real H3 GPU smoke | NOT RUN — Phase 8 |
+
+The pinned frontend exposes no supported queue interception hook. This release
+does not monkey-patch frontend internals; it disables the native control and
+surfaces the managed action, as required by the checkpoint. Its topbar badge
+metadata is static in the pinned ref, so live readiness/count/budget details
+are carried by the postMessage status feed and bottom panel.
+
+## Historical Phase 6 record
+
+Phase 6's local Project Studio, fake ComfyUI, durable worker,
+artifact/evaluation, recovery, observability, and browser release remain green.
+The remote pinned ComfyUI contract and real MiniMax H3 GPU generation were not
+available in this environment and remain deferred to **Phase 8**. No real H3
+generation claim is made.
 
 ## Next document
 
-docs/90-POST-MVP-ROADMAP.md is the next execution document. It is not part
-of this Phase 6 implementation and has not been executed.
+`docs/90-POST-MVP-ROADMAP.md` remains the next long-term document. It is not part
+of this Phase 7C implementation, and Phase 8 was not started.

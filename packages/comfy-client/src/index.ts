@@ -366,6 +366,49 @@ function loadGeneratedFixtureBytes(seed: number): Uint8Array {
   return createDeterministicFixtureBytes(seed);
 }
 
+const LEGACY_FAKE_OBJECT_INFO: ComfyObjectInfoResponse = {
+  UNETLoader: {
+    input: {
+      required: {
+        unet_name: [['minimax_h3_fl2va_pruned_int8_convrot.safetensors']],
+      },
+    },
+  },
+  CLIPLoader: {
+    input: {
+      required: {
+        clip_name: [['qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors']],
+      },
+    },
+  },
+  VAELoader: {
+    input: {
+      required: {
+        vae_name: [
+          [
+            'minimax_h3_video_vae_fp16.safetensors',
+            'minimax_h3_audio_vae_fp32.safetensors',
+          ],
+        ],
+      },
+    },
+  },
+  MiniMaxH3ImageToVideo: {},
+  RandomNoise: {},
+  BasicScheduler: {},
+  KSamplerSelect: {},
+  BasicGuider: {},
+  SamplerCustomAdvanced: {},
+  VAEDecode: {},
+  VAEDecodeAudio: {},
+  CreateVideo: {},
+  SaveVideo: {},
+  // Retained for the Phase 3 compatibility client/tests.
+  CLIPTextEncode: {},
+  EmptyHunyuanLatentVideo: {},
+  KSampler: {},
+};
+
 export class DeterministicFakeComfyService {
   readonly capabilities: ComfyCapabilities;
   private readonly jobs = new Map<string, FakeJob>();
@@ -373,12 +416,17 @@ export class DeterministicFakeComfyService {
   private uncertainSubmissionSeen = new Set<string>();
   private readonly submissionCounts = new Map<string, number>();
   private readonly outputBytes: (seed: number) => Uint8Array;
+  private readonly objectInfo: ComfyObjectInfoResponse;
   private nextQueueNumber = 0;
 
   constructor(
-    options: { readonly outputBytes?: (seed: number) => Uint8Array } = {},
+    options: {
+      readonly objectInfo?: ComfyObjectInfoResponse;
+      readonly outputBytes?: (seed: number) => Uint8Array;
+    } = {},
   ) {
     this.outputBytes = options.outputBytes ?? loadGeneratedFixtureBytes;
+    this.objectInfo = options.objectInfo ?? LEGACY_FAKE_OBJECT_INFO;
     this.capabilities = {
       apiVersion: '0.0.1-fake',
       supportsWebSocket: true,
@@ -391,48 +439,7 @@ export class DeterministicFakeComfyService {
   }
 
   getObjectInfo(): ComfyObjectInfoResponse {
-    return {
-      UNETLoader: {
-        input: {
-          required: {
-            unet_name: [['minimax_h3_fl2va_pruned_int8_convrot.safetensors']],
-          },
-        },
-      },
-      CLIPLoader: {
-        input: {
-          required: {
-            clip_name: [['qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors']],
-          },
-        },
-      },
-      VAELoader: {
-        input: {
-          required: {
-            vae_name: [
-              [
-                'minimax_h3_video_vae_fp16.safetensors',
-                'minimax_h3_audio_vae_fp32.safetensors',
-              ],
-            ],
-          },
-        },
-      },
-      MiniMaxH3ImageToVideo: {},
-      RandomNoise: {},
-      BasicScheduler: {},
-      KSamplerSelect: {},
-      BasicGuider: {},
-      SamplerCustomAdvanced: {},
-      VAEDecode: {},
-      VAEDecodeAudio: {},
-      CreateVideo: {},
-      SaveVideo: {},
-      // Retained for the Phase 3 compatibility client/tests.
-      CLIPTextEncode: {},
-      EmptyHunyuanLatentVideo: {},
-      KSampler: {},
-    };
+    return this.objectInfo;
   }
 
   getSystemStats(): ComfySystemStatsResponse {

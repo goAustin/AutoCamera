@@ -27,6 +27,7 @@ import {
   approveStoryboard,
   applyRecommendation,
   ApiError,
+  createRun,
   createManagedAttempt,
   createProject,
   createWorkflowRevision,
@@ -38,18 +39,23 @@ import {
   getCost,
   getExecutor,
   getProject,
+  getRun,
   getStoryboard,
   getWorkflowDraft,
   listProjectAttempts,
   listProjectEvents,
   listProjects,
   listRecommendations,
+  listRuns,
   listShots,
   listWorkflowRevisions,
   planProject,
   rejectAttempt,
   retryAttempt,
+  pinRun,
+  reviewRun,
   saveWorkflowDraft,
+  unpinRun,
   validateWorkflowRevision,
   type Attempt,
   type Cost,
@@ -63,9 +69,10 @@ import {
   type WorkflowRevision,
 } from './api.js';
 import {
-  createBridgeNonce,
-  createParentBridgeMessage,
-  validateParentBridgeEvent,
+  createPanelBridgeMessage,
+  validateComfyBridgeEvent,
+  readManagedBridgeContext,
+  type BridgeParentMessage,
 } from './bridge.js';
 import {
   buildFakeWorkflowGraphs,
@@ -266,8 +273,10 @@ function ConfirmPanel({
 
 function TokenGate({
   onAuthenticated,
+  embedded = false,
 }: {
   readonly onAuthenticated: (token: string) => void;
+  readonly embedded?: boolean;
 }): ReactElement {
   const [value, setValue] = useState('');
   const [error, setError] = useState<string | undefined>();
@@ -283,13 +292,22 @@ function TokenGate({
   };
 
   return (
-    <main className="auth-shell">
+    <main
+      className={embedded ? 'auth-shell auth-shell--embedded' : 'auth-shell'}
+    >
       <section className="auth-card" aria-labelledby="auth-title">
-        <p className="eyebrow">AUTHENTICATED PROJECT STUDIO</p>
-        <h1 id="auth-title">Bring a brief to life.</h1>
+        <p className="eyebrow">
+          {embedded
+            ? 'VIDEOOPS MANAGED RUN PANEL'
+            : 'AUTHENTICATED PROJECT STUDIO'}
+        </p>
+        <h1 id="auth-title">
+          {embedded ? 'Connect this panel.' : 'Bring a brief to life.'}
+        </h1>
         <p className="lede">
           This local studio uses a development bearer token. It is held only in
-          this browser session and is never passed to the ComfyUI editor.
+          this Studio-origin browser session and is never passed to the ComfyUI
+          origin.
         </p>
         <form className="stack-form" onSubmit={submit}>
           <label htmlFor="dev-token">Development token</label>
@@ -308,7 +326,7 @@ function TokenGate({
             </span>
           )}
           <button className="button button--primary" type="submit">
-            Enter Project Studio
+            {embedded ? 'Connect VideoOps' : 'Enter Project Studio'}
           </button>
         </form>
       </section>
@@ -1047,7 +1065,7 @@ function ProjectStudioPage({
   );
 }
 
-function FakeWorkflowPanel({
+function StandaloneWorkflowPanel({
   settings,
   onChange,
 }: {
@@ -1175,192 +1193,26 @@ function FakeWorkflowPanel({
   );
 }
 
-interface RemoteExport {
-  readonly editorGraph: Record<string, unknown>;
-  readonly apiGraph: Record<string, unknown>;
-  readonly frontendVersion: string;
-}
-
-function RemoteEditorPanel({
-  projectId,
-  shotId,
-  shotOrdinal,
-  executor,
-  workflowToLoad,
-  onExport,
-}: {
-  readonly projectId: string;
-  readonly shotId: string;
-  readonly shotOrdinal: number;
-  readonly executor: ExecutorInfo;
-  readonly workflowToLoad?: Record<string, unknown> | undefined;
-  readonly onExport: (value: RemoteExport) => void;
-}): ReactElement {
-  const iframeRef = useRef<HTMLIFrameElement>(null);
-  const [nonce] = useState(createBridgeNonce);
-  const [ready, setReady] = useState(false);
-  const [bridgeError, setBridgeError] = useState<string | undefined>();
-  const [exportedAt, setExportedAt] = useState<string | undefined>();
-  const seenMessages = useRef(new Set<string>());
-  const editorOrigin = useMemo(() => {
-    if (!executor.frontendUrl) return undefined;
-    try {
-      const url = new URL(executor.frontendUrl);
-      if (url.protocol !== 'http:' && url.protocol !== 'https:')
-        return undefined;
-      return url.origin;
-    } catch {
-      return undefined;
-    }
-  }, [executor.frontendUrl]);
-  const iframeSrc = useMemo(() => {
-    if (!executor.frontendUrl || !editorOrigin) return undefined;
-    try {
-      const url = new URL(executor.frontendUrl);
-      url.searchParams.set('videoopsManaged', '1');
-      url.searchParams.set('projectId', projectId);
-      url.searchParams.set('shotId', shotId);
-      url.searchParams.set('nonce', nonce);
-      url.searchParams.set('parentOrigin', window.location.origin);
-      url.searchParams.set('frontendVersion', executor.capabilityValidatedAt);
-      return url.toString();
-    } catch {
-      return undefined;
-    }
-  }, [
-    editorOrigin,
-    executor.capabilityValidatedAt,
-    executor.frontendUrl,
-    nonce,
-    projectId,
-    shotId,
-  ]);
-  const post = useCallback(
-    (
-      type: 'studio.context' | 'workflow.load',
-      fields: Record<string, unknown>,
-    ): void => {
-      const frame = iframeRef.current?.contentWindow;
-      if (!frame || !editorOrigin) return;
-      try {
-        frame.postMessage(
-          createParentBridgeMessage(type, nonce, fields),
-          editorOrigin,
-        );
-      } catch {
-        setBridgeError('The editor bridge rejected the session context.');
-      }
-    },
-    [editorOrigin, nonce],
-  );
-  const sendContext = useCallback((): void => {
-    post('studio.context', { projectId, shotId });
-    if (workflowToLoad) post('workflow.load', { editorGraph: workflowToLoad });
-  }, [post, projectId, shotId, workflowToLoad]);
-  const sendContextRef = useRef(sendContext);
-  useEffect(() => {
-    sendContextRef.current = sendContext;
-  }, [sendContext]);
-
-  const handleIframeLoad = useCallback((): void => {
-    seenMessages.current.clear();
-    setReady(false);
-    setBridgeError(undefined);
-    sendContext();
-  }, [sendContext]);
-
-  useEffect(() => {
-    seenMessages.current.clear();
-    setReady(false);
-    setBridgeError(undefined);
-    const handleMessage = (event: MessageEvent<unknown>): void => {
-      if (!editorOrigin || !iframeRef.current?.contentWindow) return;
-      try {
-        const message = validateParentBridgeEvent(
-          { origin: event.origin, source: event.source, data: event.data },
-          editorOrigin,
-          iframeRef.current.contentWindow,
-          nonce,
-          seenMessages.current,
-        );
-        if (message.type === 'bridge.ready') {
-          setReady(true);
-          sendContextRef.current();
-        } else if (message.type === 'bridge.error') {
-          setBridgeError(`The ComfyUI bridge reported ${message.code}.`);
-        } else if (message.type === 'workflow.exported') {
-          onExport({
-            editorGraph: message.editorGraph,
-            apiGraph: message.apiGraph,
-            frontendVersion: message.frontendVersion,
-          });
-          setExportedAt(new Date().toISOString());
-        }
-      } catch (error) {
-        setBridgeError(
-          error instanceof Error
-            ? error.message
-            : 'The editor bridge message was rejected.',
-        );
-      }
-    };
-    window.addEventListener('message', handleMessage);
-    return () => window.removeEventListener('message', handleMessage);
-  }, [editorOrigin, nonce, onExport]);
-
-  useEffect(() => {
-    if (ready && workflowToLoad)
-      post('workflow.load', { editorGraph: workflowToLoad });
-  }, [post, ready, workflowToLoad]);
-
-  if (!iframeSrc || !editorOrigin) {
-    return (
-      <ErrorNotice
-        error={new Error('Remote ComfyUI frontend URL is missing or invalid.')}
-      />
-    );
-  }
+function StandaloneComfySummary(): ReactElement {
   return (
     <section
       className="editor-panel editor-panel--remote"
-      aria-labelledby="remote-editor-title"
+      aria-labelledby="comfy-summary-title"
     >
       <div className="editor-panel-heading">
         <div>
-          <span className="section-kicker">REMOTE MODE / COMFYUI</span>
-          <h3 id="remote-editor-title">
-            Shot {String(shotOrdinal).padStart(2, '0')} graph editor
-          </h3>
+          <span className="section-kicker">REMOTE MODE / COMFYUI SHELL</span>
+          <h3 id="comfy-summary-title">Managed editor handoff</h3>
         </div>
-        <span
-          className={
-            ready ? 'bridge-status bridge-status--ready' : 'bridge-status'
-          }
-        >
-          {ready ? 'Bridge ready' : 'Connecting…'}
-        </span>
+        <span className="bridge-status bridge-status--ready">Shell mode</span>
       </div>
       <p className="editor-explainer">
-        This is the browser-facing pinned ComfyUI editor. The session is scoped
-        with a nonce; the VideoOps bearer token stays in the parent shell.
+        Open the pinned ComfyUI shell separately. Its VideoOps sidebar hosts a
+        Studio-origin iframe; the VideoOps bearer token never enters ComfyUI.
       </p>
-      {bridgeError && <ErrorNotice error={new Error(bridgeError)} />}
-      {exportedAt && (
-        <InfoNotice>
-          Dual graph exported from the editor at {formatDate(exportedAt)}. Save
-          the draft or create an immutable revision below.
-        </InfoNotice>
-      )}
-      <iframe
-        ref={iframeRef}
-        className="comfy-frame"
-        src={iframeSrc}
-        title={`ComfyUI editor for shot ${shotOrdinal}`}
-        onLoad={handleIframeLoad}
-      />
       <p className="editor-help">
-        Use the bridge’s <strong>Generate managed</strong> command in ComfyUI to
-        export the editable and API graphs to this shell.
+        Use <strong>Managed Run</strong> in ComfyUI after opening VideoOps from
+        its sidebar. The native ComfyUI queue is disabled for this integration.
       </p>
     </section>
   );
@@ -1819,7 +1671,6 @@ function ShotWorkspace({
   });
   const [hydratedDraftKey, setHydratedDraftKey] = useState<string>();
   const [selectedRevisionId, setSelectedRevisionId] = useState<string>();
-  const [remoteExport, setRemoteExport] = useState<RemoteExport | undefined>();
   const [notice, setNotice] = useState<string | undefined>();
   const [actionError, setActionError] = useState<unknown>();
   const [confirmGenerate, setConfirmGenerate] = useState(false);
@@ -1870,12 +1721,11 @@ function ShotWorkspace({
         frontendVersion: 'fake-mode-fixture',
       };
     if (mode === 'remote') {
-      if (remoteExport) return remoteExport;
       if (draft?.editorGraph && draft.lastApiGraph)
         return { editorGraph: draft.editorGraph, apiGraph: draft.lastApiGraph };
     }
     return undefined;
-  }, [draft, fakeGraphs, mode, remoteExport]);
+  }, [draft, fakeGraphs, mode]);
 
   const draftBody = useCallback(
     (graphs: {
@@ -1993,7 +1843,7 @@ function ShotWorkspace({
     try {
       let revision = selectedRevision;
       const graphs = currentGraphs();
-      const hasFreshGraph = mode === 'fake' || remoteExport !== undefined;
+      const hasFreshGraph = mode === 'fake';
       if (revision?.validationStatus !== 'validated' || hasFreshGraph) {
         if (!graphs) {
           setActionError(
@@ -2031,7 +1881,6 @@ function ShotWorkspace({
   };
   const useRevision = (revision: WorkflowRevision): void => {
     setSelectedRevisionId(revision.id);
-    setRemoteExport(undefined);
     if (mode === 'fake')
       setSettings(
         extractFakeWorkflowSettings(
@@ -2052,11 +1901,6 @@ function ShotWorkspace({
     (Boolean(currentGraphs()) ||
       Boolean(selectedRevision?.validationStatus === 'validated')) &&
     ['approved_for_generation', 'rejected', 'retryable'].includes(shot.status);
-  const workflowToLoad =
-    mode === 'remote'
-      ? (selectedRevision?.editorGraph ?? draft?.editorGraph)
-      : undefined;
-
   return (
     <section className="shot-workspace" aria-labelledby="selected-shot-title">
       <div className="shot-workspace-heading">
@@ -2122,19 +1966,12 @@ function ShotWorkspace({
             {!executorError &&
               !executorLoading &&
               mode === 'remote' &&
-              executor && (
-                <RemoteEditorPanel
-                  key={shot.id}
-                  projectId={projectId}
-                  shotId={shot.id}
-                  shotOrdinal={shot.ordinal}
-                  executor={executor}
-                  workflowToLoad={workflowToLoad}
-                  onExport={setRemoteExport}
-                />
-              )}
+              executor && <StandaloneComfySummary />}
             {!executorError && !executorLoading && mode === 'fake' && (
-              <FakeWorkflowPanel settings={settings} onChange={setSettings} />
+              <StandaloneWorkflowPanel
+                settings={settings}
+                onChange={setSettings}
+              />
             )}
             {!executorError && !executorLoading && !editorReady && (
               <InfoNotice>
@@ -2454,18 +2291,770 @@ function EventTimeline({
   );
 }
 
+type ManagedBridgeContext = NonNullable<
+  ReturnType<typeof readManagedBridgeContext>
+>;
+type ExportedWorkflowMessage = Extract<
+  BridgeParentMessage,
+  { readonly type: 'workflow.exported' }
+>;
+type ManagedLiveEvent = Awaited<
+  ReturnType<typeof fetchProjectEventStream>
+>[number];
+
+function shortRunId(value: string): string {
+  return `${value.slice(0, 8)}…${value.slice(-4)}`;
+}
+
+function progressFromEvents(
+  runEvents: readonly ProjectEvent[],
+  liveEvents: readonly ManagedLiveEvent[],
+  runId: string,
+): { readonly value: number; readonly max: number } | undefined {
+  let latest: { readonly value: number; readonly max: number } | undefined;
+  for (const event of runEvents) {
+    if (
+      event.type !== 'attempt.execution_progress' ||
+      (event.attemptId !== undefined && event.attemptId !== runId)
+    ) {
+      continue;
+    }
+    const value = event.payload.value;
+    const max = event.payload.max;
+    if (
+      typeof value === 'number' &&
+      Number.isFinite(value) &&
+      typeof max === 'number' &&
+      Number.isFinite(max) &&
+      max > 0
+    ) {
+      latest = { value: Math.max(0, value), max };
+    }
+  }
+  for (const event of liveEvents) {
+    const data = event.data;
+    const payload = data.payload;
+    const eventAttemptId =
+      typeof data.attemptId === 'string'
+        ? data.attemptId
+        : isPlainObject(payload) && typeof payload.attemptId === 'string'
+          ? payload.attemptId
+          : undefined;
+    if (event.type !== 'attempt.execution_progress' || eventAttemptId !== runId)
+      continue;
+    const value = isPlainObject(payload) ? payload.value : undefined;
+    const max = isPlainObject(payload) ? payload.max : undefined;
+    if (
+      typeof value === 'number' &&
+      Number.isFinite(value) &&
+      typeof max === 'number' &&
+      Number.isFinite(max) &&
+      max > 0
+    ) {
+      latest = { value: Math.max(0, value), max };
+    }
+  }
+  return latest;
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Node classes the pinned H3 template carries that resolution legitimately
+ * collapses away: the parameter helpers, and the turbo LoRA branch that
+ * `ComfySwitchNode` deselects for the preview profile.
+ */
+const RESOLVABLE_HELPER_NODE_CLASSES = new Set([
+  'ResolutionSelector',
+  'ComfyMathExpression',
+  'ComfySwitchNode',
+  'PrimitiveInt',
+  'PrimitiveFloat',
+  'PrimitiveBoolean',
+  'LoraLoaderModelOnly',
+]);
+
+function apiGraphNodeClasses(graph: unknown): readonly string[] {
+  if (!isPlainObject(graph)) return [];
+  return Object.values(graph)
+    .map((node) =>
+      isPlainObject(node) ? (node as { class_type?: unknown }).class_type : undefined,
+    )
+    .filter((value): value is string => typeof value === 'string');
+}
+
+/**
+ * The pinned H3 profile executes only a resolved graph: the editor's helper
+ * nodes (resolution pickers, math expressions, switches, primitives) must be
+ * collapsed into literal parameters before submission. Studio derives that
+ * resolved form from the exported graph, which is a faithful compilation only
+ * while the export stays within the node classes the resolver understands.
+ *
+ * Anything outside that set means the user changed something the resolver
+ * cannot express. Submitting the resolved graph anyway would silently drop the
+ * edit and store an execution hash for a workflow the user never built, so
+ * refuse instead of narrowing in silence.
+ */
+export function unresolvableNodeClasses(
+  exportedApiGraph: unknown,
+  resolvedApiGraph: unknown,
+): readonly string[] {
+  const known = new Set([
+    ...RESOLVABLE_HELPER_NODE_CLASSES,
+    ...apiGraphNodeClasses(resolvedApiGraph),
+  ]);
+  return [
+    ...new Set(
+      apiGraphNodeClasses(exportedApiGraph).filter(
+        (nodeClass) => !known.has(nodeClass),
+      ),
+    ),
+  ].sort();
+}
+
+function ManagedPanelPage({
+  token,
+  context,
+  onSignOut,
+}: {
+  readonly token: string;
+  readonly context: ManagedBridgeContext;
+  readonly onSignOut: () => void;
+}): ReactElement {
+  const queryClient = useQueryClient();
+  const [bridgeReady, setBridgeReady] = useState(false);
+  const [bridgeError, setBridgeError] = useState<string | undefined>();
+  const [selectedRunId, setSelectedRunId] = useState<string>();
+  const [notice, setNotice] = useState<string | undefined>();
+  const [liveEvents, setLiveEvents] = useState<readonly ManagedLiveEvent[]>([]);
+  const [reviewNote, setReviewNote] = useState('');
+  const seenParentMessages = useRef(new Set<string>());
+  const handledExports = useRef(new Set<string>());
+  const defaultLoadSent = useRef(false);
+  const statusSent = useRef('');
+  const liveEventCursor = useRef(0);
+
+  const runsQuery = useQuery({
+    queryKey: ['managed-runs'],
+    queryFn: () => listRuns(token, { limit: 50 }),
+    refetchInterval: 3_000,
+  });
+  const runs = runsQuery.data?.runs ?? [];
+  const selectedRun = runs.find((run) => run.runId === selectedRunId);
+  const runQuery = useQuery({
+    queryKey: ['managed-run', selectedRunId],
+    queryFn: () => getRun(token, selectedRunId ?? ''),
+    enabled: Boolean(selectedRunId),
+    refetchInterval: 2_000,
+  });
+  const run = runQuery.data ?? selectedRun;
+  const findingsQuery = useQuery({
+    queryKey: ['managed-run-findings', run?.projectId],
+    queryFn: () => listRecommendations(token, run?.projectId ?? ''),
+    enabled: Boolean(run?.projectId),
+    refetchInterval: 5_000,
+  });
+  const findings = findingsQuery.data?.recommendations ?? [];
+  const pendingFindings = findings.filter(
+    (finding) => finding.status === 'pending',
+  );
+  const progress = run
+    ? progressFromEvents(run.events, liveEvents, run.runId)
+    : undefined;
+
+  useEffect(() => {
+    if (selectedRunId && runs.some((item) => item.runId === selectedRunId))
+      return;
+    const first = runs[0];
+    if (first) setSelectedRunId(first.runId);
+  }, [runs, selectedRunId]);
+
+  const createRunMutation = useMutation({
+    mutationFn: (message: ExportedWorkflowMessage) => {
+      const settings = extractFakeWorkflowSettings(
+        message.editorGraph,
+        message.apiGraph,
+        DEFAULT_FAKE_WORKFLOW_SETTINGS,
+      );
+      const resolvedGraphs = buildFakeWorkflowGraphs(settings);
+      const unresolvable = unresolvableNodeClasses(
+        message.apiGraph,
+        resolvedGraphs.apiGraph,
+      );
+      if (unresolvable.length > 0) {
+        throw new Error(
+          `This graph uses nodes the managed H3 profile cannot resolve: ${unresolvable.join(', ')}. ` +
+            'Managed runs currently support the pinned H3 template and its ' +
+            'resolution, duration, seed and prompt controls. Remove the ' +
+            'unsupported nodes, or run this graph outside managed mode.',
+        );
+      }
+      return createRun(
+        token,
+        {
+          editorGraph: message.editorGraph,
+          apiGraph: resolvedGraphs.apiGraph,
+          label: 'ComfyUI managed run',
+          profileId: MINIMAX_H3_PROFILE_ID,
+        },
+        `run-export-${message.requestId}`,
+      );
+    },
+    onSuccess: (result) => {
+      if (result.runId) setSelectedRunId(result.runId);
+      setNotice(
+        result.runId
+          ? `Managed run ${shortRunId(result.runId)} created.`
+          : 'The graph was recorded with validation errors; no run was queued.',
+      );
+      void queryClient.invalidateQueries({ queryKey: ['managed-runs'] });
+    },
+  });
+  const mutateCreateRun = createRunMutation.mutate;
+
+  const handleExport = useCallback(
+    (message: ExportedWorkflowMessage): void => {
+      if (handledExports.current.has(message.requestId)) return;
+      handledExports.current.add(message.requestId);
+      mutateCreateRun(message);
+    },
+    [mutateCreateRun],
+  );
+
+  const postToComfy = useCallback(
+    (
+      type: 'workflow.load' | 'run.status',
+      fields: Record<string, unknown>,
+    ): void => {
+      try {
+        window.parent.postMessage(
+          createPanelBridgeMessage(type, context.nonce, fields),
+          context.parentOrigin,
+        );
+      } catch (error) {
+        setBridgeError(
+          error instanceof Error
+            ? error.message
+            : 'The managed panel could not send a bridge message.',
+        );
+      }
+    },
+    [context.nonce, context.parentOrigin],
+  );
+
+  useEffect(() => {
+    seenParentMessages.current.clear();
+    setBridgeReady(false);
+    const parentWindow = window.parent;
+    const handleMessage = (event: MessageEvent<unknown>): void => {
+      try {
+        const message = validateComfyBridgeEvent(
+          { origin: event.origin, source: event.source, data: event.data },
+          context.parentOrigin,
+          parentWindow,
+          context.nonce,
+          seenParentMessages.current,
+        );
+        if (message.type === 'comfy.context') {
+          setBridgeReady(true);
+          setBridgeError(undefined);
+        } else if (message.type === 'workflow.exported') {
+          handleExport(message);
+        } else if (message.type === 'bridge.error') {
+          setBridgeError(`ComfyUI bridge error: ${message.code}.`);
+        }
+      } catch (error) {
+        setBridgeError(
+          error instanceof Error
+            ? error.message
+            : 'The managed panel rejected a bridge message.',
+        );
+      }
+    };
+    window.addEventListener('message', handleMessage);
+    try {
+      parentWindow.postMessage(
+        createPanelBridgeMessage('panel.ready', context.nonce),
+        context.parentOrigin,
+      );
+    } catch (error) {
+      setBridgeError(
+        error instanceof Error
+          ? error.message
+          : 'The managed panel could not announce readiness.',
+      );
+    }
+    return () => window.removeEventListener('message', handleMessage);
+  }, [context.nonce, context.parentOrigin, handleExport]);
+
+  useEffect(() => {
+    if (!bridgeReady || !runsQuery.isSuccess || runs.length > 0) return;
+    if (defaultLoadSent.current) return;
+    defaultLoadSent.current = true;
+    const template = buildFakeWorkflowGraphs(DEFAULT_FAKE_WORKFLOW_SETTINGS);
+    postToComfy('workflow.load', { editorGraph: template.editorGraph });
+    setNotice('The MiniMax H3 template is open in ComfyUI.');
+  }, [bridgeReady, postToComfy, runs, runsQuery.isSuccess]);
+
+  useEffect(() => {
+    const projectId = run?.projectId;
+    liveEventCursor.current = 0;
+    setLiveEvents([]);
+    if (!projectId) return;
+    let active = true;
+    let timer: number | undefined;
+    const poll = async (): Promise<void> => {
+      if (!active) return;
+      try {
+        const events = await fetchProjectEventStream(
+          token,
+          projectId,
+          liveEventCursor.current,
+        );
+        if (!active) return;
+        if (events.length > 0) {
+          liveEventCursor.current = Math.max(
+            liveEventCursor.current,
+            ...events.map((event) => event.id),
+          );
+          setLiveEvents((current) => [...current, ...events].slice(-100));
+          void runQuery.refetch();
+        }
+      } catch {
+        // The panel keeps polling REST truth when replay is unavailable.
+      } finally {
+        if (active) timer = window.setTimeout(() => void poll(), 2_500);
+      }
+    };
+    void poll();
+    return () => {
+      active = false;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [run?.projectId, runQuery.refetch, token]);
+
+  const statusEvaluation = useMemo(() => {
+    if (!run) return undefined;
+    const activeRunCount = runs.filter(
+      (item) => item.status === 'queued' || item.status === 'running',
+    ).length;
+    const evaluation: Record<string, unknown> = {
+      status: run.evaluationStatus,
+      executorReadiness: 'managed-studio',
+      activeRunCount,
+      nodeDurations: { status: 'not-recorded' },
+      openFindingCount: pendingFindings.length,
+    };
+    if (progress) evaluation.progress = progress;
+    if (run.cost.projectRemainingUsd !== null)
+      evaluation.budgetHeadroom = run.cost.projectRemainingUsd;
+    const failureCode = run.attempt.failureCode;
+    const failureMessage = run.attempt.failureMessage;
+    const traceId = run.attempt.traceId;
+    if (failureCode || failureMessage) {
+      evaluation.failure = {
+        ...(failureCode ? { code: failureCode } : {}),
+        ...(failureMessage ? { message: failureMessage.slice(0, 256) } : {}),
+      };
+    }
+    if (traceId) evaluation.traceId = traceId;
+    return evaluation;
+  }, [pendingFindings.length, progress, run, runs]);
+
+  useEffect(() => {
+    if (!bridgeReady || !run || !statusEvaluation) {
+      if (!bridgeReady) statusSent.current = '';
+      return;
+    }
+    const signature = JSON.stringify({
+      runId: run.runId,
+      status: run.status,
+      evaluation: statusEvaluation,
+    });
+    if (signature === statusSent.current) return;
+    statusSent.current = signature;
+    postToComfy('run.status', {
+      runId: run.runId,
+      status: run.status,
+      evaluation: statusEvaluation,
+    });
+  }, [bridgeReady, postToComfy, run, statusEvaluation]);
+
+  const pinMutation = useMutation({
+    mutationFn: (runId: string) => pinRun(token, runId),
+    onSuccess: (updated) => {
+      setSelectedRunId(updated.runId);
+      void queryClient.invalidateQueries({ queryKey: ['managed-runs'] });
+      void runQuery.refetch();
+    },
+  });
+  const unpinMutation = useMutation({
+    mutationFn: (runId: string) => unpinRun(token, runId),
+    onSuccess: (updated) => {
+      setSelectedRunId(updated.runId);
+      void queryClient.invalidateQueries({ queryKey: ['managed-runs'] });
+      void runQuery.refetch();
+    },
+  });
+  const reviewMutation = useMutation({
+    mutationFn: (input: {
+      readonly runId: string;
+      readonly decision: 'accepted' | 'rejected';
+    }) =>
+      reviewRun(token, input.runId, {
+        decision: input.decision,
+        ...(reviewNote.trim() ? { note: reviewNote.trim() } : {}),
+      }),
+    onSuccess: (updated) => {
+      setReviewNote('');
+      setSelectedRunId(updated.runId);
+      setNotice(`Run annotated ${updated.review?.decision ?? 'reviewed'}.`);
+      void queryClient.invalidateQueries({ queryKey: ['managed-runs'] });
+      void runQuery.refetch();
+    },
+  });
+
+  const loadRevision = (): void => {
+    if (!run?.revision?.editorGraph) return;
+    postToComfy('workflow.load', {
+      editorGraph: run.revision.editorGraph,
+      ...(run.revision.id ? { revisionId: run.revision.id } : {}),
+    });
+    setNotice(`Revision ${shortRunId(run.revision.id)} sent to ComfyUI.`);
+  };
+
+  return (
+    <main className="managed-panel" aria-label="VideoOps managed run panel">
+      <header className="managed-panel-header">
+        <div>
+          <p className="eyebrow">VIDEOOPS / MANAGED RUN PANEL</p>
+          <h1>Run history</h1>
+          <p className="managed-panel-lede">
+            Studio controls the bearer token here. ComfyUI receives only the
+            nonce-scoped workflow bridge.
+          </p>
+        </div>
+        <div className="managed-panel-actions">
+          <span
+            className={
+              bridgeReady
+                ? 'bridge-status bridge-status--ready'
+                : 'bridge-status'
+            }
+          >
+            {bridgeReady ? 'ComfyUI connected' : 'Connecting…'}
+          </span>
+          <button
+            className="button button--quiet"
+            type="button"
+            onClick={onSignOut}
+          >
+            Sign out
+          </button>
+        </div>
+      </header>
+      {bridgeError && <ErrorNotice error={new Error(bridgeError)} />}
+      {runsQuery.isError && <ErrorNotice error={runsQuery.error} />}
+      {createRunMutation.isError && (
+        <ErrorNotice error={createRunMutation.error} />
+      )}
+      {pinMutation.isError && <ErrorNotice error={pinMutation.error} />}
+      {unpinMutation.isError && <ErrorNotice error={unpinMutation.error} />}
+      {reviewMutation.isError && <ErrorNotice error={reviewMutation.error} />}
+      {notice && <InfoNotice>{notice}</InfoNotice>}
+      {runsQuery.isSuccess && runs.length === 0 && (
+        <section className="managed-empty panel">
+          <span className="section-kicker">FIRST RUN / MINIMAX H3</span>
+          <h2>Template opened in ComfyUI</h2>
+          <p>
+            Edit the H3 graph in the ComfyUI canvas, then choose Managed Run. A
+            run will appear here after Studio receives both graph forms.
+          </p>
+          <a
+            className="button button--quiet"
+            href="/"
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            Start from a brief
+          </a>
+        </section>
+      )}
+      <div className="managed-panel-grid">
+        <section
+          className="managed-history panel"
+          aria-labelledby="managed-history-title"
+        >
+          <div className="panel-heading">
+            <div>
+              <span className="section-kicker">DURABLE RUNS</span>
+              <h2 id="managed-history-title">History</h2>
+            </div>
+            <span className="count-badge">{runs.length}</span>
+          </div>
+          {runsQuery.isPending && <LoadingState label="Loading run history…" />}
+          {runs.length === 0 && runsQuery.isSuccess && (
+            <EmptyState
+              title="No managed runs"
+              detail="Managed Run exports will be recorded here."
+            />
+          )}
+          <ol className="managed-run-list">
+            {runs.map((item) => (
+              <li key={item.runId}>
+                <button
+                  className={
+                    item.runId === run?.runId
+                      ? 'managed-run-item managed-run-item--selected'
+                      : 'managed-run-item'
+                  }
+                  type="button"
+                  aria-pressed={item.runId === run?.runId}
+                  onClick={() => setSelectedRunId(item.runId)}
+                >
+                  <span>
+                    <strong>{shortRunId(item.runId)}</strong>
+                    <small>{formatDate(item.attempt.createdAt)}</small>
+                  </span>
+                  <StatusBadge status={item.status} />
+                </button>
+              </li>
+            ))}
+          </ol>
+        </section>
+        <section
+          className="managed-detail panel"
+          aria-labelledby="managed-detail-title"
+        >
+          <div className="panel-heading">
+            <div>
+              <span className="section-kicker">RUN / RESULT / REVIEW</span>
+              <h2 id="managed-detail-title">Selected run</h2>
+            </div>
+            {run && <StatusBadge status={run.status} />}
+          </div>
+          {!run && (
+            <EmptyState
+              title="Select a run"
+              detail="Run status, evaluation, findings, and review controls will appear here."
+            />
+          )}
+          {run && (
+            <>
+              <dl className="managed-facts">
+                <div>
+                  <dt>Run ID</dt>
+                  <dd>{run.runId}</dd>
+                </div>
+                <div>
+                  <dt>Evaluation</dt>
+                  <dd>{humanize(run.evaluationStatus)}</dd>
+                </div>
+                <div>
+                  <dt>Estimated cost</dt>
+                  <dd>{formatMoney(run.cost.estimatedCostUsd)}</dd>
+                </div>
+                <div>
+                  <dt>Budget headroom</dt>
+                  <dd>
+                    {run.cost.projectRemainingUsd === null
+                      ? 'Not budgeted'
+                      : formatMoney(run.cost.projectRemainingUsd)}
+                  </dd>
+                </div>
+                <div>
+                  <dt>Keeper</dt>
+                  <dd>{run.pinned ? 'Pinned' : 'Not pinned'}</dd>
+                </div>
+                <div>
+                  <dt>Review</dt>
+                  <dd>
+                    {run.review?.decision
+                      ? humanize(run.review.decision)
+                      : 'Not annotated'}
+                  </dd>
+                </div>
+              </dl>
+              <div className="button-row">
+                {run.revision && (
+                  <button
+                    className="button button--quiet"
+                    type="button"
+                    onClick={loadRevision}
+                  >
+                    Load revision in ComfyUI
+                  </button>
+                )}
+                <button
+                  className="button button--quiet"
+                  type="button"
+                  onClick={() =>
+                    run.pinned
+                      ? unpinMutation.mutate(run.runId)
+                      : pinMutation.mutate(run.runId)
+                  }
+                  disabled={pinMutation.isPending || unpinMutation.isPending}
+                >
+                  {run.pinned ? 'Unpin keeper' : 'Pin keeper'}
+                </button>
+              </div>
+              <section
+                className="managed-subsection"
+                aria-labelledby="managed-progress-title"
+              >
+                <div className="panel-heading">
+                  <h3 id="managed-progress-title">Progress and trace</h3>
+                  <span className="live-chip">Live SSE</span>
+                </div>
+                {progress ? (
+                  <progress max={progress.max} value={progress.value} />
+                ) : (
+                  <p className="muted">No execution progress reported yet.</p>
+                )}
+                {run.attempt.failureCode && (
+                  <p className="failure-line">
+                    {run.attempt.failureCode}:{' '}
+                    {run.attempt.failureMessage ?? 'Execution failed.'}
+                  </p>
+                )}
+                {run.attempt.traceId && (
+                  <p className="trace-line">Trace ID: {run.attempt.traceId}</p>
+                )}
+                <p className="muted">
+                  Node durations: not recorded in the durable Phase 7 feed.
+                </p>
+                {run.artifact && (
+                  <p>
+                    Artifact recorded: {String(run.artifact.id ?? 'available')}
+                  </p>
+                )}
+              </section>
+              <section
+                className="managed-subsection"
+                aria-labelledby="managed-findings-title"
+              >
+                <div className="panel-heading">
+                  <h3 id="managed-findings-title">Findings</h3>
+                  <span className="count-badge">{pendingFindings.length}</span>
+                </div>
+                {pendingFindings.length === 0 ? (
+                  <p className="muted">No pending operator findings.</p>
+                ) : (
+                  <ul className="managed-finding-list">
+                    {pendingFindings.map((finding) => (
+                      <li key={finding.id}>
+                        <StatusBadge status={finding.severity} />
+                        <strong>{finding.title}</strong>
+                        <span>{finding.detail}</span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </section>
+              <section
+                className="managed-subsection"
+                aria-labelledby="managed-review-title"
+              >
+                <div className="panel-heading">
+                  <h3 id="managed-review-title">Human review</h3>
+                </div>
+                <textarea
+                  aria-label="Review note"
+                  rows={3}
+                  maxLength={2_000}
+                  value={reviewNote}
+                  onChange={(event) => setReviewNote(event.target.value)}
+                  placeholder="Optional review note"
+                />
+                <div className="button-row">
+                  <button
+                    className="button button--primary"
+                    type="button"
+                    onClick={() =>
+                      reviewMutation.mutate({
+                        runId: run.runId,
+                        decision: 'accepted',
+                      })
+                    }
+                    disabled={reviewMutation.isPending}
+                  >
+                    Accept annotation
+                  </button>
+                  <button
+                    className="button button--quiet"
+                    type="button"
+                    onClick={() =>
+                      reviewMutation.mutate({
+                        runId: run.runId,
+                        decision: 'rejected',
+                      })
+                    }
+                    disabled={reviewMutation.isPending}
+                  >
+                    Reject annotation
+                  </button>
+                </div>
+              </section>
+              <section
+                className="managed-subsection"
+                aria-labelledby="managed-events-title"
+              >
+                <div className="panel-heading">
+                  <h3 id="managed-events-title">Event feed</h3>
+                  <span className="count-badge">{run.events.length}</span>
+                </div>
+                <ol className="managed-event-list">
+                  {run.events
+                    .slice(-8)
+                    .reverse()
+                    .map((event) => (
+                      <li key={event.id}>
+                        <strong>{humanize(event.type)}</strong>
+                        <small>{formatDate(event.occurredAt)}</small>
+                      </li>
+                    ))}
+                </ol>
+              </section>
+            </>
+          )}
+        </section>
+      </div>
+    </main>
+  );
+}
+
 export function App(): ReactElement {
   const [token, setToken] = useState<string | null>(() => readStoredToken());
   const queryClient = useQueryClient();
+  const managedContext = useMemo(
+    () => readManagedBridgeContext(window.location, document.referrer),
+    [],
+  );
   useEffect(() => {
     queryClient.clear();
   }, [queryClient]);
-  if (!token) return <TokenGate onAuthenticated={setToken} />;
+  if (!token)
+    return (
+      <TokenGate
+        embedded={managedContext !== null}
+        onAuthenticated={setToken}
+      />
+    );
   const signOut = (): void => {
     queryClient.clear();
     forgetToken();
     setToken(null);
   };
+  if (managedContext)
+    return (
+      <ManagedPanelPage
+        token={token}
+        context={managedContext}
+        onSignOut={signOut}
+      />
+    );
   return (
     <AppShell onSignOut={signOut}>
       <Routes>
