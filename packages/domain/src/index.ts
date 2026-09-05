@@ -26,13 +26,6 @@ export const PROJECT_STATUSES = [
 ] as const;
 export type ProjectStatus = (typeof PROJECT_STATUSES)[number];
 
-export const STORYBOARD_STATUSES = [
-  'proposed',
-  'approved',
-  'superseded',
-] as const;
-export type StoryboardStatus = (typeof STORYBOARD_STATUSES)[number];
-
 export const SHOT_STATUSES = [
   'draft',
   'approved_for_generation',
@@ -67,6 +60,16 @@ export type GenerationAttemptStatus =
 
 export const DOMAIN_EVENT_TYPES = [
   'project.created',
+  // The five entries below are planner-era: nothing in the tree emits them
+  // any more (Phase 7D removed the brief-first product). They stay in this
+  // list forever because `domain_events` is append-only (design reference
+  // section 4, invariant three) -- any Phase 7C database that was ever used
+  // contains rows typed with these strings, `parseDomainEventType`
+  // (below) throws `UNKNOWN_EVENT_TYPE` for any value absent from this
+  // list, and `packages/db/src/index.ts`'s `mapEvent` calls it on every
+  // `domain_events` row read back. Removing a string here does not delete
+  // the old rows; it makes them unreadable -- the event timeline throws,
+  // SSE replay throws. This array is a retention schema, not an API surface.
   'project.planning_started',
   'project.planned',
   'storyboard.proposed',
@@ -104,16 +107,13 @@ export type DomainEventType = (typeof DOMAIN_EVENT_TYPES)[number];
 
 export type DomainErrorCode =
   | 'UNKNOWN_PROJECT_STATUS'
-  | 'UNKNOWN_STORYBOARD_STATUS'
   | 'UNKNOWN_SHOT_STATUS'
   | 'UNKNOWN_ATTEMPT_STATUS'
   | 'UNKNOWN_EVENT_TYPE'
   | 'INVALID_PROJECT'
-  | 'INVALID_STORYBOARD'
   | 'INVALID_SHOT'
   | 'INVALID_ATTEMPT'
   | 'INVALID_PROJECT_TRANSITION'
-  | 'INVALID_STORYBOARD_TRANSITION'
   | 'INVALID_SHOT_TRANSITION'
   | 'INVALID_ATTEMPT_TRANSITION'
   | 'TARGET_DURATION_TOO_SHORT'
@@ -158,8 +158,16 @@ export interface VideoProject {
   readonly updatedAt: IsoUtcTimestamp;
 }
 
-export interface StoryboardShotDefinition {
-  readonly ordinal: 1 | 2 | 3;
+/**
+ * A shot's position within its project. Phase 7A-era storyboard shots were
+ * always 1-3; implicit graph-first run shots (the only kind created since
+ * Phase 7D) continue past 3, so the entity type is any positive integer.
+ */
+export type ShotOrdinal = number;
+
+/** A shot definition, keyed by an ordinal not restricted to any fixed range. */
+export interface ShotDefinition {
+  readonly ordinal: ShotOrdinal;
   readonly purpose: string;
   readonly prompt: string;
   readonly durationSeconds: number;
@@ -172,35 +180,6 @@ export interface StoryboardShotDefinition {
   readonly acceptanceCriteria?: readonly string[];
   readonly requiredAssetIds?: readonly string[];
 }
-
-export interface StoryboardProposal {
-  readonly id: Uuid;
-  readonly projectId: Uuid;
-  readonly revision: number;
-  readonly status: StoryboardStatus;
-  readonly shots: readonly StoryboardShotDefinition[];
-  readonly totalDurationSeconds: number;
-  readonly durationToleranceSeconds: number;
-  readonly objective?: string;
-  readonly assumptions?: readonly string[];
-  readonly risks?: readonly string[];
-  readonly agentRunId?: Uuid;
-  readonly version: number;
-  readonly createdAt: IsoUtcTimestamp;
-  readonly updatedAt: IsoUtcTimestamp;
-}
-
-/**
- * A shot's position within its project. Storyboard shots are always 1-3, which
- * `assertStoryboardProposal` enforces separately; implicit graph-first run
- * shots continue past 3, so the entity type is any positive integer.
- */
-export type ShotOrdinal = number;
-
-/** A shot definition whose ordinal is not restricted to the storyboard range. */
-export type ShotDefinition = Omit<StoryboardShotDefinition, 'ordinal'> & {
-  readonly ordinal: ShotOrdinal;
-};
 
 export interface Shot {
   readonly id: Uuid;
@@ -384,14 +363,6 @@ export const PROJECT_STATUS_TRANSITIONS: Readonly<
   completed: [],
 };
 
-export const STORYBOARD_STATUS_TRANSITIONS: Readonly<
-  Record<StoryboardStatus, readonly StoryboardStatus[]>
-> = {
-  proposed: ['approved', 'superseded'],
-  approved: [],
-  superseded: [],
-};
-
 export const SHOT_STATUS_TRANSITIONS: Readonly<
   Record<ShotStatus, readonly ShotStatus[]>
 > = {
@@ -426,7 +397,6 @@ export const ATTEMPT_STATUS_TRANSITIONS: Readonly<
 };
 
 const projectStatusSet = new Set<string>(PROJECT_STATUSES);
-const storyboardStatusSet = new Set<string>(STORYBOARD_STATUSES);
 const shotStatusSet = new Set<string>(SHOT_STATUSES);
 const attemptStatusSet = new Set<string>(GENERATION_ATTEMPT_STATUSES);
 const eventTypeSet = new Set<string>(DOMAIN_EVENT_TYPES);
@@ -443,10 +413,6 @@ function assertSafeInteger(value: number, code: DomainErrorCode): void {
 
 export function isProjectStatus(value: unknown): value is ProjectStatus {
   return typeof value === 'string' && projectStatusSet.has(value);
-}
-
-export function isStoryboardStatus(value: unknown): value is StoryboardStatus {
-  return typeof value === 'string' && storyboardStatusSet.has(value);
 }
 
 export function isShotStatus(value: unknown): value is ShotStatus {
@@ -468,16 +434,6 @@ export function parseProjectStatus(value: unknown): ProjectStatus {
     throw new DomainError(
       'UNKNOWN_PROJECT_STATUS',
       'The project status is not recognized.',
-    );
-  }
-  return value;
-}
-
-export function parseStoryboardStatus(value: unknown): StoryboardStatus {
-  if (!isStoryboardStatus(value)) {
-    throw new DomainError(
-      'UNKNOWN_STORYBOARD_STATUS',
-      'The storyboard status is not recognized.',
     );
   }
   return value;
@@ -786,77 +742,6 @@ function assertBoundedStringArray(
   }
 }
 
-function assertStoryboard(proposal: StoryboardProposal): void {
-  parseStoryboardStatus(proposal.status);
-  assertUuid(proposal.id);
-  assertUuid(proposal.projectId);
-  assertSafeInteger(proposal.revision, 'INVALID_STORYBOARD');
-  assertSafeInteger(proposal.version, 'INVALID_STORYBOARD');
-  if (proposal.revision < 1 || proposal.version < 1) {
-    throw new DomainError(
-      'INVALID_STORYBOARD',
-      'Storyboard revision and version must be positive.',
-    );
-  }
-  if (
-    proposal.objective !== undefined &&
-    (!proposal.objective.trim() || proposal.objective.length > 400)
-  ) {
-    throw new DomainError(
-      'INVALID_STORYBOARD',
-      'Storyboard objective must be non-empty and bounded.',
-    );
-  }
-  for (const values of [proposal.assumptions, proposal.risks]) {
-    if (
-      values &&
-      (values.length > 12 ||
-        values.some((value) => !value.trim() || value.length > 280))
-    ) {
-      throw new DomainError(
-        'INVALID_STORYBOARD',
-        'Storyboard assumptions and risks must be bounded.',
-      );
-    }
-  }
-  if (proposal.agentRunId) {
-    assertUuid(proposal.agentRunId);
-  }
-  if (proposal.shots.length !== STORYBOARD_SHOT_COUNT) {
-    throw new DomainError(
-      'INVALID_STORYBOARD',
-      'A storyboard must contain exactly three shots.',
-    );
-  }
-  const ordinals = proposal.shots.map((shot) => shot.ordinal);
-  if (ordinals.join(',') !== '1,2,3') {
-    throw new DomainError(
-      'INVALID_STORYBOARD',
-      'Storyboard shot ordinals must be 1, 2, and 3.',
-    );
-  }
-  proposal.shots.forEach(assertShotDefinition);
-  const total = proposal.shots.reduce(
-    (sum, shot) => sum + shot.durationSeconds,
-    0,
-  );
-  if (
-    !isFiniteNumber(proposal.totalDurationSeconds) ||
-    proposal.totalDurationSeconds <= 0 ||
-    !isFiniteNumber(proposal.durationToleranceSeconds) ||
-    proposal.durationToleranceSeconds < 0 ||
-    Math.abs(total - proposal.totalDurationSeconds) >
-      proposal.durationToleranceSeconds
-  ) {
-    throw new DomainError(
-      'INVALID_STORYBOARD',
-      'Storyboard duration metadata is inconsistent.',
-    );
-  }
-  assertUtcTimestamp(proposal.createdAt);
-  assertUtcTimestamp(proposal.updatedAt);
-}
-
 function assertShot(shot: Shot): void {
   parseShotStatus(shot.status);
   assertUuid(shot.id);
@@ -1104,23 +989,6 @@ export function transitionProject(
   );
 }
 
-export function transitionStoryboard(
-  proposal: StoryboardProposal,
-  nextStatus: unknown,
-): StoryboardProposal {
-  assertStoryboard(proposal);
-  const currentStatus = parseStoryboardStatus(proposal.status);
-  const parsedNextStatus = parseStoryboardStatus(nextStatus);
-  return transition(
-    proposal,
-    parsedNextStatus,
-    currentStatus,
-    STORYBOARD_STATUS_TRANSITIONS,
-    'INVALID_STORYBOARD_TRANSITION',
-    'UNKNOWN_STORYBOARD_STATUS',
-  );
-}
-
 export function transitionShot(shot: Shot, nextStatus: unknown): Shot {
   assertShot(shot);
   const currentStatus = parseShotStatus(shot.status);
@@ -1169,20 +1037,6 @@ export function tryTransitionProject(
 ): TransitionResult<VideoProject> {
   try {
     return { ok: true, value: transitionProject(project, nextStatus) };
-  } catch (error) {
-    if (error instanceof DomainError) {
-      return { ok: false, error };
-    }
-    throw error;
-  }
-}
-
-export function tryTransitionStoryboard(
-  proposal: StoryboardProposal,
-  nextStatus: unknown,
-): TransitionResult<StoryboardProposal> {
-  try {
-    return { ok: true, value: transitionStoryboard(proposal, nextStatus) };
   } catch (error) {
     if (error instanceof DomainError) {
       return { ok: false, error };
@@ -1281,49 +1135,6 @@ export function createVideoProject(input: CreateProjectInput): VideoProject {
   };
   assertProject(project);
   return project;
-}
-
-export interface CreateStoryboardProposalInput {
-  readonly id: Uuid;
-  readonly projectId: Uuid;
-  readonly revision: number;
-  readonly shots: readonly StoryboardShotDefinition[];
-  readonly durationToleranceSeconds?: number;
-  readonly objective?: string;
-  readonly assumptions?: readonly string[];
-  readonly risks?: readonly string[];
-  readonly agentRunId?: Uuid;
-  readonly now: IsoUtcTimestamp;
-}
-
-export function createStoryboardProposal(
-  input: CreateStoryboardProposalInput,
-): StoryboardProposal {
-  const totalDurationSeconds = input.shots.reduce(
-    (sum, shot) => sum + shot.durationSeconds,
-    0,
-  );
-  const proposal: StoryboardProposal = {
-    id: input.id,
-    projectId: input.projectId,
-    revision: input.revision,
-    status: 'proposed',
-    shots: [...input.shots],
-    totalDurationSeconds,
-    durationToleranceSeconds:
-      input.durationToleranceSeconds ?? STORYBOARD_DURATION_TOLERANCE_SECONDS,
-    ...(input.objective !== undefined ? { objective: input.objective } : {}),
-    ...(input.assumptions !== undefined
-      ? { assumptions: [...input.assumptions] }
-      : {}),
-    ...(input.risks !== undefined ? { risks: [...input.risks] } : {}),
-    ...(input.agentRunId !== undefined ? { agentRunId: input.agentRunId } : {}),
-    version: 1,
-    createdAt: input.now,
-    updatedAt: input.now,
-  };
-  assertStoryboard(proposal);
-  return proposal;
 }
 
 export interface CreateShotInput {

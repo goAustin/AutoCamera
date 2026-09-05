@@ -120,14 +120,13 @@ if (!changelog.includes('v0.1.0-mvp')) {
 }
 
 const screenshotNames = [
-  '01-project-create.png',
-  '02-storyboard-approved.png',
-  '03-managed-workflow.png',
-  '04-revision-history.png',
-  '05-attempt-progress.png',
-  '06-artifact-review.png',
-  '07-timeline-recommendation.png',
-  '08-completed-project.png',
+  '01-run-history.png',
+  '02-artifact-review.png',
+  '03-run-accepted.png',
+  '04-recoverable-failure.png',
+  '05-retry-derived.png',
+  '06-finding-apply-confirmation.png',
+  '07-run-history-complete.png',
   '09-grafana-dashboard.png',
 ];
 for (const name of screenshotNames) {

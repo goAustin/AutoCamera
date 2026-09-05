@@ -1,29 +1,40 @@
-# Phase 7C evidence manifest
+# Phase 7D evidence manifest
 
 Release evidence level: **Offline fake**. Phase 6's named deterministic alias is
 `demo-project`; the screenshots contain no bearer tokens, private executor
 credentials, or model paths. The release commit is the commit containing this
 manifest; its hash is reported by the handoff after commit creation.
 
+Phase 7D removed the brief-first product (planning, storyboard approval, and
+the legacy per-shot workflow-authoring screens the previous evidence set
+walked through). The offline screenshot set below is regenerated from what
+replaced it: `StandaloneRunPage`, the durable run view mounted at `/` with no
+ComfyUI origin present, described in `70-PHASE-7-DESIGN-REFERENCE.md`. The
+ComfyUI-sidebar half of the run view already has its own evidence in the
+pinned ComfyUI editor shell set below (`comfy-frontend/05-videoops-managed-run.png`);
+this set does not duplicate it.
+
 ## Offline screenshot set
 
 | Filename | Capture command | Evidence level | Fixture/project alias | Secret review |
 |---|---|---|---|---|
-| `assets/screenshots/01-project-create.png` | `pnpm demo:screenshots` | `offline-fake` | `demo-project` | automatically reviewed by capture assertions and `pnpm security:scan` |
-| `assets/screenshots/02-storyboard-approved.png` | `pnpm demo:screenshots` | `offline-fake` | `demo-project` | automatically reviewed by capture assertions and `pnpm security:scan` |
-| `assets/screenshots/03-managed-workflow.png` | `pnpm demo:screenshots` | `offline-fake` | `demo-project` | automatically reviewed by capture assertions and `pnpm security:scan` |
-| `assets/screenshots/04-revision-history.png` | `pnpm demo:screenshots` | `offline-fake` | `demo-project` | automatically reviewed by capture assertions and `pnpm security:scan` |
-| `assets/screenshots/05-attempt-progress.png` | `pnpm demo:screenshots` | `offline-fake` | `demo-project` | automatically reviewed by capture assertions and `pnpm security:scan` |
-| `assets/screenshots/06-artifact-review.png` | `pnpm demo:screenshots` | `offline-fake` | `demo-project` | automatically reviewed by capture assertions and `pnpm security:scan` |
-| `assets/screenshots/07-timeline-recommendation.png` | `pnpm demo:screenshots` | `offline-fake` | `demo-project` | automatically reviewed by capture assertions and `pnpm security:scan` |
-| `assets/screenshots/08-completed-project.png` | `pnpm demo:screenshots` | `offline-fake` | `demo-project` | automatically reviewed by capture assertions and `pnpm security:scan` |
+| `assets/screenshots/01-run-history.png` | `pnpm demo:screenshots` | `offline-fake` | `demo-project` | automatically reviewed by capture assertions and `pnpm security:scan` |
+| `assets/screenshots/02-artifact-review.png` | `pnpm demo:screenshots` | `offline-fake` | `demo-project` | automatically reviewed by capture assertions and `pnpm security:scan` |
+| `assets/screenshots/03-run-accepted.png` | `pnpm demo:screenshots` | `offline-fake` | `demo-project` | automatically reviewed by capture assertions and `pnpm security:scan` |
+| `assets/screenshots/04-recoverable-failure.png` | `pnpm demo:screenshots` | `offline-fake` | `demo-project` | automatically reviewed by capture assertions and `pnpm security:scan` |
+| `assets/screenshots/05-retry-derived.png` | `pnpm demo:screenshots` | `offline-fake` | `demo-project` | automatically reviewed by capture assertions and `pnpm security:scan` |
+| `assets/screenshots/06-finding-apply-confirmation.png` | `pnpm demo:screenshots` | `offline-fake` | `demo-project` | automatically reviewed by capture assertions and `pnpm security:scan` |
+| `assets/screenshots/07-run-history-complete.png` | `pnpm demo:screenshots` | `offline-fake` | `demo-project` | automatically reviewed by capture assertions and `pnpm security:scan` |
 | `assets/screenshots/09-grafana-dashboard.png` | `pnpm exec playwright screenshot --wait-for-timeout 8000 --full-page http://127.0.0.1:3001/d/h3-videoops-phase6/... assets/screenshots/09-grafana-dashboard.png` | `offline-fake` | `demo-project` | visually reviewed; no private URLs, tokens, or model paths |
 
-The screenshot suite captures the project list/readiness page, proposal and
-approval, selected-shot fake panel, revision validation, managed attempt,
-artifact/evaluation review, event timeline/operator surface, and the supported
-completion state. It hides the development-token field before capture and
-does not include browser storage, cookies, private URLs, or model paths.
+The screenshot suite captures the run history list, artifact playback with a
+passed technical evaluation, human acceptance, a recoverable infrastructure
+failure with its human-in-the-loop retry confirmation, a derived retry's own
+passed review, an operator finding with its apply confirmation, and the final
+history list showing every run status the walkthrough produced. It hides the
+development-token field before capture and does not include browser storage,
+cookies, private URLs, or model paths. `COMFY_MODE=fake` drives every attempt;
+no GPU, model weights, or real H3 inference is involved.
 
 ## Pinned ComfyUI editor shell set
 
@@ -42,9 +53,10 @@ The evidence level therefore remains **Offline fake**.
 | `assets/screenshots/comfy-frontend/03-graph-to-prompt.png` | `pnpm test:e2e e2e/comfy-frontend.spec.ts` (`@comfy-frontend`) | `offline-fake` | Dual graph export assertion completed | captured locally; no tokens, private URLs, or model paths |
 
 The tagged set is intentionally skipped with a printed remediation reason when
-the ignored build is absent. The original nine screenshots above remain the
-release walkthrough and are still generated by `apps/web`; this editor set
-does not replace them or upgrade the evidence level to H3/GPU evidence.
+the ignored build is absent. The offline run-view walkthrough above and the
+observability capture remain separate release evidence, still generated by
+`apps/web`; this editor set does not replace them or upgrade the evidence
+level to H3/GPU evidence.
 
 ## ComfyUI-first inversion evidence
 

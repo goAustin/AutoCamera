@@ -63,122 +63,7 @@ describe('Phase 2 project API', () => {
     expect(JSON.stringify(invalid.json())).not.toContain('SQL');
   });
 
-  it('creates, plans, approves, retrieves, and costs a project', async () => {
-    const app = createApp();
-    const create = await app.inject({
-      method: 'POST',
-      url: '/v1/projects',
-      headers: authHeaders('create-1'),
-      payload: {
-        title: 'Launch film',
-        brief: 'A bright product launch in three beats.',
-        targetDurationSeconds: 5,
-        budgetUsd: '12.50',
-      },
-    });
-    expect(create.statusCode).toBe(201);
-    const project = create.json().project;
-    expect(project).toMatchObject({
-      status: 'draft',
-      budgetMicrousd: 12_500_000,
-      spentMicrousd: 0,
-      version: 1,
-    });
-
-    const plan = await app.inject({
-      method: 'POST',
-      url: `/v1/projects/${project.id}/plan`,
-      headers: authHeaders('plan-1'),
-      payload: {},
-    });
-    expect(plan.statusCode).toBe(200);
-    expect(plan.json().project.status).toBe('awaiting_storyboard_approval');
-    const proposal = plan.json().proposal;
-    expect(proposal.shots).toHaveLength(3);
-    expect(
-      proposal.shots.map((shot: { ordinal: number }) => shot.ordinal),
-    ).toEqual([1, 2, 3]);
-    expect(
-      proposal.shots.reduce(
-        (sum: number, shot: { durationSeconds: number }) =>
-          sum + shot.durationSeconds,
-        0,
-      ),
-    ).toBeCloseTo(5, 6);
-
-    const approval = await app.inject({
-      method: 'POST',
-      url: `/v1/projects/${project.id}/storyboard/approve`,
-      headers: authHeaders('approve-1'),
-      payload: { proposalId: proposal.id },
-    });
-    expect(approval.statusCode).toBe(200);
-    expect(approval.json().project.status).toBe('ready_for_generation');
-    expect(approval.json().shots).toHaveLength(3);
-    expect(
-      approval.json().shots.map((shot: { ordinal: number }) => shot.ordinal),
-    ).toEqual([1, 2, 3]);
-    expect(
-      approval
-        .json()
-        .shots.every(
-          (shot: { status: string }) =>
-            shot.status === 'approved_for_generation',
-        ),
-    ).toBe(true);
-
-    const retrieved = await app.inject({
-      method: 'GET',
-      url: `/v1/projects/${project.id}`,
-      headers: authHeaders(),
-    });
-    expect(retrieved.statusCode).toBe(200);
-    expect(retrieved.json().project.status).toBe('ready_for_generation');
-
-    const shots = await app.inject({
-      method: 'GET',
-      url: `/v1/projects/${project.id}/shots`,
-      headers: authHeaders(),
-    });
-    expect(shots.json().shots).toHaveLength(3);
-
-    const events = await app.inject({
-      method: 'GET',
-      url: `/v1/projects/${project.id}/events`,
-      headers: authHeaders(),
-    });
-    expect(events.statusCode).toBe(200);
-    expect(
-      events.json().events.map((event: { type: string }) => event.type),
-    ).toEqual([
-      'project.created',
-      'project.planning_started',
-      'storyboard.proposed',
-      'project.planned',
-      'storyboard.approved',
-      'shot.created',
-      'shot.created',
-      'shot.created',
-      'project.ready_for_generation',
-    ]);
-    expect(JSON.stringify(events.json())).not.toContain(
-      'bright product launch',
-    );
-
-    const cost = await app.inject({
-      method: 'GET',
-      url: `/v1/projects/${project.id}/cost`,
-      headers: authHeaders(),
-    });
-    expect(cost.statusCode).toBe(200);
-    expect(cost.json()).toMatchObject({
-      budgetMicrousd: 12_500_000,
-      spentMicrousd: 0,
-      remainingMicrousd: 12_500_000,
-    });
-  });
-
-  it('replays identical mutations, rejects key reuse, and never duplicates approval shots', async () => {
+  it('replays identical mutations and rejects idempotency key reuse', async () => {
     const app = createApp();
     const payload = {
       title: 'Idempotent project',
@@ -212,53 +97,6 @@ describe('Phase 2 project API', () => {
     });
     expect(conflict.statusCode).toBe(409);
     expect(conflict.json()).toMatchObject({ code: 'IDEMPOTENCY_KEY_REUSED' });
-
-    const projectId = first.json().project.id;
-    const plan = await app.inject({
-      method: 'POST',
-      url: `/v1/projects/${projectId}/plan`,
-      headers: authHeaders('same-plan'),
-      payload: {},
-    });
-    const planReplay = await app.inject({
-      method: 'POST',
-      url: `/v1/projects/${projectId}/plan`,
-      headers: authHeaders('same-plan'),
-      payload: {},
-    });
-    expect(planReplay.json()).toEqual(plan.json());
-    const proposalId = plan.json().proposal.id;
-
-    const approval = await app.inject({
-      method: 'POST',
-      url: `/v1/projects/${projectId}/storyboard/approve`,
-      headers: authHeaders('same-approval'),
-      payload: { proposalId },
-    });
-    const approvalReplay = await app.inject({
-      method: 'POST',
-      url: `/v1/projects/${projectId}/storyboard/approve`,
-      headers: authHeaders('same-approval'),
-      payload: { proposalId },
-    });
-    expect(approvalReplay.json()).toEqual(approval.json());
-
-    const duplicateApproval = await app.inject({
-      method: 'POST',
-      url: `/v1/projects/${projectId}/storyboard/approve`,
-      headers: authHeaders('different-approval'),
-      payload: { proposalId },
-    });
-    expect(duplicateApproval.statusCode).toBe(409);
-    expect(duplicateApproval.json()).toMatchObject({
-      code: 'STORYBOARD_NOT_APPROVABLE',
-    });
-    const shots = await app.inject({
-      method: 'GET',
-      url: `/v1/projects/${projectId}/shots`,
-      headers: authHeaders(),
-    });
-    expect(shots.json().shots).toHaveLength(3);
   });
 
   it('serializes concurrent identical create requests to one effect', async () => {
@@ -303,11 +141,10 @@ describe('Phase 2 project API', () => {
       expect.arrayContaining([
         '/v1/projects',
         '/v1/projects/{projectId}',
-        '/v1/projects/{projectId}/plan',
-        '/v1/projects/{projectId}/storyboard/approve',
-        '/v1/projects/{projectId}/shots',
         '/v1/projects/{projectId}/events',
         '/v1/projects/{projectId}/cost',
+        '/v1/runs',
+        '/v1/runs/{runId}',
       ]),
     );
     expect(createTraceId()).toMatch(/^[0-9a-f]{32}$/);

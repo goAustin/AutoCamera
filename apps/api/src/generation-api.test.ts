@@ -63,22 +63,29 @@ describe('Phase 3 generation API', () => {
     expect(projectResponse.statusCode).toBe(201);
     const projectId = projectResponse.json().project.id as string;
 
-    const planResponse = await app.inject({
+    // Phase 7D removed `POST /v1/projects/:projectId/plan` and
+    // `.../storyboard/approve`; seed the shot the way a real client now
+    // must, by submitting a run that fails validation. That still creates
+    // the project's implicit shot (and a `shot.created` event) without
+    // reaching attempt creation, leaving the shot `approved_for_generation`.
+    const invalidRun = await app.inject({
       method: 'POST',
-      url: `/v1/projects/${projectId}/plan`,
-      headers: { ...auth, 'idempotency-key': 'plan-1' },
-      payload: {},
+      url: '/v1/runs',
+      headers: { ...auth, 'idempotency-key': 'seed-run-1' },
+      payload: { projectId, editorGraph: {}, apiGraph: {} },
     });
-    expect(planResponse.statusCode).toBe(200);
-    const proposalId = planResponse.json().proposal.id as string;
-    const approvalResponse = await app.inject({
-      method: 'POST',
-      url: `/v1/projects/${projectId}/storyboard/approve`,
-      headers: { ...auth, 'idempotency-key': 'approve-1' },
-      payload: { proposalId },
+    expect(invalidRun.statusCode).toBe(422);
+    const seedEvents = await app.inject({
+      method: 'GET',
+      url: `/v1/projects/${projectId}/events`,
+      headers: auth,
     });
-    expect(approvalResponse.statusCode).toBe(200);
-    const shotId = approvalResponse.json().shots[0].id as string;
+    const shotCreated = (
+      seedEvents.json().events as ReadonlyArray<Record<string, unknown>>
+    ).find((event) => event.type === 'shot.created');
+    const shotId = shotCreated?.shotId as string | undefined;
+    if (!shotId)
+      throw new Error('Expected a shot.created event with a shotId.');
 
     const create = await app.inject({
       method: 'POST',
@@ -132,7 +139,13 @@ describe('Phase 3 generation API', () => {
     expect(acceptedReplay.json()).toEqual(accepted.json());
   });
 
-  it('rejects and regenerates through the review routes with a derivation link', async () => {
+  it('rejects and retries through the review routes with a derivation link', async () => {
+    // Phase 7D removed `POST /v1/attempts/:attemptId/regenerate` (no client
+    // ever called it) and, with it, `.../plan` and `.../storyboard/approve`.
+    // `POST /v1/attempts/:attemptId/retry` is the live recovery path
+    // instead (the only one `AttemptCard`'s "Retry with confirmation"
+    // button uses), so this now exercises that route for the same
+    // derivation-link invariant the deleted regenerate route used to cover.
     const { app, worker } = await setupApi();
     const project = await app.inject({
       method: 'POST',
@@ -145,19 +158,24 @@ describe('Phase 3 generation API', () => {
       },
     });
     const projectId = project.json().project.id as string;
-    const plan = await app.inject({
+    const invalidRun = await app.inject({
       method: 'POST',
-      url: `/v1/projects/${projectId}/plan`,
-      headers: { ...auth, 'idempotency-key': 'plan-reject' },
-      payload: {},
+      url: '/v1/runs',
+      headers: { ...auth, 'idempotency-key': 'seed-run-reject' },
+      payload: { projectId, editorGraph: {}, apiGraph: {} },
     });
-    const approve = await app.inject({
-      method: 'POST',
-      url: `/v1/projects/${projectId}/storyboard/approve`,
-      headers: { ...auth, 'idempotency-key': 'approve-reject' },
-      payload: { proposalId: plan.json().proposal.id },
+    expect(invalidRun.statusCode).toBe(422);
+    const seedEvents = await app.inject({
+      method: 'GET',
+      url: `/v1/projects/${projectId}/events`,
+      headers: auth,
     });
-    const shotId = approve.json().shots[1].id as string;
+    const shotCreated = (
+      seedEvents.json().events as ReadonlyArray<Record<string, unknown>>
+    ).find((event) => event.type === 'shot.created');
+    const shotId = shotCreated?.shotId as string | undefined;
+    if (!shotId)
+      throw new Error('Expected a shot.created event with a shotId.');
     const create = await app.inject({
       method: 'POST',
       url: `/v1/shots/${shotId}/attempts`,
@@ -173,15 +191,14 @@ describe('Phase 3 generation API', () => {
       payload: { reasonCode: 'too_dark' },
     });
     expect(rejected.statusCode).toBe(200);
-    const regenerated = await app.inject({
+    const retried = await app.inject({
       method: 'POST',
-      url: `/v1/attempts/${attemptId}/regenerate`,
-      headers: { ...auth, 'idempotency-key': 'regenerate-1' },
-      payload: { seed: 99 },
+      url: `/v1/attempts/${attemptId}/retry`,
+      headers: { ...auth, 'idempotency-key': 'retry-1' },
+      payload: {},
     });
-    expect(regenerated.statusCode).toBe(201);
-    expect(regenerated.json().attempt.sourceAttemptId).toBe(attemptId);
-    expect(regenerated.json().attempt.seed).toBe(99);
+    expect(retried.statusCode).toBe(201);
+    expect(retried.json().attempt.sourceAttemptId).toBe(attemptId);
   });
 
   it('returns problem details for missing authentication and invalid shot IDs', async () => {

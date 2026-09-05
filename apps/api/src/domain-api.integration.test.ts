@@ -8,6 +8,7 @@ import {
   createPostgresStore,
   runMigrations,
 } from '@h3/db';
+import { loadMinimaxH3Fixtures } from '@h3/workflow-compiler';
 import { buildApiApp } from './app.js';
 
 const databaseUrl =
@@ -49,7 +50,6 @@ describe('Phase 2 PostgreSQL persistence', () => {
     const requiredTables = [
       'tenants',
       'video_projects',
-      'storyboard_proposals',
       'shots',
       'generation_attempts',
       'workflow_versions',
@@ -112,7 +112,13 @@ describe('Phase 2 PostgreSQL persistence', () => {
     ]);
   });
 
-  it('persists the complete project, storyboard, shot, event, outbox, and cost flow', async () => {
+  it('persists the complete project, shot, revision, attempt, event, outbox, and cost flow', async () => {
+    // Phase 7D removed storyboard planning; the durable core is now exercised
+    // through `POST /v1/runs`, the graph-first path that replaced it. This
+    // still verifies the same thing the deleted plan/approve version did:
+    // that project, shot, event, outbox, and cost all round-trip through
+    // real PostgreSQL.
+    const fixtures = await loadMinimaxH3Fixtures();
     const create = await app.inject({
       method: 'POST',
       url: '/v1/projects',
@@ -135,33 +141,19 @@ describe('Phase 2 PostgreSQL persistence', () => {
       version: 1,
     });
 
-    const plan = await app.inject({
+    const run = await app.inject({
       method: 'POST',
-      url: `/v1/projects/${project.id}/plan`,
-      headers: authHeaders(uniqueKey('pg-plan')),
-      payload: {},
+      url: '/v1/runs',
+      headers: authHeaders(uniqueKey('pg-run')),
+      payload: {
+        projectId: project.id,
+        editorGraph: fixtures.editorGraph,
+        apiGraph: fixtures.apiGraph,
+      },
     });
-    expect(plan.statusCode).toBe(200);
-    const plannedProject = plan.json().project as { status: string };
-    const proposal = plan.json().proposal as {
-      id: string;
-      shots: Array<{ ordinal: number; durationSeconds: number }>;
-    };
-    expect(plannedProject.status).toBe('awaiting_storyboard_approval');
-    expect(proposal.shots.map((shot) => shot.ordinal)).toEqual([1, 2, 3]);
-    expect(
-      proposal.shots.reduce((sum, shot) => sum + shot.durationSeconds, 0),
-    ).toBeCloseTo(5, 6);
-
-    const approval = await app.inject({
-      method: 'POST',
-      url: `/v1/projects/${project.id}/storyboard/approve`,
-      headers: authHeaders(uniqueKey('pg-approve')),
-      payload: { proposalId: proposal.id },
-    });
-    expect(approval.statusCode).toBe(200);
-    expect(approval.json().project.status).toBe('ready_for_generation');
-    expect(approval.json().shots).toHaveLength(3);
+    expect(run.statusCode).toBe(201);
+    const runId = run.json().runId as string;
+    expect(run.json().status).toBe('queued');
 
     const retrieved = await app.inject({
       method: 'GET',
@@ -171,30 +163,9 @@ describe('Phase 2 PostgreSQL persistence', () => {
     expect(retrieved.statusCode).toBe(200);
     expect(retrieved.json().project).toMatchObject({
       id: project.id,
-      status: 'ready_for_generation',
+      status: 'generating',
       budgetMicrousd: 12_500_000,
-      spentMicrousd: 0,
-      version: 4,
     });
-
-    const shots = await app.inject({
-      method: 'GET',
-      url: `/v1/projects/${project.id}/shots`,
-      headers: authHeaders(),
-    });
-    expect(shots.statusCode).toBe(200);
-    expect(shots.json().shots).toHaveLength(3);
-    expect(
-      shots.json().shots.map((shot: { ordinal: number }) => shot.ordinal),
-    ).toEqual([1, 2, 3]);
-    expect(
-      shots
-        .json()
-        .shots.every(
-          (shot: { status: string }) =>
-            shot.status === 'approved_for_generation',
-        ),
-    ).toBe(true);
 
     const events = await app.inject({
       method: 'GET',
@@ -202,18 +173,15 @@ describe('Phase 2 PostgreSQL persistence', () => {
       headers: authHeaders(),
     });
     expect(events.statusCode).toBe(200);
-    expect(
-      events.json().events.map((event: { type: string }) => event.type),
-    ).toEqual([
+    const eventTypes = events
+      .json()
+      .events.map((event: { type: string }) => event.type);
+    expect(eventTypes).toEqual([
       'project.created',
-      'project.planning_started',
-      'storyboard.proposed',
-      'project.planned',
-      'storyboard.approved',
-      'shot.created',
-      'shot.created',
-      'shot.created',
       'project.ready_for_generation',
+      'shot.created',
+      'attempt.queued',
+      'run.created',
     ]);
 
     const cost = await app.inject({
@@ -222,43 +190,34 @@ describe('Phase 2 PostgreSQL persistence', () => {
       headers: authHeaders(),
     });
     expect(cost.statusCode).toBe(200);
-    expect(cost.json()).toMatchObject({
-      budgetMicrousd: 12_500_000,
-      spentMicrousd: 0,
-      remainingMicrousd: 12_500_000,
-    });
+    expect(cost.json()).toMatchObject({ budgetMicrousd: 12_500_000 });
 
-    const persistedProject = await pool.query<{
-      status: string;
-      version: number;
-    }>('SELECT status, version FROM video_projects WHERE id = $1', [
-      project.id,
-    ]);
-    expect(persistedProject.rows).toEqual([
-      { status: 'ready_for_generation', version: 4 },
-    ]);
-
-    const persistedProposal = await pool.query<{ status: string }>(
-      'SELECT status FROM storyboard_proposals WHERE id = $1',
-      [proposal.id],
+    const persistedProject = await pool.query<{ status: string }>(
+      'SELECT status FROM video_projects WHERE id = $1',
+      [project.id],
     );
-    expect(persistedProposal.rows).toEqual([{ status: 'approved' }]);
+    expect(persistedProject.rows).toEqual([{ status: 'generating' }]);
 
     const persistedShots = await pool.query<{
       ordinal: number;
       status: string;
+      implicit: boolean;
     }>(
-      `SELECT ordinal, status
+      `SELECT ordinal, status, implicit
        FROM shots
        WHERE project_id = $1
        ORDER BY ordinal`,
       [project.id],
     );
     expect(persistedShots.rows).toEqual([
-      { ordinal: 1, status: 'approved_for_generation' },
-      { ordinal: 2, status: 'approved_for_generation' },
-      { ordinal: 3, status: 'approved_for_generation' },
+      { ordinal: 1, status: 'queued', implicit: true },
     ]);
+
+    const persistedAttempts = await pool.query<{ id: string; status: string }>(
+      'SELECT id, status FROM generation_attempts WHERE project_id = $1',
+      [project.id],
+    );
+    expect(persistedAttempts.rows).toEqual([{ id: runId, status: 'queued' }]);
 
     const persistedEvents = await pool.query<{ type: string }>(
       `SELECT type
@@ -267,9 +226,7 @@ describe('Phase 2 PostgreSQL persistence', () => {
        ORDER BY event_sequence`,
       [project.id],
     );
-    expect(persistedEvents.rows.map((row) => row.type)).toEqual(
-      events.json().events.map((event: { type: string }) => event.type),
-    );
+    expect(persistedEvents.rows.map((row) => row.type)).toEqual(eventTypes);
 
     const persistedOutbox = await pool.query<{ count: number }>(
       `SELECT count(*)::int AS count
@@ -278,7 +235,7 @@ describe('Phase 2 PostgreSQL persistence', () => {
        WHERE event.project_id = $1`,
       [project.id],
     );
-    expect(persistedOutbox.rows[0]?.count).toBe(9);
+    expect(persistedOutbox.rows[0]?.count).toBe(eventTypes.length);
   });
 
   it('serializes concurrent PostgreSQL idempotency and replays or rejects reuse', async () => {

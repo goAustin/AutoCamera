@@ -1,7 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
   createShot,
-  createStoryboardProposal,
   createUuidV7,
   createVideoProject,
   parseUsdToMicrousd,
@@ -49,32 +48,25 @@ async function seedProject(
     budgetMicrousd: parseUsdToMicrousd('25'),
     now: timestamp,
   });
-  const proposal = createStoryboardProposal({
-    id: id(seed + 2),
-    projectId: project.id,
-    revision: 1,
-    shots: [1, 2, 3].map((ordinal) => ({
-      ordinal: ordinal as 1 | 2 | 3,
-      purpose: `Purpose ${ordinal}`,
-      prompt: `Prompt ${ordinal}`,
-      durationSeconds: 1,
-      mode: 't2v' as const,
-      qualityTier: 'preview' as const,
-      visualDescription: `Visual ${ordinal}`,
-      cameraDirection: `Camera ${ordinal}`,
-      audioDirection: `Audio ${ordinal}`,
-      acceptanceCriteria: [`Criterion ${ordinal}`],
-      requiredAssetIds: [],
-    })),
-    now: timestamp,
-  });
-  const definition = proposal.shots[0];
-  if (!definition) throw new Error('Expected a shot definition.');
+  // Phase 7D removed storyboard materialization; every surviving shot is
+  // implicit, created directly rather than promoted from a proposal.
   const shot = createShot({
     id: id(seed + 3),
     projectId: project.id,
-    storyboardProposalId: proposal.id,
-    definition,
+    implicit: true,
+    definition: {
+      ordinal: 1,
+      purpose: 'Purpose 1',
+      prompt: 'Prompt 1',
+      durationSeconds: 1,
+      mode: 't2v',
+      qualityTier: 'preview',
+      visualDescription: 'Visual 1',
+      cameraDirection: 'Camera 1',
+      audioDirection: 'Audio 1',
+      acceptanceCriteria: ['Criterion 1'],
+      requiredAssetIds: [],
+    },
     now: timestamp,
   });
   await store.withTransaction(async (repositories) => {
@@ -84,7 +76,6 @@ async function seedProject(
       timestamp,
     );
     await repositories.projects.create(project);
-    await repositories.storyboards.create(proposal);
     await repositories.shots.createMany([shot]);
   });
   return { tenantId, projectId: project.id, shotId: shot.id };

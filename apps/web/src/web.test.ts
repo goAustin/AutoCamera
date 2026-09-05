@@ -1,5 +1,6 @@
 import { unresolvableNodeClasses } from './App.js';
 import { describe, expect, it } from 'vitest';
+import * as api from './api.js';
 import { parseSseFrames } from './api.js';
 import {
   BRIDGE_SCHEMA_VERSION,
@@ -132,5 +133,53 @@ describe('managed run graph fidelity guard', () => {
 
   it('treats a non-object export as empty rather than throwing', () => {
     expect(unresolvableNodeClasses(undefined, resolved)).toEqual([]);
+  });
+});
+
+describe('apps/web/src/api.ts export surface', () => {
+  // `RunView` (plus the recovery-path components it renders -- `AttemptCard`,
+  // `ArtifactPlayer`, `RecommendationPanel`) and `ManagedPanelPage`'s own
+  // bridge logic call exactly these `api.ts` functions. A later deletion in
+  // `api.ts` (e.g. mistaking one of these for more brief-first surface)
+  // would silently break the run view with no compile error, since
+  // `apps/web` is only checked with `tsc --noEmit` and JavaScript does not
+  // fail a missing named export until the call site actually runs. This
+  // test is the guard the checkpoint requires for that.
+  const requiredExports = [
+    'acceptAttempt',
+    'applyRecommendation',
+    'createRun',
+    'dismissRecommendation',
+    'fetchArtifact',
+    'fetchProjectEventStream',
+    'getAttemptDetail',
+    'getRun',
+    'listRecommendations',
+    'listRuns',
+    'rejectAttempt',
+    'retryAttempt',
+    'pinRun',
+    'reviewRun',
+    'unpinRun',
+    'validateWorkflowRevision',
+  ] as const;
+
+  it.each(requiredExports)('still exports %s as a function', (name) => {
+    expect(typeof (api as Record<string, unknown>)[name]).toBe('function');
+  });
+
+  it('still exports the project-management functions step 5 requires, even though RunView has no project-management UI of its own', () => {
+    // `POST /v1/projects` (with `budgetUsd`) and `GET .../cost` are the cost
+    // breaker (design doc step 5); `getProject` and `listProjects` back it.
+    // RunView never calls these itself -- it has no project-creation or
+    // project-list screen -- but they must stay exported.
+    for (const name of [
+      'createProject',
+      'getProject',
+      'listProjects',
+      'getCost',
+    ]) {
+      expect(typeof (api as Record<string, unknown>)[name]).toBe('function');
+    }
   });
 });

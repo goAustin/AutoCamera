@@ -4,13 +4,17 @@ import { expect, test, type Page } from '@playwright/test';
 // with no ComfyUI origin present at all. `apps/web/src/App.tsx` carries the
 // same recovery-path components (`AttemptCard`, `ArtifactPlayer`,
 // `RecommendationPanel`, `RevisionHistory`, `EvaluationPanel`,
-// `EventTimeline`, `ConfirmPanel`) that the legacy Studio in
-// `project-studio.spec.ts` already exercises; this file proves the same
-// underlying attempt lifecycle is reachable and actionable through the new
-// run view instead. It ports that file's four behaviours (see the
-// `describe` block referencing it below) and adds the new standalone-page
-// coverage the 7D checkpoint requires. `project-studio.spec.ts` itself is
-// left in place and still green -- this file only adds coverage.
+// `EventTimeline`, `ConfirmPanel`) that the legacy Studio in the
+// now-deleted `project-studio.spec.ts` used to exercise; this file ports
+// that spec's four behaviours (see the `describe` block referencing it
+// below) against the new run view instead, and adds the new
+// standalone-page coverage the Phase 7D checkpoint requires. Phase 7D step
+// 3 removed the legacy Studio screens themselves (`ProjectListPage`,
+// `ProjectStudioPage`, `StoryboardSection`, `ShotWorkspace`, and the
+// `/plan` and `/storyboard/approve` routes their fixtures used to call),
+// so shot seeding below goes through `POST /v1/runs` with a deliberately
+// invalid graph instead -- the durable core's only remaining way to
+// materialize an implicit shot without also queuing an attempt on it.
 
 const token = 'e2e-token';
 const apiOrigin =
@@ -34,6 +38,8 @@ async function apiCall(
     readonly method?: string;
     readonly body?: unknown;
     readonly key?: string;
+    /** Set to a specific status to assert a deliberately-failing call instead of a 2xx. */
+    readonly expectStatus?: number;
   } = {},
 ): Promise<Record<string, unknown>> {
   const headers: Record<string, string> = {
@@ -49,19 +55,31 @@ async function apiCall(
   const response = await fetch(`${apiOrigin}${path}`, init);
   const text = await response.text();
   const payload = text ? (JSON.parse(text) as Record<string, unknown>) : {};
-  expect(response.ok, `${path} -> ${JSON.stringify(payload)}`).toBe(true);
+  if (options.expectStatus !== undefined) {
+    expect(response.status, `${path} -> ${JSON.stringify(payload)}`).toBe(
+      options.expectStatus,
+    );
+  } else {
+    expect(response.ok, `${path} -> ${JSON.stringify(payload)}`).toBe(true);
+  }
   return payload;
 }
 
 /**
  * `RunView` never exposes a shot or a project-creation form of its own --
- * that authoring surface lives only in the legacy Studio, which this
- * checkpoint keeps working but does not route through here. These tests
- * seed the durable core directly through the same REST endpoints the
- * legacy UI calls (`project-studio.spec.ts`'s own `apiJson` helper uses the
- * identical pattern for its infrastructure-failure case), then drive
- * `RunView` itself for every assertion the checkpoint actually cares about:
- * review, retry, playback, and findings.
+ * that authoring surface does not exist anywhere any more; Phase 7D removed
+ * the planner UI and `POST /v1/projects/:projectId/plan` and
+ * `.../storyboard/approve` along with it. These tests seed the durable core
+ * directly through the REST endpoints that remain: create a project, then
+ * submit `POST /v1/runs` with a graph that fails validation. That still
+ * creates the project's implicit shot (and a `shot.created` domain event)
+ * without ever reaching attempt creation, leaving the shot
+ * `approved_for_generation` -- the same invariant the "invalid graph creates
+ * no attempt" test below now verifies directly. `GET .../events` is the only
+ * remaining way to recover the shot's id, since shots are never listed.
+ * `createScenarioAttempt` then drives `POST /v1/shots/:shotId/attempts`
+ * itself for every assertion the checkpoint actually cares about: review,
+ * retry, playback, and findings.
  */
 async function createApprovedShot(prefix: string): Promise<string> {
   const suffix = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -77,23 +95,19 @@ async function createApprovedShot(prefix: string): Promise<string> {
     },
   });
   const projectId = (created.project as Record<string, unknown>).id as string;
-  const planned = await apiCall(`/v1/projects/${projectId}/plan`, {
+  await apiCall('/v1/runs', {
     method: 'POST',
-    key: `run-view-plan-${suffix}`,
+    key: `run-view-seed-run-${suffix}`,
+    body: { projectId, editorGraph: {}, apiGraph: {} },
+    expectStatus: 422,
   });
-  const proposal = planned.proposal as Record<string, unknown>;
-  const approved = await apiCall(
-    `/v1/projects/${projectId}/storyboard/approve`,
-    {
-      method: 'POST',
-      key: `run-view-approve-${suffix}`,
-      body: { proposalId: proposal.id },
-    },
-  );
-  const shots = approved.shots as ReadonlyArray<Record<string, unknown>>;
-  const shotId = shots[0]?.id as string | undefined;
+  const events = await apiCall(`/v1/projects/${projectId}/events`);
+  const shotCreated = (
+    events.events as ReadonlyArray<Record<string, unknown>>
+  ).find((event) => event.type === 'shot.created');
+  const shotId = shotCreated?.shotId as string | undefined;
   if (!shotId) {
-    throw new Error('Approving the storyboard did not materialize a shot.');
+    throw new Error('Expected a shot.created event with a shotId.');
   }
   return shotId;
 }
@@ -162,9 +176,10 @@ async function selectRun(page: Page, runId: string): Promise<void> {
 }
 
 test.describe('RunView, ported from project-studio.spec.ts', () => {
-  // These four cases port the coverage at e2e/project-studio.spec.ts:133,
-  // :166, :214, and :240 so it exists against RunView before that spec is
-  // ever deleted. The original spec is untouched and still runs.
+  // These four cases ported the coverage that used to live at
+  // e2e/project-studio.spec.ts:133, :166, :214, and :240. That spec is now
+  // deleted (Phase 7D step 3): its four behaviours were confirmed passing
+  // here first, against RunView, before it was removed.
 
   test('lists a run through review with state reconstructed after refresh', async ({
     page,
@@ -248,56 +263,44 @@ test.describe('RunView, ported from project-studio.spec.ts', () => {
     ).toBeVisible();
   });
 
-  test('an invalid graph creates no attempt, so no new run surfaces here either', async ({
+  test('an invalid graph creates no attempt, so no new run surfaces in RunView either', async ({
     page,
   }) => {
-    // RunView has no workflow-authoring surface: submitting a graph at all
-    // is only reachable through the legacy Studio (kept working, unmodified,
-    // by this checkpoint). What this test proves against RunView is the
-    // invariant the original case protects -- an invalid revision creates no
-    // attempt -- by showing the run list RunView reads from gains no entry.
+    // RunView has no workflow-authoring surface, and Phase 7D removed the
+    // legacy Studio screens that used to have one (they drove this same
+    // invariant through a UI form). `POST /v1/runs` is now the only
+    // graph-submission path in the tree, so submit an invalid graph directly
+    // through it -- proving the original case's invariant, that an invalid
+    // revision creates no attempt, at the layer that actually enforces it --
+    // then confirm the run list RunView reads from gains no entry either.
     const before = await apiCall('/v1/runs?limit=50');
     const beforeCount = (before.runs as ReadonlyArray<unknown>).length;
 
-    await page.goto('/projects');
-    await page.getByLabel('Development token').fill(token);
-    await page.getByRole('button', { name: 'Enter Project Studio' }).click();
-    await expect(
-      page.getByRole('heading', { name: 'Projects that stay explainable.' }),
-    ).toBeVisible();
-    await page.getByLabel('Project title').fill(uniqueName('Run view invalid'));
-    await page
-      .getByLabel('Creative brief')
-      .fill(
-        'A premium product story with clear motion and natural stereo sound.',
-      );
-    await page.getByLabel('Target duration (seconds)').fill('15');
-    await page.getByLabel('Budget (USD)').fill('25.00');
-    await page.getByRole('button', { name: 'Create project' }).click();
-    await expect(
-      page.getByRole('heading', { name: 'Storyboard' }),
-    ).toBeVisible();
-    await page.getByRole('button', { name: 'Plan with Pi' }).click();
-    await expect(page.getByText('Ready for human approval')).toBeVisible();
-    await page.getByRole('button', { name: 'Approve storyboard' }).click();
-    await expect(
-      page.getByText('The storyboard is approved.', { exact: false }),
-    ).toBeVisible();
-    await page.getByRole('link', { name: /Shot 01/ }).click();
-    await expect(
-      page.getByRole('heading', { name: 'Shape the managed graph' }),
-    ).toBeVisible();
-    await page.getByLabel('Width').fill('950');
-    await page
-      .getByRole('button', { name: 'Create revision & validate' })
-      .click();
-    await expect(
-      page.getByText('saved with validation errors', { exact: false }),
-    ).toBeVisible();
-    await expect(
-      page.getByRole('button', { name: 'Generate managed' }),
-    ).toBeDisabled();
-    await expect(page.getByText('No managed attempts')).toBeVisible();
+    const suffix = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const created = await apiCall('/v1/projects', {
+      method: 'POST',
+      key: `run-view-invalid-project-${suffix}`,
+      body: {
+        title: uniqueName('Run view invalid'),
+        brief:
+          'A premium product story with clear motion and natural stereo sound.',
+        targetDurationSeconds: 15,
+        budgetUsd: '25.00',
+      },
+    });
+    const projectId = (created.project as Record<string, unknown>).id as string;
+    const invalid = await apiCall('/v1/runs', {
+      method: 'POST',
+      key: `run-view-invalid-run-${suffix}`,
+      body: { projectId, editorGraph: {}, apiGraph: {} },
+      expectStatus: 422,
+    });
+    expect(invalid.runId).toBeNull();
+    const validation = invalid.validation as Record<string, unknown>;
+    expect(validation.status).toBe('invalid');
+    expect(
+      (validation.errors as ReadonlyArray<unknown>).length,
+    ).toBeGreaterThan(0);
 
     const after = await apiCall('/v1/runs?limit=50');
     const afterCount = (after.runs as ReadonlyArray<unknown>).length;

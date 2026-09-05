@@ -25,7 +25,6 @@ import {
   type IdGenerator,
   type MicroUsd,
   type Shot,
-  type StoryboardProposal,
   type Uuid,
   type VideoProject,
   isGenerationAttemptStatus,
@@ -41,7 +40,6 @@ import {
   type Repositories,
   type OperationalRecommendationRecord,
   type TransactionalStore,
-  type WorkflowDraftRecord,
   type WorkflowRevisionRecord,
 } from '@h3/db';
 import { getApiConfig, type ApiConfig } from '@h3/config';
@@ -69,20 +67,13 @@ import {
   ApplicationError,
   DEV_TENANT_ID,
   ProjectApplicationService,
-  type PlanningAgent,
 } from './application.js';
-import {
-  PiPlanningAgent,
-  PlanningAgentError,
-  type FauxPlanningScript,
-} from './agent.js';
 import {
   GenerationApplicationService,
   GenerationApplicationError,
   GenerationWorker,
   PREVIEW_DURATION_SECONDS,
   type CreateAttemptCommand,
-  type CreateManagedAttemptCommand,
   type RetryAttemptCommand,
 } from './generation.js';
 import {
@@ -124,11 +115,9 @@ export interface ApiAppOptions {
   readonly config?: ApiConfig;
   readonly databaseReady?: () => Promise<boolean>;
   readonly store?: TransactionalStore;
-  readonly planner?: PlanningAgent;
   readonly telemetry?: AgentTelemetry;
   readonly metrics?: MetricsRegistry;
   readonly traceContexts?: TraceContextRegistry;
-  readonly planningScript?: FauxPlanningScript;
   readonly clock?: Clock;
   readonly idGenerator?: IdGenerator;
   readonly comfyClient?: ComfyClient;
@@ -195,10 +184,6 @@ const createProjectBodySchema = z
   })
   .strict();
 
-const approveStoryboardBodySchema = z
-  .object({ proposalId: z.string().uuid().optional() })
-  .strict();
-
 const createAttemptBodySchema = z
   .object({
     seed: z.number().int().optional(),
@@ -218,42 +203,6 @@ const createAttemptBodySchema = z
 
 const rejectAttemptBodySchema = z
   .object({ reasonCode: z.string().trim().min(1).max(64) })
-  .strict();
-
-const workflowDraftBodySchema = z
-  .object({
-    editorGraph: z.unknown().optional(),
-    editorGraphJson: z.unknown().optional(),
-    lastApiGraph: z.unknown().nullable().optional(),
-    lastApiGraphJson: z.unknown().nullable().optional(),
-    baseRevisionId: z.string().uuid().nullable().optional(),
-    profileId: z.string().trim().min(1).max(128).optional(),
-    profileVersion: z.string().trim().min(1).max(64).optional(),
-    authorType: z.string().trim().min(1).max(64).optional(),
-    authorId: z.string().trim().min(1).max(200).optional(),
-    expectedVersion: z.number().int().positive().optional(),
-  })
-  .strict();
-
-const workflowRevisionBodySchema = z
-  .object({
-    editorGraph: z.unknown().optional(),
-    editorGraphJson: z.unknown().optional(),
-    apiGraph: z.unknown().optional(),
-    apiGraphJson: z.unknown().optional(),
-    parentRevisionId: z.string().uuid().nullable().optional(),
-    profileId: z.string().trim().min(1).max(128).optional(),
-    profileVersion: z.string().trim().min(1).max(64).optional(),
-    source: z.enum(['comfy_editor', 'official_template', 'system']).optional(),
-    frontendVersion: z.string().trim().min(1).max(128).optional(),
-    frontendCommit: z.string().trim().min(1).max(128).optional(),
-    authorType: z.string().trim().min(1).max(64).optional(),
-    authorId: z.string().trim().min(1).max(200).optional(),
-  })
-  .strict();
-
-const managedAttemptBodySchema = z
-  .object({ workflowRevisionId: z.string().uuid() })
   .strict();
 
 const retryAttemptBodySchema = z
@@ -288,17 +237,12 @@ const runReviewBodySchema = z
 
 type CreateAttemptBody = z.infer<typeof createAttemptBodySchema>;
 type RejectAttemptBody = z.infer<typeof rejectAttemptBodySchema>;
-type WorkflowDraftBody = z.infer<typeof workflowDraftBodySchema>;
-type WorkflowRevisionBody = z.infer<typeof workflowRevisionBodySchema>;
-type ManagedAttemptBody = z.infer<typeof managedAttemptBodySchema>;
 type RetryAttemptBody = z.infer<typeof retryAttemptBodySchema>;
 type RecommendationActionBody = z.infer<typeof recommendationActionBodySchema>;
 type RunBody = z.infer<typeof runBodySchema>;
 type RunReviewBody = z.infer<typeof runReviewBodySchema>;
 
 type CreateProjectBody = z.infer<typeof createProjectBodySchema>;
-type ApproveStoryboardBody = z.infer<typeof approveStoryboardBodySchema>;
-
 export interface WorkflowRunMetadata {
   readonly prompt: string;
   readonly durationSeconds: number;
@@ -682,27 +626,6 @@ function projectResponse(project: VideoProject): Record<string, unknown> {
   return response;
 }
 
-function proposalResponse(
-  proposal: StoryboardProposal,
-): Record<string, unknown> {
-  return {
-    id: proposal.id,
-    projectId: proposal.projectId,
-    revision: proposal.revision,
-    status: proposal.status,
-    shots: proposal.shots,
-    totalDurationSeconds: proposal.totalDurationSeconds,
-    durationToleranceSeconds: proposal.durationToleranceSeconds,
-    ...(proposal.objective ? { objective: proposal.objective } : {}),
-    ...(proposal.assumptions ? { assumptions: proposal.assumptions } : {}),
-    ...(proposal.risks ? { risks: proposal.risks } : {}),
-    ...(proposal.agentRunId ? { agentRunId: proposal.agentRunId } : {}),
-    version: proposal.version,
-    createdAt: proposal.createdAt,
-    updatedAt: proposal.updatedAt,
-  };
-}
-
 function shotResponse(shot: Shot): Record<string, unknown> {
   const response: Record<string, unknown> = {
     id: shot.id,
@@ -1026,36 +949,6 @@ function eventResponse(event: DomainEvent): Record<string, unknown> {
   return response;
 }
 
-function workflowDraftResponse(
-  draft: WorkflowDraftRecord | null,
-): Record<string, unknown> {
-  if (!draft) return { draft: null };
-  return {
-    draft: {
-      id: draft.id,
-      tenantId: draft.tenantId,
-      projectId: draft.projectId,
-      shotId: draft.shotId,
-      ...(draft.baseRevisionId ? { baseRevisionId: draft.baseRevisionId } : {}),
-      profileId: draft.profileId,
-      profileVersion: draft.profileVersion,
-      editorGraph: draft.editorGraphJson,
-      editorGraphJson: draft.editorGraphJson,
-      ...(draft.lastApiGraphJson
-        ? {
-            lastApiGraph: draft.lastApiGraphJson,
-            lastApiGraphJson: draft.lastApiGraphJson,
-          }
-        : {}),
-      authorType: draft.authorType,
-      authorId: draft.authorId,
-      version: draft.version,
-      createdAt: draft.createdAt,
-      updatedAt: draft.updatedAt,
-    },
-  };
-}
-
 function workflowRevisionResponse(
   revision: WorkflowRevisionRecord,
 ): Record<string, unknown> {
@@ -1329,35 +1222,6 @@ function resourceParam(
   }
 }
 
-function bodyGraph(
-  body: WorkflowDraftBody | WorkflowRevisionBody,
-  primary: 'editorGraph' | 'apiGraph',
-  legacy: 'editorGraphJson' | 'apiGraphJson',
-  label: string,
-): WorkflowGraph {
-  const record = body as Record<string, unknown>;
-  const value = record[primary] ?? record[legacy];
-  if (value === undefined) {
-    throw new HttpProblemError(
-      'INVALID_REQUEST',
-      `${label} is required.`,
-      422,
-      false,
-    );
-  }
-  return value as WorkflowGraph;
-}
-
-function bodyOptionalGraph(
-  body: WorkflowDraftBody,
-): WorkflowGraph | null | undefined {
-  return body.lastApiGraph !== undefined
-    ? (body.lastApiGraph as WorkflowGraph | null)
-    : body.lastApiGraphJson !== undefined
-      ? (body.lastApiGraphJson as WorkflowGraph | null)
-      : undefined;
-}
-
 function bodyUuid(
   value: string | null | undefined,
   label: string,
@@ -1411,23 +1275,6 @@ function parseBody<T>(schema: z.ZodType<T>, value: unknown): T {
     );
   }
   return result.data;
-}
-
-function parseApprovalBody(value: unknown): ApproveStoryboardBody {
-  const body = parseBody(approveStoryboardBodySchema, value);
-  if (!body.proposalId) {
-    return body;
-  }
-  try {
-    return { proposalId: assertProjectUuid(body.proposalId) };
-  } catch {
-    throw new HttpProblemError(
-      'INVALID_REQUEST',
-      'The storyboard proposal identifier is invalid.',
-      422,
-      false,
-    );
-  }
 }
 
 function parseBudget(
@@ -1555,63 +1402,6 @@ async function executeIdempotent(
   });
 }
 
-async function executeAsyncIdempotent(
-  request: FastifyRequest,
-  service: ProjectApplicationService,
-  operation: string,
-  body: unknown,
-  mutation: () => Promise<IdempotentResponse>,
-): Promise<IdempotentResponse> {
-  const key = idempotencyKey(request);
-  const hash = requestHash(operation, body);
-  const reservation = await service.withTransaction((repositories) =>
-    repositories.idempotency.reserve(
-      service.tenantId,
-      key,
-      operation,
-      hash,
-      toIsoUtc(service.clock.now()),
-    ),
-  );
-  if (reservation.kind === 'conflict') {
-    throw new HttpProblemError(
-      'IDEMPOTENCY_KEY_REUSED',
-      'The Idempotency-Key was already used for a different request.',
-      409,
-      false,
-    );
-  }
-  if (reservation.kind === 'in_progress') {
-    throw new HttpProblemError(
-      'IDEMPOTENCY_IN_PROGRESS',
-      'The original request is still being processed.',
-      409,
-      true,
-    );
-  }
-  if (reservation.kind === 'replay') {
-    return { status: reservation.status, body: reservation.body };
-  }
-  try {
-    const response = await mutation();
-    await service.withTransaction((repositories) =>
-      repositories.idempotency.complete(
-        service.tenantId,
-        key,
-        response.status,
-        response.body,
-        toIsoUtc(service.clock.now()),
-      ),
-    );
-    return response;
-  } catch (error) {
-    await service.withTransaction((repositories) =>
-      repositories.idempotency.release(service.tenantId, key),
-    );
-    throw error;
-  }
-}
-
 function queryValue(request: FastifyRequest, name: string): string | undefined {
   const query = request.query as Record<string, unknown> | undefined;
   const value = query?.[name];
@@ -1705,12 +1495,6 @@ function requestOperationName(request: FastifyRequest): string {
     return 'run.read';
   }
   if (path === '/v1/events/stream') return 'sse.replay';
-  if (request.method === 'POST' && path.endsWith('/plan')) {
-    return 'agent.plan';
-  }
-  if (request.method === 'POST' && path.endsWith('/storyboard/approve')) {
-    return 'storyboard.approve';
-  }
   if (request.method === 'PUT' && path.endsWith('/workflow-draft')) {
     return 'workflow.draft.save';
   }
@@ -1770,11 +1554,6 @@ function sendProblem(
     retryable = error.retryable;
     detail = error.message;
   } else if (error instanceof WorkflowApplicationError) {
-    status = error.status;
-    code = error.code;
-    retryable = error.retryable;
-    detail = error.message;
-  } else if (error instanceof PlanningAgentError) {
     status = error.status;
     code = error.code;
     retryable = error.retryable;
@@ -2071,50 +1850,12 @@ export function buildApiApp(options: ApiAppOptions = {}): FastifyInstance {
     telemetry,
     metrics,
   });
-  let projectService: ProjectApplicationService | undefined;
-  const planner =
-    options.planner ??
-    new PiPlanningAgent({
-      store,
-      tenantId: DEV_TENANT_ID,
-      clock,
-      idGenerator,
-      provider: config.piProvider,
-      model: config.piModel,
-      maxConcurrentRuns: config.piMaxConcurrentRuns,
-      telemetry,
-      metrics,
-      ...(config.piApiKey ? { apiKey: config.piApiKey } : {}),
-      ...(config.piBaseUrl ? { baseUrl: config.piBaseUrl } : {}),
-      ...(options.planningScript ? { script: options.planningScript } : {}),
-      projectService: {
-        approveStoryboard: (projectId, proposalId) => {
-          if (!projectService) throw new Error('project service unavailable');
-          return projectService.approveStoryboard(projectId, proposalId);
-        },
-        getProject: (projectId) => {
-          if (!projectService) throw new Error('project service unavailable');
-          return projectService.getProject(projectId);
-        },
-        listEvents: (projectId) => {
-          if (!projectService) throw new Error('project service unavailable');
-          return projectService.listEvents(projectId);
-        },
-        listShots: (projectId) => {
-          if (!projectService) throw new Error('project service unavailable');
-          return projectService.listShots(projectId);
-        },
-      },
-      generationService,
-    });
   const service = new ProjectApplicationService({
     store,
-    planner,
     defaultBudgetMicrousd,
     clock,
     idGenerator,
   });
-  projectService = service;
   const generationWorker =
     options.generationWorker ??
     new GenerationWorker({
@@ -3230,296 +2971,6 @@ export function buildApiApp(options: ApiAppOptions = {}): FastifyInstance {
       }),
     );
 
-    routes.post(
-      '/v1/projects/:projectId/plan',
-      {
-        schema: {
-          tags: ['projects'],
-          summary: 'Generate a Pi-planned storyboard proposal',
-          params: {
-            type: 'object',
-            required: ['projectId'],
-            properties: { projectId: { type: 'string', format: 'uuid' } },
-          },
-          response: { 200: schemas.proposalResponse },
-        },
-      },
-      async (request, reply) => {
-        const projectId = parseProjectId(request);
-        const body = request.body ?? {};
-        const response = await executeAsyncIdempotent(
-          request,
-          service,
-          `project.plan:${projectId}`,
-          body,
-          async () => {
-            const result = await service.planProject(
-              projectId,
-              undefined,
-              traceIdFor(request),
-            );
-            return {
-              status: 200,
-              body: {
-                project: projectResponse(result.project),
-                proposal: proposalResponse(result.proposal),
-              },
-            };
-          },
-        );
-        return reply.code(response.status as 200).send(response.body);
-      },
-    );
-
-    routes.post(
-      '/v1/projects/:projectId/storyboard/approve',
-      {
-        schema: {
-          tags: ['projects'],
-          summary: 'Approve the current storyboard and materialize three shots',
-          params: {
-            type: 'object',
-            required: ['projectId'],
-            properties: { projectId: { type: 'string', format: 'uuid' } },
-          },
-          body: {
-            type: 'object',
-            properties: { proposalId: { type: 'string', format: 'uuid' } },
-            additionalProperties: false,
-          },
-          response: { 200: schemas.approvalResponse },
-        },
-      },
-      async (request, reply) => {
-        const projectId = parseProjectId(request);
-        const body = parseApprovalBody(request.body);
-        const response = await executeIdempotent(
-          request,
-          service,
-          `project.storyboard.approve:${projectId}`,
-          body,
-          async (repositories) => {
-            const result = await service.approveStoryboardInTransaction(
-              repositories,
-              projectId,
-              body.proposalId as Uuid | undefined,
-              traceIdFor(request),
-            );
-            return {
-              status: 200,
-              body: {
-                project: projectResponse(result.project),
-                shots: result.shots.map(shotResponse),
-              },
-            };
-          },
-        );
-        return reply.code(response.status as 200).send(response.body);
-      },
-    );
-
-    routes.get(
-      '/v1/projects/:projectId/storyboard',
-      {
-        schema: {
-          tags: ['projects'],
-          summary: 'Get the latest storyboard proposal',
-          params: {
-            type: 'object',
-            required: ['projectId'],
-            properties: { projectId: { type: 'string', format: 'uuid' } },
-          },
-          response: { 200: schemas.storyboardResponse },
-        },
-      },
-      async (request) => {
-        const proposal = await service.getStoryboard(parseProjectId(request));
-        return { proposal: proposal ? proposalResponse(proposal) : null };
-      },
-    );
-
-    routes.get(
-      '/v1/projects/:projectId/shots',
-      {
-        schema: {
-          tags: ['projects'],
-          summary: 'List materialized shots',
-          params: {
-            type: 'object',
-            required: ['projectId'],
-            properties: { projectId: { type: 'string', format: 'uuid' } },
-          },
-          response: { 200: schemas.shotsResponse },
-        },
-      },
-      async (request) => ({
-        shots: (await service.listShots(parseProjectId(request))).map(
-          shotResponse,
-        ),
-      }),
-    );
-
-    routes.get(
-      '/v1/projects/:projectId/shots/:shotId/workflow-draft',
-      {
-        schema: {
-          tags: ['generation'],
-          summary: 'Get the editable workflow draft for a shot',
-          response: { 200: schemas.workflowDraftResponse },
-        },
-      },
-      async (request) => ({
-        ...(await workflowDraftResponse(
-          await workflowService.getWorkflowDraft(
-            parseProjectId(request),
-            resourceParam(request, 'shotId'),
-          ),
-        )),
-      }),
-    );
-
-    routes.put(
-      '/v1/projects/:projectId/shots/:shotId/workflow-draft',
-      {
-        schema: {
-          tags: ['generation'],
-          summary: 'Create or update a scoped workflow draft',
-          body: {
-            type: 'object',
-            additionalProperties: true,
-          },
-          response: { 200: schemas.workflowDraftResponse },
-        },
-      },
-      async (request, reply) => {
-        const projectId = parseProjectId(request);
-        const shotId = resourceParam(request, 'shotId');
-        const body = parseBody(
-          workflowDraftBodySchema,
-          request.body,
-        ) as WorkflowDraftBody;
-        const key = idempotencyKey(request);
-        const editorGraphJson = bodyGraph(
-          body,
-          'editorGraph',
-          'editorGraphJson',
-          'editorGraph',
-        );
-        const lastApiGraphJson = bodyOptionalGraph(body);
-        const baseRevisionId = bodyUuid(body.baseRevisionId, 'baseRevisionId');
-        const command = {
-          idempotencyKey: key,
-          traceId: traceIdFor(request),
-          editorGraphJson,
-          ...(lastApiGraphJson !== undefined ? { lastApiGraphJson } : {}),
-          ...(baseRevisionId !== undefined ? { baseRevisionId } : {}),
-          ...(body.profileId !== undefined
-            ? { profileId: body.profileId }
-            : {}),
-          ...(body.profileVersion !== undefined
-            ? { profileVersion: body.profileVersion }
-            : {}),
-          authorType: body.authorType ?? 'development_user',
-          authorId: body.authorId ?? 'development-user',
-          ...(body.expectedVersion !== undefined
-            ? { expectedVersion: body.expectedVersion }
-            : {}),
-        };
-        const draft = await workflowService.saveWorkflowDraft(
-          projectId,
-          shotId,
-          command,
-        );
-        return reply.code(200).send(workflowDraftResponse(draft));
-      },
-    );
-
-    routes.post(
-      '/v1/projects/:projectId/shots/:shotId/workflow-revisions',
-      {
-        schema: {
-          tags: ['generation'],
-          summary: 'Create an immutable workflow revision',
-          body: {
-            type: 'object',
-            additionalProperties: true,
-          },
-          response: { 201: schemas.workflowValidationResponse },
-        },
-      },
-      async (request, reply) => {
-        const projectId = parseProjectId(request);
-        const shotId = resourceParam(request, 'shotId');
-        const body = parseBody(
-          workflowRevisionBodySchema,
-          request.body,
-        ) as WorkflowRevisionBody;
-        const parentRevisionId =
-          body.parentRevisionId === undefined
-            ? undefined
-            : bodyUuid(body.parentRevisionId, 'parentRevisionId');
-        const result = await workflowService.createWorkflowRevision(
-          projectId,
-          shotId,
-          {
-            idempotencyKey: idempotencyKey(request),
-            traceId: traceIdFor(request),
-            editorGraphJson: bodyGraph(
-              body,
-              'editorGraph',
-              'editorGraphJson',
-              'editorGraph',
-            ),
-            apiGraphJson: bodyGraph(
-              body,
-              'apiGraph',
-              'apiGraphJson',
-              'apiGraph',
-            ),
-            ...(parentRevisionId !== undefined ? { parentRevisionId } : {}),
-            ...(body.profileId !== undefined
-              ? { profileId: body.profileId }
-              : {}),
-            ...(body.profileVersion !== undefined
-              ? { profileVersion: body.profileVersion }
-              : {}),
-            ...(body.source !== undefined ? { source: body.source } : {}),
-            ...(body.frontendVersion !== undefined
-              ? { frontendVersion: body.frontendVersion }
-              : {}),
-            ...(body.frontendCommit !== undefined
-              ? { frontendCommit: body.frontendCommit }
-              : {}),
-            authorType: body.authorType ?? 'development_user',
-            authorId: body.authorId ?? 'development-user',
-          },
-        );
-        return reply.code(201).send({
-          revision: workflowRevisionResponse(result.revision),
-          validation: validationResponse(result.validation),
-        });
-      },
-    );
-
-    routes.get(
-      '/v1/projects/:projectId/shots/:shotId/workflow-revisions',
-      {
-        schema: {
-          tags: ['generation'],
-          summary: 'List immutable workflow revisions for a shot',
-          response: { 200: schemas.workflowRevisionsResponse },
-        },
-      },
-      async (request) => ({
-        revisions: (
-          await workflowService.listWorkflowRevisions(
-            parseProjectId(request),
-            resourceParam(request, 'shotId'),
-          )
-        ).map(workflowRevisionResponse),
-      }),
-    );
-
     routes.get(
       '/v1/workflow-revisions/:revisionId',
       {
@@ -4037,74 +3488,6 @@ export function buildApiApp(options: ApiAppOptions = {}): FastifyInstance {
     );
 
     routes.post(
-      '/v1/projects/:projectId/shots/:shotId/managed-attempts',
-      {
-        schema: {
-          tags: ['generation'],
-          summary: 'Queue generation from an exact validated workflow revision',
-          body: {
-            type: 'object',
-            required: ['workflowRevisionId'],
-            properties: {
-              workflowRevisionId: { type: 'string', format: 'uuid' },
-            },
-            // Zod performs the strict rejection so Fastify does not silently
-            // strip execution override fields before the application sees them.
-            additionalProperties: true,
-          },
-          response: { 201: schemas.attemptResponse },
-        },
-      },
-      async (request, reply) => {
-        const projectId = parseProjectId(request);
-        const shotId = resourceParam(request, 'shotId');
-        const body = parseBody(
-          managedAttemptBodySchema,
-          request.body,
-        ) as ManagedAttemptBody;
-        const workflowRevisionId = bodyUuid(
-          body.workflowRevisionId,
-          'workflowRevisionId',
-        );
-        if (!workflowRevisionId) {
-          throw new HttpProblemError(
-            'INVALID_REQUEST',
-            'workflowRevisionId is required.',
-            422,
-            false,
-          );
-        }
-        const key = idempotencyKey(request);
-        const traceId = traceIdFor(request);
-        const command: CreateManagedAttemptCommand = {
-          idempotencyKey: key,
-          workflowRevisionId,
-          traceId,
-        };
-        const response = await executeIdempotent(
-          request,
-          service,
-          `managed-attempt.create:${projectId}:${shotId}`,
-          body,
-          async (repositories) => ({
-            status: 201,
-            body: {
-              attempt: attemptResponse(
-                await generationService.createManagedAttemptInTransaction(
-                  repositories,
-                  projectId,
-                  shotId,
-                  command,
-                ),
-              ),
-            },
-          }),
-        );
-        return reply.code(response.status as 201).send(response.body);
-      },
-    );
-
-    routes.post(
       '/v1/shots/:shotId/attempts',
       {
         schema: {
@@ -4316,74 +3699,6 @@ export function buildApiApp(options: ApiAppOptions = {}): FastifyInstance {
           },
         );
         return reply.code(response.status as 200).send(response.body);
-      },
-    );
-
-    routes.post(
-      '/v1/attempts/:attemptId/regenerate',
-      {
-        schema: {
-          tags: ['generation'],
-          summary: 'Queue a new attempt derived from a rejected attempt',
-          params: {
-            type: 'object',
-            required: ['attemptId'],
-            properties: { attemptId: { type: 'string', format: 'uuid' } },
-          },
-          body: {
-            type: 'object',
-            properties: {
-              seed: { type: 'integer' },
-              steps: { type: 'integer', minimum: 1, maximum: 100 },
-              scenario: {
-                type: 'string',
-                enum: [
-                  'success',
-                  'duplicate-events',
-                  'disconnect-reconcile',
-                  'execution-failure',
-                  'timeout',
-                  'uncertain-submission',
-                ],
-              },
-            },
-            additionalProperties: false,
-          },
-          response: { 201: schemas.attemptResponse },
-        },
-      },
-      async (request, reply) => {
-        const attemptId = resourceParam(request, 'attemptId');
-        const body = parseBody(
-          createAttemptBodySchema,
-          request.body,
-        ) as CreateAttemptBody;
-        const key = idempotencyKey(request);
-        const command: CreateAttemptCommand = {
-          idempotencyKey: key,
-          ...(body.seed !== undefined ? { seed: body.seed } : {}),
-          ...(body.steps !== undefined ? { steps: body.steps } : {}),
-          ...(body.scenario !== undefined ? { scenario: body.scenario } : {}),
-        };
-        const response = await executeIdempotent(
-          request,
-          service,
-          `attempt.regenerate:${attemptId}`,
-          body,
-          async (repositories) => ({
-            status: 201,
-            body: {
-              attempt: attemptResponse(
-                await generationService.regenerateAttemptInTransaction(
-                  repositories,
-                  attemptId,
-                  command,
-                ),
-              ),
-            },
-          }),
-        );
-        return reply.code(response.status as 201).send(response.body);
       },
     );
 

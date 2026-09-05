@@ -15,7 +15,6 @@ import {
   parseDomainEventType,
   parseProjectStatus,
   parseShotStatus,
-  parseStoryboardStatus,
   toIsoUtc,
   isTerminalGenerationAttempt,
   type ArtifactRecord,
@@ -24,7 +23,6 @@ import {
   type EvaluationResult,
   type GenerationAttempt,
   type Shot,
-  type StoryboardProposal,
   type Uuid,
   type VideoProject,
 } from '@h3/domain';
@@ -151,19 +149,6 @@ export interface ProjectRepository {
   findById(tenantId: Uuid, projectId: Uuid): Promise<VideoProject | null>;
   listByTenant(tenantId: Uuid): Promise<readonly VideoProject[]>;
   update(project: VideoProject, expectedVersion: number): Promise<VideoProject>;
-}
-
-export interface StoryboardRepository {
-  create(proposal: StoryboardProposal): Promise<void>;
-  findById(
-    projectId: Uuid,
-    proposalId: Uuid,
-  ): Promise<StoryboardProposal | null>;
-  findLatest(projectId: Uuid): Promise<StoryboardProposal | null>;
-  update(
-    proposal: StoryboardProposal,
-    expectedVersion: number,
-  ): Promise<StoryboardProposal>;
 }
 
 export interface ShotRepository {
@@ -650,7 +635,6 @@ export interface IdempotencyRepository {
 export interface Repositories {
   readonly tenants: TenantRepository;
   readonly projects: ProjectRepository;
-  readonly storyboards: StoryboardRepository;
   readonly shots: ShotRepository;
   readonly attempts: AttemptRepository;
   readonly artifacts: ArtifactRepository;
@@ -689,27 +673,9 @@ interface ProjectRow extends QueryResultRow {
   updated_at: DatabaseTimestamp;
 }
 
-interface StoryboardRow extends QueryResultRow {
-  id: string;
-  project_id: string;
-  revision: number;
-  status: string;
-  shot_definitions: unknown;
-  total_duration_seconds: string | number;
-  duration_tolerance_seconds: string | number;
-  objective: string;
-  assumptions: unknown;
-  risks: unknown;
-  agent_run_id: string | null;
-  version: number;
-  created_at: DatabaseTimestamp;
-  updated_at: DatabaseTimestamp;
-}
-
 interface ShotRow extends QueryResultRow {
   id: string;
   project_id: string;
-  storyboard_proposal_id: string | null;
   ordinal: number;
   purpose: string;
   prompt: string;
@@ -1351,71 +1317,6 @@ function mapAgentRun(row: AgentRunRow): AgentRunRecord {
   };
 }
 
-function parseShotDefinitions(value: unknown): StoryboardProposal['shots'] {
-  const parsed = typeof value === 'string' ? JSON.parse(value) : value;
-  if (!Array.isArray(parsed)) {
-    throw new DomainError(
-      'INVALID_STORYBOARD',
-      'Stored storyboard shots are invalid.',
-    );
-  }
-  return parsed.map((candidate: unknown) => {
-    if (typeof candidate !== 'object' || candidate === null) {
-      throw new DomainError(
-        'INVALID_SHOT',
-        'Stored storyboard shot is invalid.',
-      );
-    }
-    const valueRecord = candidate as Record<string, unknown>;
-    const ordinal = valueRecord.ordinal;
-    if (ordinal !== 1 && ordinal !== 2 && ordinal !== 3) {
-      throw new DomainError('INVALID_SHOT', 'Stored shot ordinal is invalid.');
-    }
-    if (
-      typeof valueRecord.purpose !== 'string' ||
-      typeof valueRecord.prompt !== 'string' ||
-      typeof valueRecord.durationSeconds !== 'number' ||
-      valueRecord.mode !== 't2v' ||
-      valueRecord.qualityTier !== 'preview'
-    ) {
-      throw new DomainError(
-        'INVALID_SHOT',
-        'Stored storyboard shot is invalid.',
-      );
-    }
-    const optionalText = [
-      'visualDescription',
-      'cameraDirection',
-      'audioDirection',
-      'dialogue',
-    ] as const;
-    const optional = Object.fromEntries(
-      optionalText.flatMap((key) =>
-        typeof valueRecord[key] === 'string' ? [[key, valueRecord[key]]] : [],
-      ),
-    );
-    const criteria = valueRecord.acceptanceCriteria;
-    const assetIds = valueRecord.requiredAssetIds;
-    return {
-      ordinal,
-      purpose: valueRecord.purpose,
-      prompt: valueRecord.prompt,
-      durationSeconds: valueRecord.durationSeconds,
-      mode: 't2v',
-      qualityTier: 'preview',
-      ...optional,
-      ...(Array.isArray(criteria) &&
-      criteria.every((item) => typeof item === 'string')
-        ? { acceptanceCriteria: [...criteria] }
-        : {}),
-      ...(Array.isArray(assetIds) &&
-      assetIds.every((item) => typeof item === 'string')
-        ? { requiredAssetIds: [...assetIds] }
-        : {}),
-    };
-  });
-}
-
 function mapProject(row: ProjectRow): VideoProject {
   const budgetMicrousd =
     row.budget_microusd === null
@@ -1437,32 +1338,6 @@ function mapProject(row: ProjectRow): VideoProject {
   };
 }
 
-function mapStoryboard(row: StoryboardRow): StoryboardProposal {
-  const agentRunId = row.agent_run_id
-    ? assertUuid(row.agent_run_id)
-    : undefined;
-  return {
-    id: assertUuid(row.id),
-    projectId: assertUuid(row.project_id),
-    revision: row.revision,
-    status: parseStoryboardStatus(row.status),
-    shots: parseShotDefinitions(row.shot_definitions),
-    totalDurationSeconds: databaseNumber(row.total_duration_seconds),
-    durationToleranceSeconds: databaseNumber(row.duration_tolerance_seconds),
-    objective: row.objective,
-    assumptions: databaseStringArray(row.assumptions),
-    risks: databaseStringArray(row.risks),
-    ...(agentRunId ? { agentRunId } : {}),
-    version: row.version,
-    createdAt: databaseTimestamp(
-      row.created_at,
-    ) as StoryboardProposal['createdAt'],
-    updatedAt: databaseTimestamp(
-      row.updated_at,
-    ) as StoryboardProposal['updatedAt'],
-  };
-}
-
 function shotOrdinal(value: number): Shot['ordinal'] {
   if (value === 1 || value === 2 || value === 3) {
     return value;
@@ -1480,13 +1355,9 @@ function mapShot(row: ShotRow): Shot {
   const pinnedAttemptId = row.pinned_attempt_id
     ? assertUuid(row.pinned_attempt_id)
     : undefined;
-  const storyboardProposalId = row.storyboard_proposal_id
-    ? assertUuid(row.storyboard_proposal_id)
-    : undefined;
   const shot: Shot = {
     id: assertUuid(row.id),
     projectId: assertUuid(row.project_id),
-    ...(storyboardProposalId ? { storyboardProposalId } : {}),
     ordinal: shotOrdinal(row.ordinal),
     purpose: row.purpose,
     prompt: row.prompt,
@@ -2164,109 +2035,6 @@ class PostgresProjectRepository implements ProjectRepository {
   }
 }
 
-class PostgresStoryboardRepository implements StoryboardRepository {
-  private readonly executor: SqlExecutor;
-
-  constructor(executor: SqlExecutor) {
-    this.executor = executor;
-  }
-
-  async create(proposal: StoryboardProposal): Promise<void> {
-    await this.executor.query(
-      `INSERT INTO storyboard_proposals (
-        id, project_id, revision, status, shot_definitions,
-        total_duration_seconds, duration_tolerance_seconds, objective,
-        assumptions, risks, agent_run_id, version, created_at, updated_at
-      ) VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9::jsonb, $10::jsonb,
-        $11, $12, $13, $14)`,
-      [
-        proposal.id,
-        proposal.projectId,
-        proposal.revision,
-        proposal.status,
-        databaseJson(proposal.shots),
-        proposal.totalDurationSeconds,
-        proposal.durationToleranceSeconds,
-        proposal.objective ?? 'MVP storyboard proposal',
-        databaseJson(proposal.assumptions ?? []),
-        databaseJson(proposal.risks ?? []),
-        proposal.agentRunId ?? null,
-        proposal.version,
-        proposal.createdAt,
-        proposal.updatedAt,
-      ],
-    );
-  }
-
-  async findById(
-    projectId: Uuid,
-    proposalId: Uuid,
-  ): Promise<StoryboardProposal | null> {
-    const result = await this.executor.query<StoryboardRow>(
-      'SELECT * FROM storyboard_proposals WHERE project_id = $1 AND id = $2',
-      [projectId, proposalId],
-    );
-    const row = result.rows[0];
-    return row ? mapStoryboard(row) : null;
-  }
-
-  async findLatest(projectId: Uuid): Promise<StoryboardProposal | null> {
-    const result = await this.executor.query<StoryboardRow>(
-      `SELECT * FROM storyboard_proposals
-       WHERE project_id = $1
-       ORDER BY revision DESC
-       LIMIT 1`,
-      [projectId],
-    );
-    const row = result.rows[0];
-    return row ? mapStoryboard(row) : null;
-  }
-
-  async update(
-    proposal: StoryboardProposal,
-    expectedVersion: number,
-  ): Promise<StoryboardProposal> {
-    const result = await this.executor.query<StoryboardRow>(
-      `UPDATE storyboard_proposals
-       SET status = $1,
-           shot_definitions = $2::jsonb,
-           total_duration_seconds = $3,
-           duration_tolerance_seconds = $4,
-           objective = $5,
-           assumptions = $6::jsonb,
-           risks = $7::jsonb,
-           agent_run_id = $8,
-           version = $9,
-           updated_at = $10
-       WHERE id = $11 AND project_id = $12 AND version = $13
-       RETURNING *`,
-      [
-        proposal.status,
-        databaseJson(proposal.shots),
-        proposal.totalDurationSeconds,
-        proposal.durationToleranceSeconds,
-        proposal.objective ?? 'MVP storyboard proposal',
-        databaseJson(proposal.assumptions ?? []),
-        databaseJson(proposal.risks ?? []),
-        proposal.agentRunId ?? null,
-        proposal.version,
-        proposal.updatedAt,
-        proposal.id,
-        proposal.projectId,
-        expectedVersion,
-      ],
-    );
-    const row = result.rows[0];
-    if (!row) {
-      throw new RepositoryError(
-        'OPTIMISTIC_CONFLICT',
-        'The storyboard was modified by another transaction.',
-      );
-    }
-    return mapStoryboard(row);
-  }
-}
-
 class PostgresShotRepository implements ShotRepository {
   private readonly executor: SqlExecutor;
 
@@ -2278,17 +2046,16 @@ class PostgresShotRepository implements ShotRepository {
     for (const shot of shots) {
       await this.executor.query(
         `INSERT INTO shots (
-          id, project_id, storyboard_proposal_id, ordinal, purpose, prompt,
+          id, project_id, ordinal, purpose, prompt,
           duration_seconds, mode, quality_tier, visual_description,
           camera_direction, audio_direction, dialogue, acceptance_criteria,
           required_asset_ids, status, accepted_attempt_id, pinned_attempt_id,
           version, created_at, updated_at, implicit
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-          $13, $14::jsonb, $15::jsonb, $16, $17, $18, $19, $20, $21, $22)`,
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+          $12, $13::jsonb, $14::jsonb, $15, $16, $17, $18, $19, $20, $21)`,
         [
           shot.id,
           shot.projectId,
-          shot.storyboardProposalId ?? null,
           shot.ordinal,
           shot.purpose,
           shot.prompt,
@@ -2342,29 +2109,27 @@ class PostgresShotRepository implements ShotRepository {
   async update(shot: Shot, expectedVersion: number): Promise<Shot> {
     const result = await this.executor.query<ShotRow>(
       `UPDATE shots
-       SET storyboard_proposal_id = $1,
-           ordinal = $2,
-           purpose = $3,
-           prompt = $4,
-           duration_seconds = $5,
-           mode = $6,
-           quality_tier = $7,
-           status = $8,
-           visual_description = $9,
-           camera_direction = $10,
-           audio_direction = $11,
-           dialogue = $12,
-           acceptance_criteria = $13::jsonb,
-           required_asset_ids = $14::jsonb,
-           accepted_attempt_id = $15,
-           pinned_attempt_id = $16,
-           implicit = $17,
-           version = $18,
-           updated_at = $19
-       WHERE id = $20 AND project_id = $21 AND version = $22
+       SET ordinal = $1,
+           purpose = $2,
+           prompt = $3,
+           duration_seconds = $4,
+           mode = $5,
+           quality_tier = $6,
+           status = $7,
+           visual_description = $8,
+           camera_direction = $9,
+           audio_direction = $10,
+           dialogue = $11,
+           acceptance_criteria = $12::jsonb,
+           required_asset_ids = $13::jsonb,
+           accepted_attempt_id = $14,
+           pinned_attempt_id = $15,
+           implicit = $16,
+           version = $17,
+           updated_at = $18
+       WHERE id = $19 AND project_id = $20 AND version = $21
        RETURNING *`,
       [
-        shot.storyboardProposalId ?? null,
         shot.ordinal,
         shot.purpose,
         shot.prompt,
@@ -3802,7 +3567,6 @@ function createPostgresRepositories(executor: SqlExecutor): Repositories {
   return {
     tenants: new PostgresTenantRepository(executor),
     projects: new PostgresProjectRepository(executor),
-    storyboards: new PostgresStoryboardRepository(executor),
     shots: new PostgresShotRepository(executor),
     attempts: new PostgresAttemptRepository(executor),
     artifacts: new PostgresArtifactRepository(executor),
@@ -3864,7 +3628,6 @@ interface MemoryTenant {
 interface MemoryState {
   readonly tenants: Map<Uuid, MemoryTenant>;
   readonly projects: Map<Uuid, VideoProject>;
-  readonly storyboards: Map<Uuid, StoryboardProposal>;
   readonly shots: Map<Uuid, Shot>;
   readonly attempts: Map<Uuid, GenerationAttempt>;
   readonly artifacts: Map<Uuid, ArtifactRecord>;
@@ -3890,7 +3653,6 @@ function emptyMemoryState(): MemoryState {
   return {
     tenants: new Map(),
     projects: new Map(),
-    storyboards: new Map(),
     shots: new Map(),
     attempts: new Map(),
     artifacts: new Map(),
@@ -3911,12 +3673,6 @@ function cloneMemoryState(state: MemoryState): MemoryState {
   return {
     tenants: new Map(state.tenants),
     projects: new Map(state.projects),
-    storyboards: new Map(
-      [...state.storyboards].map(([id, proposal]) => [
-        id,
-        { ...proposal, shots: [...proposal.shots] },
-      ]),
-    ),
     shots: new Map([...state.shots].map(([id, shot]) => [id, cloneShot(shot)])),
     attempts: new Map(
       [...state.attempts].map(([id, attempt]) => [id, { ...attempt }]),
@@ -4016,7 +3772,6 @@ function memoryIdempotencyKey(tenantId: Uuid, key: string): string {
 class MemoryRepositories implements Repositories {
   readonly tenants: TenantRepository;
   readonly projects: ProjectRepository;
-  readonly storyboards: StoryboardRepository;
   readonly shots: ShotRepository;
   readonly attempts: AttemptRepository;
   readonly artifacts: ArtifactRepository;
@@ -4075,59 +3830,6 @@ class MemoryRepositories implements Repositories {
         }
         this.state.projects.set(project.id, { ...project });
         return { ...project };
-      },
-    };
-    this.storyboards = {
-      create: async (proposal) => {
-        if (this.state.storyboards.has(proposal.id)) {
-          throw new RepositoryError(
-            'UNIQUE_VIOLATION',
-            'Storyboard already exists.',
-          );
-        }
-        if (
-          [...this.state.storyboards.values()].some(
-            (current) =>
-              current.projectId === proposal.projectId &&
-              current.revision === proposal.revision,
-          )
-        ) {
-          throw new RepositoryError(
-            'UNIQUE_VIOLATION',
-            'Storyboard revision already exists.',
-          );
-        }
-        this.state.storyboards.set(proposal.id, {
-          ...proposal,
-          shots: [...proposal.shots],
-        });
-      },
-      findById: async (projectId, proposalId) => {
-        const proposal = this.state.storyboards.get(proposalId);
-        return proposal && proposal.projectId === projectId
-          ? { ...proposal, shots: [...proposal.shots] }
-          : null;
-      },
-      findLatest: async (projectId) => {
-        const proposals = [...this.state.storyboards.values()]
-          .filter((proposal) => proposal.projectId === projectId)
-          .sort((left, right) => right.revision - left.revision);
-        const proposal = proposals[0];
-        return proposal ? { ...proposal, shots: [...proposal.shots] } : null;
-      },
-      update: async (proposal, expectedVersion) => {
-        const current = this.state.storyboards.get(proposal.id);
-        if (!current || current.version !== expectedVersion) {
-          throw new RepositoryError(
-            'OPTIMISTIC_CONFLICT',
-            'The storyboard was modified by another transaction.',
-          );
-        }
-        this.state.storyboards.set(proposal.id, {
-          ...proposal,
-          shots: [...proposal.shots],
-        });
-        return { ...proposal, shots: [...proposal.shots] };
       },
     };
     this.shots = {

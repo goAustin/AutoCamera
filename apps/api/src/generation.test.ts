@@ -8,6 +8,7 @@ import {
   transitionGenerationAttempt,
   type GenerationAttempt,
   type IdGenerator,
+  type Shot,
   type Uuid,
 } from '@h3/domain';
 import { createInMemoryStore } from '@h3/db';
@@ -199,12 +200,34 @@ async function setupProject(
     brief: 'A moving synthetic product story.',
     targetDurationSeconds: 3,
     budgetMicrousd: parseUsdToMicrousd(budgetUsd),
+    // Phase 7D removed storyboard approval, which used to be what carried a
+    // project from `draft` to `ready_for_generation`. Implicit shots (below)
+    // are the only surviving shot-creation path, and `POST /v1/runs` always
+    // pairs them with this same status for a freshly auto-created project.
+    initialStatus: 'ready_for_generation',
   });
-  const planned = await projectService.planProject(project.id);
-  const approved = await projectService.approveStoryboard(
-    project.id,
-    planned.proposal.id,
-  );
+  // Phase 7D removed storyboard materialization. This fixture used to come
+  // from a plan+approve pair that always produced exactly three shots; the
+  // tests below still depend on three shots per project (in particular
+  // "accepts one validated attempt per shot and completes the project
+  // atomically"), so create them directly and implicitly instead, one at a
+  // time so each sees the previous one when assigning its ordinal.
+  const shots: Shot[] = [];
+  for (let index = 0; index < 3; index += 1) {
+    shots.push(
+      await store.withTransaction((repositories) =>
+        projectService.createImplicitShotInTransaction(
+          repositories,
+          project.id,
+          {
+            purpose: `Purpose ${index + 1}`,
+            prompt: `Prompt ${index + 1}`,
+            durationSeconds: 1,
+          },
+        ),
+      ),
+    );
+  }
   const root = await mkdtemp(join(tmpdir(), 'h3-generation-test-'));
   const fakeService = new DeterministicFakeComfyService();
   const fake = new FakeComfyClient(fakeService);
@@ -229,7 +252,7 @@ async function setupProject(
       timeoutSeconds: 1,
       sleep: async () => undefined,
     }),
-    shots: approved.shots,
+    shots,
     root,
   };
 }
@@ -339,9 +362,11 @@ describe('Phase 3 durable generation worker', () => {
       'failed',
     );
     expect(
-      (await context.projectService.listShots(attempt.projectId)).find(
-        (shot) => shot.id === attempt.shotId,
-      )?.status,
+      (
+        await context.store.withTransaction((repositories) =>
+          repositories.shots.listByProject(attempt.projectId),
+        )
+      ).find((shot) => shot.id === attempt.shotId)?.status,
     ).toBe('retryable');
     expect(
       (await context.projectService.getProject(attempt.projectId)).status,
@@ -356,9 +381,11 @@ describe('Phase 3 durable generation worker', () => {
       (await context.projectService.getProject(attempt.projectId)).status,
     ).toBe('generating');
     expect(
-      (await context.projectService.listShots(attempt.projectId)).find(
-        (shot) => shot.id === attempt.shotId,
-      )?.status,
+      (
+        await context.store.withTransaction((repositories) =>
+          repositories.shots.listByProject(attempt.projectId),
+        )
+      ).find((shot) => shot.id === attempt.shotId)?.status,
     ).toBe('queued');
   });
 
@@ -379,7 +406,9 @@ describe('Phase 3 durable generation worker', () => {
       context.shots[0]?.projectId as Uuid,
     );
     expect(project.status).toBe('completed');
-    const shots = await context.projectService.listShots(project.id);
+    const shots = await context.store.withTransaction((repositories) =>
+      repositories.shots.listByProject(project.id),
+    );
     expect(shots.every((shot) => shot.status === 'accepted')).toBe(true);
   });
 
@@ -488,7 +517,9 @@ describe('Phase 3 durable generation worker', () => {
     ).toHaveLength(1);
     const stored = await context.generation.getAttempt(attempt.id);
     expect(stored.status).toBe('accepted');
-    const shot = await context.projectService.listShots(stored.projectId);
+    const shot = await context.store.withTransaction((repositories) =>
+      repositories.shots.listByProject(stored.projectId),
+    );
     expect(
       shot.find((value) => value.id === stored.shotId)?.acceptedAttemptId,
     ).toBe(attempt.id);

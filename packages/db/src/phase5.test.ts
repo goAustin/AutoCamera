@@ -3,7 +3,6 @@ import {
   createDomainEvent,
   createGenerationAttempt,
   createShot,
-  createStoryboardProposal,
   createUuidV7,
   createVideoProject,
   parseUsdToMicrousd,
@@ -48,39 +47,33 @@ async function seedProject(
     budgetMicrousd: parseUsdToMicrousd('25'),
     now: timestamp,
   });
-  const proposal = createStoryboardProposal({
-    id: id(seed + 2),
-    projectId: project.id,
-    revision: 1,
-    shots: [1, 2, 3].map((ordinal) => ({
-      ordinal: ordinal as 1 | 2 | 3,
-      purpose: `Purpose ${ordinal}`,
-      prompt: `Prompt ${ordinal}`,
-      durationSeconds: 1,
-      mode: 't2v' as const,
-      qualityTier: 'preview' as const,
-      visualDescription: `Visual direction ${ordinal}`,
-      cameraDirection: `Camera direction ${ordinal}`,
-      audioDirection: `Audio direction ${ordinal}`,
-      ...(ordinal === 1 ? { dialogue: 'A bounded line.' } : {}),
-      acceptanceCriteria: [`Criterion ${ordinal}`],
-      requiredAssetIds: [],
-    })),
-    now: timestamp,
-  });
-  const firstDefinition = proposal.shots[0];
-  if (!firstDefinition) throw new Error('Expected first shot definition.');
+  // Phase 7D removed storyboard materialization; every surviving shot is
+  // implicit, created directly rather than promoted from a proposal. Only
+  // `shots[0]`'s fields were ever asserted on, so they are reproduced here
+  // verbatim (`round-trips all structured shot fields...` below).
   const shot = createShot({
     id: id(seed + 3),
     projectId: project.id,
-    storyboardProposalId: proposal.id,
-    definition: firstDefinition,
+    implicit: true,
+    definition: {
+      ordinal: 1,
+      purpose: 'Purpose 1',
+      prompt: 'Prompt 1',
+      durationSeconds: 1,
+      mode: 't2v',
+      qualityTier: 'preview',
+      visualDescription: 'Visual direction 1',
+      cameraDirection: 'Camera direction 1',
+      audioDirection: 'Audio direction 1',
+      dialogue: 'A bounded line.',
+      acceptanceCriteria: ['Criterion 1'],
+      requiredAssetIds: [],
+    },
     now: timestamp,
   });
   await store.withTransaction(async (repositories) => {
     await repositories.tenants.ensure(tenantId, 'Test tenant', timestamp);
     await repositories.projects.create(project);
-    await repositories.storyboards.create(proposal);
     await repositories.shots.createMany([shot]);
   });
   return { tenantId, projectId: project.id, shot };

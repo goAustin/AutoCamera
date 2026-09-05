@@ -70,11 +70,19 @@ async function setupGeneration(): Promise<GenerationContext> {
     brief: 'A durable worker recovery integration test.',
     targetDurationSeconds: 3,
     budgetMicrousd: parseUsdToMicrousd('25'),
+    // Phase 7D removed storyboard approval; pair the implicit shot (below)
+    // with the same status a freshly auto-created `POST /v1/runs` project
+    // gets, since nothing transitions this project onward otherwise.
+    initialStatus: 'ready_for_generation',
   });
-  const planned = await projectService.planProject(project.id);
-  const approved = await projectService.approveStoryboard(
-    project.id,
-    planned.proposal.id,
+  // Phase 7D removed storyboard materialization; create the fixture shot
+  // directly and implicitly instead of through a plan+approve pair.
+  const shot = await store.withTransaction((repositories) =>
+    projectService.createImplicitShotInTransaction(repositories, project.id, {
+      purpose: 'Purpose 1',
+      prompt: 'Prompt 1',
+      durationSeconds: 1,
+    }),
   );
   const root = await mkdtemp(join(tmpdir(), 'h3-generation-integration-'));
   roots.push(root);
@@ -88,8 +96,6 @@ async function setupGeneration(): Promise<GenerationContext> {
     artifactStore: createLocalArtifactStore(root),
     evaluator: new MediaEvaluator(new DeterministicFixtureProcessRunner()),
   });
-  const shot = approved.shots[0];
-  if (!shot) throw new Error('Expected one approved shot.');
   return { projectService, generation, comfy, shotId: shot.id, now };
 }
 

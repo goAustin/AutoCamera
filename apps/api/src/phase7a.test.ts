@@ -292,56 +292,6 @@ describe('Phase 7A thin-core runs', () => {
     );
   });
 
-  it('lets the planner demote direct grouping and promotes the same shot key', async () => {
-    const { app, store } = createApp();
-    const run = await submitRun(app, 'phase7a-planner-demotion');
-    const runBody = {
-      ...run.json(),
-      projectId: assertUuid(run.json().projectId as string),
-    };
-
-    const planned = await app.inject({
-      method: 'POST',
-      url: `/v1/projects/${runBody.projectId}/plan`,
-      headers: authHeaders('phase7a-planner-plan'),
-      payload: {},
-    });
-    expect(planned.statusCode).toBe(200);
-    const proposalId = planned.json().proposal.id as string;
-
-    const approved = await app.inject({
-      method: 'POST',
-      url: `/v1/projects/${runBody.projectId}/storyboard/approve`,
-      headers: authHeaders('phase7a-planner-approve'),
-      payload: { proposalId },
-    });
-    expect(approved.statusCode).toBe(200);
-
-    const persisted = await store.withTransaction(async (repositories) => ({
-      project: await repositories.projects.findById(
-        DEV_TENANT_ID,
-        runBody.projectId,
-      ),
-      shots: await repositories.shots.listByProject(runBody.projectId),
-      attempts: await repositories.attempts.listByProject(
-        DEV_TENANT_ID,
-        runBody.projectId,
-      ),
-    }));
-    expect(persisted.project).toMatchObject({ status: 'ready_for_generation' });
-    expect(persisted.shots).toHaveLength(3);
-    expect(
-      persisted.shots.filter((shot) => shot.implicit === true),
-    ).toHaveLength(0);
-    expect(persisted.shots.map((shot) => shot.storyboardProposalId)).toEqual(
-      expect.arrayContaining([proposalId, proposalId, proposalId]),
-    );
-    expect(persisted.attempts).toHaveLength(1);
-    expect(persisted.attempts[0]?.shotId).toBe(
-      persisted.shots.find((shot) => shot.ordinal === 1)?.id,
-    );
-  });
-
   it('pins failed and running records, reviews without lifecycle transitions, and unpins reversibly', async () => {
     const { app, store } = createApp();
     const first = await submitRun(app, 'phase7a-pin-failed');

@@ -3,28 +3,24 @@ import {
   addMicrousd,
   assertUuid,
   createShot,
-  createStoryboardProposal,
   createUuidV7,
   createVideoProject,
+  DOMAIN_EVENT_TYPES,
   DomainError,
   formatMicrousdToUsd,
+  parseDomainEventType,
   parseProjectStatus,
   parseShotStatus,
-  parseStoryboardStatus,
   parseUsdToMicrousd,
   PROJECT_STATUS_TRANSITIONS,
   SHOT_STATUS_TRANSITIONS,
-  STORYBOARD_STATUS_TRANSITIONS,
   subtractMicrousd,
   toIsoUtc,
   transitionProject,
   transitionShot,
-  transitionStoryboard,
   type ProjectStatus,
   type Shot,
   type ShotStatus,
-  type StoryboardProposal,
-  type StoryboardStatus,
   type Uuid,
 } from './index.js';
 
@@ -55,28 +51,6 @@ function projectWithStatus(status: ProjectStatus) {
     targetDurationSeconds: 5,
     budgetMicrousd: parseUsdToMicrousd('25'),
     spentMicrousd: parseUsdToMicrousd('0'),
-    version: 1,
-    createdAt: timestamp,
-    updatedAt: timestamp,
-  };
-}
-
-function proposalWithStatus(status: StoryboardStatus): StoryboardProposal {
-  return {
-    id: id(3),
-    projectId: id(4),
-    revision: 1,
-    status,
-    shots: [1, 2, 3].map((ordinal) => ({
-      ordinal: ordinal as 1 | 2 | 3,
-      purpose: `Purpose ${ordinal}`,
-      prompt: `Prompt ${ordinal}`,
-      durationSeconds: 1,
-      mode: 't2v' as const,
-      qualityTier: 'preview' as const,
-    })),
-    totalDurationSeconds: 3,
-    durationToleranceSeconds: 0.05,
     version: 1,
     createdAt: timestamp,
     updatedAt: timestamp,
@@ -140,31 +114,6 @@ describe('domain transitions', () => {
     );
   });
 
-  it('allows and rejects every documented storyboard transition', () => {
-    for (const [current, nextStatuses] of Object.entries(
-      STORYBOARD_STATUS_TRANSITIONS,
-    ) as [StoryboardStatus, readonly StoryboardStatus[]][]) {
-      for (const next of nextStatuses) {
-        expect(
-          transitionStoryboard(proposalWithStatus(current), next).status,
-        ).toBe(next);
-      }
-      for (const next of Object.keys(
-        STORYBOARD_STATUS_TRANSITIONS,
-      ) as StoryboardStatus[]) {
-        if (!nextStatuses.includes(next)) {
-          expect(() =>
-            transitionStoryboard(proposalWithStatus(current), next),
-          ).toThrow();
-        }
-      }
-    }
-    expectDomainCode(
-      () => parseStoryboardStatus('future-status'),
-      'UNKNOWN_STORYBOARD_STATUS',
-    );
-  });
-
   it('allows and rejects every documented shot transition', () => {
     for (const [current, nextStatuses] of Object.entries(
       SHOT_STATUS_TRANSITIONS,
@@ -210,6 +159,50 @@ describe('domain transitions', () => {
   });
 });
 
+describe('historical domain-event retention (Phase 7D)', () => {
+  // Phase 7D removed the brief-first product's emitters, but `domain_events`
+  // is append-only (design reference section 4, invariant three): any
+  // Phase 7C database that was ever used still contains rows typed with
+  // these five planner-era strings. `packages/db/src/index.ts`'s `mapEvent`
+  // calls `parseDomainEventType` on every row it reads back, and that
+  // function throws `UNKNOWN_EVENT_TYPE` for a value absent from
+  // `DOMAIN_EVENT_TYPES`. Removing a string here would make those historical
+  // rows unreadable, not delete them -- the event timeline would throw and
+  // SSE replay would throw. This test is the regression guard for that.
+  const retainedPlannerEraTypes = [
+    'project.planning_started',
+    'project.planned',
+    'storyboard.proposed',
+    'storyboard.superseded',
+    'storyboard.approved',
+  ] as const;
+
+  it('keeps every planner-era event type in DOMAIN_EVENT_TYPES', () => {
+    for (const type of retainedPlannerEraTypes) {
+      expect(DOMAIN_EVENT_TYPES).toContain(type);
+    }
+  });
+
+  it('still parses a historical row typed with a planner-era event type', () => {
+    for (const type of retainedPlannerEraTypes) {
+      expect(parseDomainEventType(type)).toBe(type);
+    }
+    // The specific row the amendment names: a historical `storyboard.approved`
+    // event, exactly as `packages/db/src/index.ts`'s `mapEvent` would read
+    // one back from an append-only `domain_events` table.
+    expect(parseDomainEventType('storyboard.approved')).toBe(
+      'storyboard.approved',
+    );
+  });
+
+  it('still rejects a type that was never valid', () => {
+    expectDomainCode(
+      () => parseDomainEventType('not.a.real.event'),
+      'UNKNOWN_EVENT_TYPE',
+    );
+  });
+});
+
 describe('domain money, identity, and constructors', () => {
   it('uses exact integer micro-dollars for conversion and arithmetic', () => {
     const one = parseUsdToMicrousd('1.000001');
@@ -228,7 +221,11 @@ describe('domain money, identity, and constructors', () => {
     expect(assertUuid(value)).toBe(value);
   });
 
-  it('constructs a valid project, proposal, and approved-ready shot', () => {
+  it('constructs a valid project and an implicit graph-first shot', () => {
+    // Phase 7D removed storyboard materialization; every surviving shot is
+    // implicit, created directly off a run submission rather than off an
+    // approved storyboard proposal (design reference glossary: "Shot ...
+    // Never surfaced in the new API").
     const project = createVideoProject({
       id: id(10),
       tenantId: id(11),
@@ -238,33 +235,22 @@ describe('domain money, identity, and constructors', () => {
       budgetMicrousd: parseUsdToMicrousd('5'),
       now: timestamp,
     });
-    const proposal = createStoryboardProposal({
-      id: id(12),
-      projectId: project.id,
-      revision: 1,
-      shots: [1, 2, 3].map((ordinal) => ({
-        ordinal: ordinal as 1 | 2 | 3,
-        purpose: `Purpose ${ordinal}`,
-        prompt: `Prompt ${ordinal}`,
-        durationSeconds: 1,
-        mode: 't2v' as const,
-        qualityTier: 'preview' as const,
-      })),
-      now: timestamp,
-    });
-    const firstDefinition = proposal.shots[0];
-    if (!firstDefinition) {
-      throw new Error('Expected a first storyboard shot.');
-    }
     const shot = createShot({
       id: id(13),
       projectId: project.id,
-      storyboardProposalId: proposal.id,
-      definition: firstDefinition,
+      implicit: true,
+      definition: {
+        ordinal: 1,
+        purpose: 'Purpose',
+        prompt: 'Prompt',
+        durationSeconds: 1,
+        mode: 't2v',
+        qualityTier: 'preview',
+      },
       now: timestamp,
     });
     expect(project.status).toBe('draft');
-    expect(proposal.shots).toHaveLength(3);
     expect(shot.status).toBe('approved_for_generation');
+    expect(shot.implicit).toBe(true);
   });
 });

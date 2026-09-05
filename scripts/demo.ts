@@ -77,7 +77,7 @@ async function seed(): Promise<void> {
       traceId: DEMO_TRACE_ID,
     });
     console.log(
-      `Seeded deterministic demo alias demo-project (${project.status}); planning remains human-triggered.`,
+      `Seeded deterministic demo alias demo-project (${project.status}); submit a graph through POST /v1/runs to generate.`,
     );
   } finally {
     await closeDatabase(pool);
@@ -170,10 +170,6 @@ async function reset(force: boolean): Promise<void> {
       await client.query('DELETE FROM shots WHERE project_id = $1', [
         projectId,
       ]);
-      await client.query(
-        'DELETE FROM storyboard_proposals WHERE project_id = $1',
-        [projectId],
-      );
       await client.query(
         'DELETE FROM agent_runs WHERE tenant_id = $1 AND project_id = $2',
         [DEV_TENANT_ID, projectId],

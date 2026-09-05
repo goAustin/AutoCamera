@@ -23,12 +23,7 @@ import {
   MediaEvaluator,
 } from '@h3/evaluator';
 import { createLocalArtifactStore } from '@h3/object-store';
-import {
-  MINIMAX_H3_PROFILE_ID,
-  MINIMAX_H3_PROFILE_VERSION,
-  loadMinimaxH3Fixtures,
-} from '@h3/workflow-compiler';
-import { DEV_TENANT_ID, StaticStoryboardPlanner } from './application.js';
+import { DEV_TENANT_ID } from './application.js';
 import { buildApiApp } from './app.js';
 import type { GenerationWorker } from './generation.js';
 
@@ -70,7 +65,6 @@ async function setupApi() {
     }),
     store,
     idGenerator: testIds(),
-    planner: new StaticStoryboardPlanner(),
     comfyClient: new FakeComfyClient(comfy),
     artifactStore,
     evaluator: new MediaEvaluator(new DeterministicFixtureProcessRunner()),
@@ -93,6 +87,20 @@ async function request(
   return app.inject({ ...options, headers: { ...auth, ...options.headers } });
 }
 
+/**
+ * Phase 7D removed storyboard planning: `POST /v1/projects/:projectId/plan`
+ * and `.../storyboard/approve` no longer exist, and shots are never listed
+ * or otherwise addressable from outside. The durable core still requires an
+ * `approved_for_generation` shot to accept a scenario-scoped attempt
+ * (`generation.ts`'s `createAttemptInTransaction`), so this seeds one the
+ * same way a real client now would: submit `POST /v1/runs` with a graph that
+ * fails validation. That creates the project's implicit shot and records a
+ * `shot.created` domain event before ever reaching attempt creation, so the
+ * shot survives, untouched, in `approved_for_generation` -- reusing exactly
+ * the "invalid graph creates no attempt" invariant the deleted planner UI's
+ * replacement test also exercises. `GET .../events` is the only remaining
+ * way to recover the shot's id.
+ */
 async function createApprovedShot(
   app: Awaited<ReturnType<typeof buildApiApp>>,
   prefix: string,
@@ -109,188 +117,27 @@ async function createApprovedShot(
   });
   expect(project.statusCode).toBe(201);
   const projectId = project.json().project.id as string;
-  const plan = await request(app, {
+  const invalidRun = await request(app, {
     method: 'POST',
-    url: `/v1/projects/${projectId}/plan`,
-    headers: { 'idempotency-key': `${prefix}-plan` },
-    payload: {},
+    url: '/v1/runs',
+    headers: { 'idempotency-key': `${prefix}-seed-run` },
+    payload: { projectId, editorGraph: {}, apiGraph: {} },
   });
-  expect(plan.statusCode).toBe(200);
-  const approve = await request(app, {
-    method: 'POST',
-    url: `/v1/projects/${projectId}/storyboard/approve`,
-    headers: { 'idempotency-key': `${prefix}-approve` },
-    payload: { proposalId: plan.json().proposal.id },
+  expect(invalidRun.statusCode).toBe(422);
+  const events = await request(app, {
+    method: 'GET',
+    url: `/v1/projects/${projectId}/events`,
   });
-  expect(approve.statusCode).toBe(200);
-  return { projectId, shotId: approve.json().shots[0].id as string };
+  expect(events.statusCode).toBe(200);
+  const shotCreated = (
+    events.json().events as ReadonlyArray<Record<string, unknown>>
+  ).find((event) => event.type === 'shot.created');
+  const shotId = shotCreated?.shotId as string | undefined;
+  if (!shotId) throw new Error('Expected a shot.created event with a shotId.');
+  return { projectId, shotId };
 }
 
 describe('Phase 5 control-plane APIs', () => {
-  it('creates scoped drafts and immutable validated revisions, then queues exact managed data', async () => {
-    const { app, worker, comfy } = await setupApi();
-    const { projectId, shotId } = await createApprovedShot(app, 'managed');
-    const fixtures = await loadMinimaxH3Fixtures();
-
-    const draft = await request(app, {
-      method: 'PUT',
-      url: `/v1/projects/${projectId}/shots/${shotId}/workflow-draft`,
-      headers: { 'idempotency-key': 'managed-draft-1' },
-      payload: {
-        editorGraph: fixtures.editorGraph,
-        lastApiGraph: fixtures.apiGraph,
-      },
-    });
-    expect(draft.statusCode).toBe(200);
-    expect(draft.json().draft.version).toBe(1);
-
-    const draftReplay = await request(app, {
-      method: 'PUT',
-      url: `/v1/projects/${projectId}/shots/${shotId}/workflow-draft`,
-      headers: { 'idempotency-key': 'managed-draft-1' },
-      payload: {
-        editorGraph: fixtures.editorGraph,
-        lastApiGraph: fixtures.apiGraph,
-      },
-    });
-    expect(draftReplay.statusCode).toBe(200);
-    expect(draftReplay.json()).toEqual(draft.json());
-
-    const draftUpdate = await request(app, {
-      method: 'PUT',
-      url: `/v1/projects/${projectId}/shots/${shotId}/workflow-draft`,
-      headers: { 'idempotency-key': 'managed-draft-2' },
-      payload: {
-        editorGraph: fixtures.editorGraph,
-        lastApiGraph: fixtures.apiGraph,
-        expectedVersion: 1,
-      },
-    });
-    expect(draftUpdate.statusCode).toBe(200);
-    expect(draftUpdate.json().draft.version).toBe(2);
-
-    const staleDraft = await request(app, {
-      method: 'PUT',
-      url: `/v1/projects/${projectId}/shots/${shotId}/workflow-draft`,
-      headers: { 'idempotency-key': 'managed-draft-stale' },
-      payload: {
-        editorGraph: fixtures.editorGraph,
-        expectedVersion: 1,
-      },
-    });
-    expect(staleDraft.statusCode).toBe(409);
-
-    const revision = await request(app, {
-      method: 'POST',
-      url: `/v1/projects/${projectId}/shots/${shotId}/workflow-revisions`,
-      headers: { 'idempotency-key': 'managed-revision-1' },
-      payload: {
-        editorGraph: fixtures.editorGraph,
-        apiGraph: fixtures.apiGraph,
-        profileId: MINIMAX_H3_PROFILE_ID,
-        profileVersion: MINIMAX_H3_PROFILE_VERSION,
-        source: 'comfy_editor',
-        frontendVersion: 'bridge-test',
-        frontendCommit: 'bridge-test-commit',
-      },
-    });
-    expect(revision.statusCode).toBe(201);
-    expect(revision.json().validation.valid).toBe(true);
-    expect(revision.json().revision.validationStatus).toBe('validated');
-    expect(revision.json().revision.frontendVersion).toBe('bridge-test');
-    expect(revision.json().revision.frontendCommit).toBe('bridge-test-commit');
-    const revisionId = revision.json().revision.id as string;
-
-    const listed = await request(app, {
-      method: 'GET',
-      url: `/v1/projects/${projectId}/shots/${shotId}/workflow-revisions`,
-    });
-    expect(listed.statusCode).toBe(200);
-    expect(listed.json().revisions[0].id).toBe(revisionId);
-    const global = await request(app, {
-      method: 'GET',
-      url: `/v1/workflow-revisions/${revisionId}`,
-    });
-    expect(global.statusCode).toBe(200);
-
-    const revalidated = await request(app, {
-      method: 'POST',
-      url: `/v1/workflow-revisions/${revisionId}/validate`,
-      headers: { 'idempotency-key': 'managed-revision-validate' },
-      payload: {},
-    });
-    expect(revalidated.statusCode).toBe(200);
-    expect(revalidated.json().validation.valid).toBe(true);
-
-    const override = await request(app, {
-      method: 'POST',
-      url: `/v1/projects/${projectId}/shots/${shotId}/managed-attempts`,
-      headers: { 'idempotency-key': 'managed-override' },
-      payload: { workflowRevisionId: revisionId, seed: 999 },
-    });
-    expect(override.statusCode).toBeGreaterThanOrEqual(400);
-    expect(override.statusCode).toBeLessThan(500);
-
-    const managed = await request(app, {
-      method: 'POST',
-      url: `/v1/projects/${projectId}/shots/${shotId}/managed-attempts`,
-      headers: { 'idempotency-key': 'managed-attempt-1' },
-      payload: { workflowRevisionId: revisionId },
-    });
-    expect(managed.statusCode).toBe(201);
-    const attempt = managed.json().attempt as {
-      id: string;
-      workflowRevisionId: string;
-      seed: number;
-      steps: number;
-      requestedWidth: number;
-      requestedHeight: number;
-      requestedDurationSeconds: number;
-      scenario?: string;
-    };
-    expect(attempt.workflowRevisionId).toBe(revisionId);
-    expect(attempt.scenario).toBeUndefined();
-    expect(attempt.seed).toBe(
-      revision.json().revision.executionParameters.seed,
-    );
-    expect(attempt.steps).toBe(
-      revision.json().revision.executionParameters.steps,
-    );
-
-    const replay = await request(app, {
-      method: 'POST',
-      url: `/v1/projects/${projectId}/shots/${shotId}/managed-attempts`,
-      headers: { 'idempotency-key': 'managed-attempt-1' },
-      payload: { workflowRevisionId: revisionId },
-    });
-    expect(replay.statusCode).toBe(201);
-    expect(replay.json()).toEqual(managed.json());
-    const attempts = await request(app, {
-      method: 'GET',
-      url: `/v1/projects/${projectId}/attempts`,
-    });
-    expect(attempts.json().attempts).toHaveLength(1);
-
-    expect(await worker.processOnce()).toBe(true);
-    const detail = await request(app, {
-      method: 'GET',
-      url: `/v1/attempts/${attempt.id}`,
-    });
-    expect(detail.statusCode).toBe(200);
-    expect(detail.json().attempt.status).toBe('awaiting_review');
-    const history = Object.values(comfy.histories())[0];
-    expect(history).toBeDefined();
-    const saveVideo = Object.values(history?.workflow ?? {}).find(
-      (node) =>
-        typeof node === 'object' &&
-        node !== null &&
-        !Array.isArray(node) &&
-        (node as { class_type?: unknown }).class_type === 'SaveVideo',
-    ) as { inputs?: { filename_prefix?: string } } | undefined;
-    expect(saveVideo?.inputs?.filename_prefix).toContain(attempt.id);
-    expect(history?.extraData.scenario).toBeUndefined();
-  });
-
   it('replays sanitized SSE events and serves authenticated ranged artifacts', async () => {
     const { app, store, worker, artifactStore } = await setupApi();
     const { projectId, shotId } = await createApprovedShot(app, 'stream');

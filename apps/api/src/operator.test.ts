@@ -18,7 +18,7 @@ import {
   FakeComfyClient,
 } from '@h3/comfy-client';
 import { InMemoryTelemetry } from '@h3/telemetry';
-import { DEV_TENANT_ID, StaticStoryboardPlanner } from './application.js';
+import { DEV_TENANT_ID } from './application.js';
 import { buildApiApp } from './app.js';
 import {
   createOperationalToolServices,
@@ -92,7 +92,6 @@ async function setup(script?: FauxOperationalScript): Promise<TestApp> {
     telemetry,
     idGenerator: testIds(),
     config: getApiConfig({ NODE_ENV: 'test', DEV_AUTH_TOKEN: 'test-token' }),
-    planner: new StaticStoryboardPlanner(),
     comfyClient: new FakeComfyClient(comfy),
     ...(adapter ? { operationalAdapter: adapter } : {}),
   });
@@ -130,6 +129,38 @@ async function createProject(
   });
   expect(response.statusCode).toBe(201);
   return response.json().project.id as Uuid;
+}
+
+/**
+ * Phase 7D removed `POST /v1/projects/:projectId/plan` and
+ * `.../storyboard/approve`; shots are no longer listed or otherwise
+ * addressable. Seed one the way a real client now must: submit `POST
+ * /v1/runs` with a graph that fails validation, which creates the project's
+ * implicit shot (and a `shot.created` domain event) without ever reaching
+ * attempt creation, leaving the shot in `approved_for_generation`.
+ */
+async function createApprovedShot(
+  app: Awaited<ReturnType<typeof buildApiApp>>,
+  prefix: string,
+): Promise<{ readonly projectId: Uuid; readonly shotId: Uuid }> {
+  const projectId = await createProject(app, prefix);
+  const invalidRun = await request(app, {
+    method: 'POST',
+    url: '/v1/runs',
+    headers: { 'idempotency-key': `${prefix}-seed-run` },
+    payload: { projectId, editorGraph: {}, apiGraph: {} },
+  });
+  expect(invalidRun.statusCode).toBe(422);
+  const events = await request(app, {
+    method: 'GET',
+    url: `/v1/projects/${projectId}/events`,
+  });
+  const shotCreated = (
+    events.json().events as ReadonlyArray<Record<string, unknown>>
+  ).find((event) => event.type === 'shot.created');
+  const shotId = shotCreated?.shotId as Uuid | undefined;
+  if (!shotId) throw new Error('Expected a shot.created event with a shotId.');
+  return { projectId, shotId };
 }
 
 async function appendEvent(
@@ -302,22 +333,7 @@ describe('Checkpoint 5 operational Pi adapter', () => {
 
   it('recommends a retry for a failed attempt but spends budget only after human apply', async () => {
     const { app, store, dispatcher } = await setup();
-    const projectId = await createProject(app, 'retry');
-    const plan = await request(app, {
-      method: 'POST',
-      url: `/v1/projects/${projectId}/plan`,
-      headers: { 'idempotency-key': 'retry-plan' },
-      payload: {},
-    });
-    expect(plan.statusCode).toBe(200);
-    const approval = await request(app, {
-      method: 'POST',
-      url: `/v1/projects/${projectId}/storyboard/approve`,
-      headers: { 'idempotency-key': 'retry-approve' },
-      payload: {},
-    });
-    expect(approval.statusCode).toBe(200);
-    const shotId = approval.json().shots[0].id as Uuid;
+    const { projectId, shotId } = await createApprovedShot(app, 'retry');
     const created = await request(app, {
       method: 'POST',
       url: `/v1/shots/${shotId}/attempts`,

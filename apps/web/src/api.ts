@@ -23,61 +23,6 @@ export interface Project {
   readonly updatedAt: string;
 }
 
-export interface StoryboardShot {
-  readonly ordinal: number;
-  readonly purpose: string;
-  readonly prompt: string;
-  readonly durationSeconds: number;
-  readonly mode: 't2v';
-  readonly qualityTier: 'preview';
-  readonly visualDescription?: string;
-  readonly cameraDirection?: string;
-  readonly audioDirection?: string;
-  readonly dialogue?: string;
-  readonly acceptanceCriteria?: readonly string[];
-  readonly requiredAssetIds?: readonly string[];
-}
-
-export interface StoryboardProposal {
-  readonly id: string;
-  readonly projectId: string;
-  readonly revision: number;
-  readonly status: 'proposed' | 'approved' | 'superseded';
-  readonly shots: readonly StoryboardShot[];
-  readonly totalDurationSeconds: number;
-  readonly durationToleranceSeconds: number;
-  readonly objective?: string;
-  readonly assumptions?: readonly string[];
-  readonly risks?: readonly string[];
-  readonly agentRunId?: string;
-  readonly version: number;
-  readonly createdAt: string;
-  readonly updatedAt: string;
-}
-
-export interface Shot {
-  readonly id: string;
-  readonly projectId: string;
-  readonly storyboardProposalId: string;
-  readonly ordinal: number;
-  readonly purpose: string;
-  readonly prompt: string;
-  readonly durationSeconds: number;
-  readonly mode: 't2v';
-  readonly qualityTier: 'preview';
-  readonly visualDescription?: string;
-  readonly cameraDirection?: string;
-  readonly audioDirection?: string;
-  readonly dialogue?: string;
-  readonly acceptanceCriteria?: readonly string[];
-  readonly requiredAssetIds?: readonly string[];
-  readonly status: string;
-  readonly acceptedAttemptId?: string;
-  readonly version: number;
-  readonly createdAt: string;
-  readonly updatedAt: string;
-}
-
 export interface ExecutorInfo {
   readonly mode: 'fake' | 'remote';
   readonly readiness: {
@@ -442,20 +387,6 @@ export function getProject(
   return request(token, `/v1/projects/${pathSegment(projectId)}`);
 }
 
-export function getStoryboard(
-  token: string,
-  projectId: string,
-): Promise<{ readonly proposal: StoryboardProposal | null }> {
-  return request(token, `/v1/projects/${pathSegment(projectId)}/storyboard`);
-}
-
-export function listShots(
-  token: string,
-  projectId: string,
-): Promise<{ readonly shots: readonly Shot[] }> {
-  return request(token, `/v1/projects/${pathSegment(projectId)}/shots`);
-}
-
 export function createProject(
   token: string,
   body: {
@@ -469,32 +400,6 @@ export function createProject(
     token,
     '/v1/projects',
     mutationOptions('project-create', body),
-  );
-}
-
-export function planProject(
-  token: string,
-  projectId: string,
-): Promise<{
-  readonly project: Project;
-  readonly proposal: StoryboardProposal;
-}> {
-  return request(
-    token,
-    `/v1/projects/${pathSegment(projectId)}/plan`,
-    mutationOptions('project-plan', {}),
-  );
-}
-
-export function approveStoryboard(
-  token: string,
-  projectId: string,
-  proposalId: string,
-): Promise<{ readonly project: Project; readonly shots: readonly Shot[] }> {
-  return request(
-    token,
-    `/v1/projects/${pathSegment(projectId)}/storyboard/approve`,
-    mutationOptions('storyboard-approve', { proposalId }),
   );
 }
 

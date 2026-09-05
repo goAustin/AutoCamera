@@ -24,11 +24,12 @@ evidence.
 
 ![ComfyUI shell with VideoOps managed panel](assets/screenshots/comfy-frontend/05-videoops-managed-run.png)
 
-Offline evidence set: `01-project-create.png`, `02-storyboard-approved.png`,
-`03-managed-workflow.png`, `04-revision-history.png`, `05-attempt-progress.png`,
-`06-artifact-review.png`, `07-timeline-recommendation.png`, and
-`08-completed-project.png`; the enabled local observability view is
-`09-grafana-dashboard.png` (full manifest: `EVIDENCE-MANIFEST.md`).
+Offline evidence set (Phase 7D's run view, captured from `StandaloneRunPage`):
+`01-run-history.png`, `02-artifact-review.png`, `03-run-accepted.png`,
+`04-recoverable-failure.png`, `05-retry-derived.png`,
+`06-finding-apply-confirmation.png`, and `07-run-history-complete.png`; the
+enabled local observability view is `09-grafana-dashboard.png` (full
+manifest: `EVIDENCE-MANIFEST.md`).
 
 ComfyUI-first inversion evidence: `comfy-frontend/04-videoops-sidebar.png` and
 `comfy-frontend/05-videoops-managed-run.png`.
