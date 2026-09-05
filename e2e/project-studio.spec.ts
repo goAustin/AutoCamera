@@ -28,7 +28,10 @@ function browserErrors(page: Page): string[] {
 }
 
 async function enterStudio(page: Page): Promise<void> {
-  await page.goto('/');
+  // Phase 7D step 1 moves the legacy Studio entry point from `/` (now
+  // `StandaloneRunPage`) to `/projects`; the screen and behaviour below are
+  // otherwise unchanged.
+  await page.goto('/projects');
   await page.getByLabel('Development token').fill(token);
   await page.getByRole('button', { name: 'Enter Project Studio' }).click();
   await expect(

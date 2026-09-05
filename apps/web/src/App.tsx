@@ -64,6 +64,7 @@ import {
   type OperatorRecommendation,
   type Project,
   type ProjectEvent,
+  type RunRecord,
   type Shot,
   type StoryboardProposal,
   type WorkflowRevision,
@@ -973,7 +974,7 @@ function ProjectStudioPage({
   return (
     <main className="page-shell studio-page">
       <div className="breadcrumb">
-        <Link to="/">Projects</Link>
+        <Link to="/projects">Projects</Link>
         <span>/</span>
         <span>{project.title}</span>
       </div>
@@ -1225,10 +1226,10 @@ function RevisionHistory({
   onValidate,
   validatingId,
 }: {
-  readonly revisions: readonly WorkflowRevision[];
+  readonly revisions: readonly Omit<WorkflowRevision, 'shotId'>[];
   readonly selectedRevisionId?: string | undefined;
-  readonly onUse: (revision: WorkflowRevision) => void;
-  readonly onValidate: (revision: WorkflowRevision) => void;
+  readonly onUse?: (revision: Omit<WorkflowRevision, 'shotId'>) => void;
+  readonly onValidate: (revision: Omit<WorkflowRevision, 'shotId'>) => void;
   readonly validatingId?: string | undefined;
 }): ReactElement {
   return (
@@ -1283,13 +1284,15 @@ function RevisionHistory({
                 </ul>
               )}
               <div className="button-row">
-                <button
-                  className="button button--quiet"
-                  type="button"
-                  onClick={() => onUse(revision)}
-                >
-                  Use revision
-                </button>
+                {onUse && (
+                  <button
+                    className="button button--quiet"
+                    type="button"
+                    onClick={() => onUse(revision)}
+                  >
+                    Use revision
+                  </button>
+                )}
                 {revision.validationStatus !== 'validated' && (
                   <button
                     className="button button--quiet"
@@ -1417,7 +1420,7 @@ function AttemptCard({
   invalidateProject,
 }: {
   readonly token: string;
-  readonly attempt: Attempt;
+  readonly attempt: Omit<Attempt, 'shotId'>;
   readonly events: readonly ProjectEvent[];
   readonly invalidateProject: () => void;
 }): ReactElement {
@@ -1439,7 +1442,10 @@ function AttemptCard({
         : false;
     },
   });
-  const detail = detailQuery.data ?? { attempt };
+  const detail: {
+    readonly attempt: Omit<Attempt, 'shotId'>;
+    readonly evaluation?: Evaluation;
+  } = detailQuery.data ?? { attempt };
   const reviewMutation = useMutation({
     mutationFn: (action: 'accept' | 'reject') =>
       action === 'accept'
@@ -1879,7 +1885,7 @@ function ShotWorkspace({
       setActionError(error);
     }
   };
-  const useRevision = (revision: WorkflowRevision): void => {
+  const useRevision = (revision: Omit<WorkflowRevision, 'shotId'>): void => {
     setSelectedRevisionId(revision.id);
     if (mode === 'fake')
       setSettings(
@@ -2414,26 +2420,47 @@ export function unresolvableNodeClasses(
   ].sort();
 }
 
-function ManagedPanelPage({
+interface RunViewSnapshot {
+  readonly runsLoaded: boolean;
+  readonly runs: readonly RunRecord[];
+  readonly run: RunRecord | undefined;
+  readonly progress:
+    | { readonly value: number; readonly max: number }
+    | undefined;
+  readonly pendingFindingCount: number;
+}
+
+/**
+ * Run list, run detail, progress, evaluation status, findings, revision
+ * restore, pin, and review. No bridge, no `postMessage`, no ComfyUI-origin
+ * awareness whatsoever: `ManagedPanelPage` mounts this alongside the bridge
+ * for the ComfyUI sidebar, and `StandaloneRunPage` mounts it alone at `/` so
+ * the durable record stays readable when no ComfyUI origin exists at all.
+ *
+ * `onRunSnapshot` and `onLoadRevision` are the only seams `ManagedPanelPage`
+ * needs: the first lets it read the currently selected run (for the
+ * ComfyUI status-feed payload) without this component knowing that feed
+ * exists; the second lets it push a revision's graph back into ComfyUI
+ * without this component ever importing `postMessage`.
+ */
+function RunView({
   token,
-  context,
-  onSignOut,
+  selectRunId,
+  onRunSnapshot,
+  onLoadRevision,
 }: {
   readonly token: string;
-  readonly context: ManagedBridgeContext;
-  readonly onSignOut: () => void;
+  readonly selectRunId?: string | undefined;
+  readonly onRunSnapshot?: (snapshot: RunViewSnapshot) => void;
+  readonly onLoadRevision?: (
+    revision: Omit<WorkflowRevision, 'shotId'>,
+  ) => void;
 }): ReactElement {
   const queryClient = useQueryClient();
-  const [bridgeReady, setBridgeReady] = useState(false);
-  const [bridgeError, setBridgeError] = useState<string | undefined>();
   const [selectedRunId, setSelectedRunId] = useState<string>();
   const [notice, setNotice] = useState<string | undefined>();
   const [liveEvents, setLiveEvents] = useState<readonly ManagedLiveEvent[]>([]);
   const [reviewNote, setReviewNote] = useState('');
-  const seenParentMessages = useRef(new Set<string>());
-  const handledExports = useRef(new Set<string>());
-  const defaultLoadSent = useRef(false);
-  const statusSent = useRef('');
   const liveEventCursor = useRef(0);
 
   const runsQuery = useQuery({
@@ -2450,6 +2477,7 @@ function ManagedPanelPage({
     refetchInterval: 2_000,
   });
   const run = runQuery.data ?? selectedRun;
+  const revision = run?.revision;
   const findingsQuery = useQuery({
     queryKey: ['managed-run-findings', run?.projectId],
     queryFn: () => listRecommendations(token, run?.projectId ?? ''),
@@ -2470,6 +2498,407 @@ function ManagedPanelPage({
     const first = runs[0];
     if (first) setSelectedRunId(first.runId);
   }, [runs, selectedRunId]);
+
+  // The only inbound seam from `ManagedPanelPage`: a run created from a
+  // ComfyUI export should become the selected run here, exactly as it did
+  // before the bridge and the run list lived in the same component.
+  useEffect(() => {
+    if (selectRunId !== undefined) setSelectedRunId(selectRunId);
+  }, [selectRunId]);
+
+  useEffect(() => {
+    const projectId = run?.projectId;
+    liveEventCursor.current = 0;
+    setLiveEvents([]);
+    if (!projectId) return;
+    let active = true;
+    let timer: number | undefined;
+    const poll = async (): Promise<void> => {
+      if (!active) return;
+      try {
+        const events = await fetchProjectEventStream(
+          token,
+          projectId,
+          liveEventCursor.current,
+        );
+        if (!active) return;
+        if (events.length > 0) {
+          liveEventCursor.current = Math.max(
+            liveEventCursor.current,
+            ...events.map((event) => event.id),
+          );
+          setLiveEvents((current) => [...current, ...events].slice(-100));
+          void runQuery.refetch();
+        }
+      } catch {
+        // The panel keeps polling REST truth when replay is unavailable.
+      } finally {
+        if (active) timer = window.setTimeout(() => void poll(), 2_500);
+      }
+    };
+    void poll();
+    return () => {
+      active = false;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [run?.projectId, runQuery.refetch, token]);
+
+  // The only outbound seam to `ManagedPanelPage`: it needs the selected run,
+  // the run list, computed progress, and the pending-finding count to build
+  // the ComfyUI status-feed payload and to decide whether to show the
+  // "first run" onboarding panel. Neither of those is this component's
+  // concern, so it exposes the raw ingredients instead of the bridge shape.
+  useEffect(() => {
+    onRunSnapshot?.({
+      runsLoaded: runsQuery.isSuccess,
+      runs,
+      run,
+      progress,
+      pendingFindingCount: pendingFindings.length,
+    });
+  }, [
+    onRunSnapshot,
+    runsQuery.isSuccess,
+    runs,
+    run,
+    progress,
+    pendingFindings.length,
+  ]);
+
+  const pinMutation = useMutation({
+    mutationFn: (runId: string) => pinRun(token, runId),
+    onSuccess: (updated) => {
+      setSelectedRunId(updated.runId);
+      void queryClient.invalidateQueries({ queryKey: ['managed-runs'] });
+      void runQuery.refetch();
+    },
+  });
+  const unpinMutation = useMutation({
+    mutationFn: (runId: string) => unpinRun(token, runId),
+    onSuccess: (updated) => {
+      setSelectedRunId(updated.runId);
+      void queryClient.invalidateQueries({ queryKey: ['managed-runs'] });
+      void runQuery.refetch();
+    },
+  });
+  const reviewMutation = useMutation({
+    mutationFn: (input: {
+      readonly runId: string;
+      readonly decision: 'accepted' | 'rejected';
+    }) =>
+      reviewRun(token, input.runId, {
+        decision: input.decision,
+        ...(reviewNote.trim() ? { note: reviewNote.trim() } : {}),
+      }),
+    onSuccess: (updated) => {
+      setReviewNote('');
+      setSelectedRunId(updated.runId);
+      setNotice(`Run annotated ${updated.review?.decision ?? 'reviewed'}.`);
+      void queryClient.invalidateQueries({ queryKey: ['managed-runs'] });
+      void runQuery.refetch();
+    },
+  });
+  const validateMutation = useMutation({
+    mutationFn: (revisionId: string) =>
+      validateWorkflowRevision(token, revisionId),
+    onSuccess: (result) => {
+      setNotice(
+        result.validation.valid
+          ? 'Revision validated against the current executor.'
+          : 'Revision remains invalid; review the correction details.',
+      );
+      void queryClient.invalidateQueries({ queryKey: ['managed-runs'] });
+      if (run)
+        void queryClient.invalidateQueries({
+          queryKey: ['managed-run', run.runId],
+        });
+    },
+  });
+
+  // Shared invalidation for the carried-over `AttemptCard` and
+  // `RecommendationPanel`, which each expect a single "something about this
+  // project may have changed" callback rather than the run-scoped query keys
+  // this view happens to use.
+  const invalidateRunState = useCallback(() => {
+    void queryClient.invalidateQueries({ queryKey: ['managed-runs'] });
+    if (run) {
+      void queryClient.invalidateQueries({
+        queryKey: ['managed-run', run.runId],
+      });
+      void queryClient.invalidateQueries({
+        queryKey: ['managed-run-findings', run.projectId],
+      });
+    }
+  }, [queryClient, run]);
+
+  return (
+    <>
+      {runsQuery.isError && <ErrorNotice error={runsQuery.error} />}
+      {pinMutation.isError && <ErrorNotice error={pinMutation.error} />}
+      {unpinMutation.isError && <ErrorNotice error={unpinMutation.error} />}
+      {reviewMutation.isError && <ErrorNotice error={reviewMutation.error} />}
+      {validateMutation.isError && (
+        <ErrorNotice error={validateMutation.error} />
+      )}
+      {notice && <InfoNotice>{notice}</InfoNotice>}
+      <div className="managed-panel-grid">
+        <section
+          className="managed-history panel"
+          aria-labelledby="managed-history-title"
+        >
+          <div className="panel-heading">
+            <div>
+              <span className="section-kicker">DURABLE RUNS</span>
+              <h2 id="managed-history-title">History</h2>
+            </div>
+            <span className="count-badge">{runs.length}</span>
+          </div>
+          {runsQuery.isPending && <LoadingState label="Loading run history…" />}
+          {runs.length === 0 && runsQuery.isSuccess && (
+            <EmptyState
+              title="No managed runs"
+              detail="Managed Run exports will be recorded here."
+            />
+          )}
+          <ol className="managed-run-list">
+            {runs.map((item) => (
+              <li key={item.runId}>
+                <button
+                  className={
+                    item.runId === run?.runId
+                      ? 'managed-run-item managed-run-item--selected'
+                      : 'managed-run-item'
+                  }
+                  type="button"
+                  aria-pressed={item.runId === run?.runId}
+                  onClick={() => setSelectedRunId(item.runId)}
+                >
+                  <span>
+                    <strong>{shortRunId(item.runId)}</strong>
+                    <small>{formatDate(item.attempt.createdAt)}</small>
+                  </span>
+                  <StatusBadge status={item.status} />
+                </button>
+              </li>
+            ))}
+          </ol>
+        </section>
+        <section
+          className="managed-detail panel"
+          aria-labelledby="managed-detail-title"
+        >
+          <div className="panel-heading">
+            <div>
+              <span className="section-kicker">RUN / RESULT / REVIEW</span>
+              <h2 id="managed-detail-title">Selected run</h2>
+            </div>
+          </div>
+          {!run && (
+            <EmptyState
+              title="Select a run"
+              detail="Run status, evaluation, findings, and review controls will appear here."
+            />
+          )}
+          {run && (
+            <>
+              <dl className="managed-facts">
+                <div>
+                  <dt>Run ID</dt>
+                  <dd>{run.runId}</dd>
+                </div>
+                <div>
+                  <dt>Evaluation</dt>
+                  <dd>{humanize(run.evaluationStatus)}</dd>
+                </div>
+                <div>
+                  <dt>Estimated cost</dt>
+                  <dd>{formatMoney(run.cost.estimatedCostUsd)}</dd>
+                </div>
+                <div>
+                  <dt>Budget headroom</dt>
+                  <dd>
+                    {run.cost.projectRemainingUsd === null
+                      ? 'Not budgeted'
+                      : formatMoney(run.cost.projectRemainingUsd)}
+                  </dd>
+                </div>
+                <div>
+                  <dt>Keeper</dt>
+                  <dd>{run.pinned ? 'Pinned' : 'Not pinned'}</dd>
+                </div>
+                <div>
+                  <dt>Review</dt>
+                  <dd>
+                    {run.review?.decision
+                      ? humanize(run.review.decision)
+                      : 'Not annotated'}
+                  </dd>
+                </div>
+              </dl>
+              <div className="button-row">
+                {revision && onLoadRevision && (
+                  <button
+                    className="button button--quiet"
+                    type="button"
+                    onClick={() => onLoadRevision(revision)}
+                  >
+                    Load revision in ComfyUI
+                  </button>
+                )}
+                <button
+                  className="button button--quiet"
+                  type="button"
+                  onClick={() =>
+                    run.pinned
+                      ? unpinMutation.mutate(run.runId)
+                      : pinMutation.mutate(run.runId)
+                  }
+                  disabled={pinMutation.isPending || unpinMutation.isPending}
+                >
+                  {run.pinned ? 'Unpin keeper' : 'Pin keeper'}
+                </button>
+              </div>
+              <section
+                className="managed-subsection"
+                aria-labelledby="managed-progress-title"
+              >
+                <div className="panel-heading">
+                  <h3 id="managed-progress-title">Progress and trace</h3>
+                  <span className="live-chip">Live SSE</span>
+                </div>
+                {progress ? (
+                  <progress max={progress.max} value={progress.value} />
+                ) : (
+                  <p className="muted">No execution progress reported yet.</p>
+                )}
+                {run.attempt.failureCode && (
+                  <p className="failure-line">
+                    {run.attempt.failureCode}:{' '}
+                    {run.attempt.failureMessage ?? 'Execution failed.'}
+                  </p>
+                )}
+                {run.attempt.traceId && (
+                  <p className="trace-line">Trace ID: {run.attempt.traceId}</p>
+                )}
+                <p className="muted">
+                  Node durations: not recorded in the durable Phase 7 feed.
+                </p>
+                {run.artifact && (
+                  <p>
+                    Artifact recorded: {String(run.artifact.id ?? 'available')}
+                  </p>
+                )}
+              </section>
+              {revision && (
+                <RevisionHistory
+                  revisions={[revision]}
+                  selectedRevisionId={revision.id}
+                  onValidate={(target) => validateMutation.mutate(target.id)}
+                  validatingId={
+                    validateMutation.isPending
+                      ? validateMutation.variables
+                      : undefined
+                  }
+                />
+              )}
+              <AttemptCard
+                key={run.attempt.id}
+                token={token}
+                attempt={run.attempt}
+                events={run.events}
+                invalidateProject={invalidateRunState}
+              />
+              <RecommendationPanel
+                token={token}
+                projectId={run.projectId}
+                recommendations={findings}
+                invalidateProject={invalidateRunState}
+              />
+              <section
+                className="managed-subsection"
+                aria-labelledby="managed-review-title"
+              >
+                <div className="panel-heading">
+                  <h3 id="managed-review-title">Human review</h3>
+                </div>
+                <textarea
+                  aria-label="Review note"
+                  rows={3}
+                  maxLength={2_000}
+                  value={reviewNote}
+                  onChange={(event) => setReviewNote(event.target.value)}
+                  placeholder="Optional review note"
+                />
+                <div className="button-row">
+                  <button
+                    className="button button--primary"
+                    type="button"
+                    onClick={() =>
+                      reviewMutation.mutate({
+                        runId: run.runId,
+                        decision: 'accepted',
+                      })
+                    }
+                    disabled={reviewMutation.isPending}
+                  >
+                    Accept annotation
+                  </button>
+                  <button
+                    className="button button--quiet"
+                    type="button"
+                    onClick={() =>
+                      reviewMutation.mutate({
+                        runId: run.runId,
+                        decision: 'rejected',
+                      })
+                    }
+                    disabled={reviewMutation.isPending}
+                  >
+                    Reject annotation
+                  </button>
+                </div>
+              </section>
+              <EventTimeline events={run.events} />
+            </>
+          )}
+        </section>
+      </div>
+    </>
+  );
+}
+
+/**
+ * `RunView` plus the ComfyUI bridge. The bridge coupling is confined to this
+ * component: `bridgeReady`, `handleExport`, `postToComfy`, the `message`
+ * listener, and the status-feed effect. `RunView` itself never sees any of
+ * it; this component observes `RunView`'s state through `onRunSnapshot` and
+ * pushes graphs back into ComfyUI through `onLoadRevision`.
+ */
+function ManagedPanelPage({
+  token,
+  context,
+  onSignOut,
+}: {
+  readonly token: string;
+  readonly context: ManagedBridgeContext;
+  readonly onSignOut: () => void;
+}): ReactElement {
+  const queryClient = useQueryClient();
+  const [bridgeReady, setBridgeReady] = useState(false);
+  const [bridgeError, setBridgeError] = useState<string | undefined>();
+  const [bridgeNotice, setBridgeNotice] = useState<string | undefined>();
+  const [requestedRunId, setRequestedRunId] = useState<string>();
+  const [snapshot, setSnapshot] = useState<RunViewSnapshot>({
+    runsLoaded: false,
+    runs: [],
+    run: undefined,
+    progress: undefined,
+    pendingFindingCount: 0,
+  });
+  const seenParentMessages = useRef(new Set<string>());
+  const handledExports = useRef(new Set<string>());
+  const defaultLoadSent = useRef(false);
+  const statusSent = useRef('');
 
   const createRunMutation = useMutation({
     mutationFn: (message: ExportedWorkflowMessage) => {
@@ -2503,8 +2932,8 @@ function ManagedPanelPage({
       );
     },
     onSuccess: (result) => {
-      if (result.runId) setSelectedRunId(result.runId);
-      setNotice(
+      if (result.runId) setRequestedRunId(result.runId);
+      setBridgeNotice(
         result.runId
           ? `Managed run ${shortRunId(result.runId)} created.`
           : 'The graph was recorded with validation errors; no run was queued.',
@@ -2590,54 +3019,19 @@ function ManagedPanelPage({
   }, [context.nonce, context.parentOrigin, handleExport]);
 
   useEffect(() => {
-    if (!bridgeReady || !runsQuery.isSuccess || runs.length > 0) return;
+    if (!bridgeReady || !snapshot.runsLoaded || snapshot.runs.length > 0)
+      return;
     if (defaultLoadSent.current) return;
     defaultLoadSent.current = true;
     const template = buildFakeWorkflowGraphs(DEFAULT_FAKE_WORKFLOW_SETTINGS);
     postToComfy('workflow.load', { editorGraph: template.editorGraph });
-    setNotice('The MiniMax H3 template is open in ComfyUI.');
-  }, [bridgeReady, postToComfy, runs, runsQuery.isSuccess]);
-
-  useEffect(() => {
-    const projectId = run?.projectId;
-    liveEventCursor.current = 0;
-    setLiveEvents([]);
-    if (!projectId) return;
-    let active = true;
-    let timer: number | undefined;
-    const poll = async (): Promise<void> => {
-      if (!active) return;
-      try {
-        const events = await fetchProjectEventStream(
-          token,
-          projectId,
-          liveEventCursor.current,
-        );
-        if (!active) return;
-        if (events.length > 0) {
-          liveEventCursor.current = Math.max(
-            liveEventCursor.current,
-            ...events.map((event) => event.id),
-          );
-          setLiveEvents((current) => [...current, ...events].slice(-100));
-          void runQuery.refetch();
-        }
-      } catch {
-        // The panel keeps polling REST truth when replay is unavailable.
-      } finally {
-        if (active) timer = window.setTimeout(() => void poll(), 2_500);
-      }
-    };
-    void poll();
-    return () => {
-      active = false;
-      if (timer !== undefined) window.clearTimeout(timer);
-    };
-  }, [run?.projectId, runQuery.refetch, token]);
+    setBridgeNotice('The MiniMax H3 template is open in ComfyUI.');
+  }, [bridgeReady, postToComfy, snapshot.runsLoaded, snapshot.runs]);
 
   const statusEvaluation = useMemo(() => {
+    const run = snapshot.run;
     if (!run) return undefined;
-    const activeRunCount = runs.filter(
+    const activeRunCount = snapshot.runs.filter(
       (item) => item.status === 'queued' || item.status === 'running',
     ).length;
     const evaluation: Record<string, unknown> = {
@@ -2645,9 +3039,9 @@ function ManagedPanelPage({
       executorReadiness: 'managed-studio',
       activeRunCount,
       nodeDurations: { status: 'not-recorded' },
-      openFindingCount: pendingFindings.length,
+      openFindingCount: snapshot.pendingFindingCount,
     };
-    if (progress) evaluation.progress = progress;
+    if (snapshot.progress) evaluation.progress = snapshot.progress;
     if (run.cost.projectRemainingUsd !== null)
       evaluation.budgetHeadroom = run.cost.projectRemainingUsd;
     const failureCode = run.attempt.failureCode;
@@ -2661,9 +3055,10 @@ function ManagedPanelPage({
     }
     if (traceId) evaluation.traceId = traceId;
     return evaluation;
-  }, [pendingFindings.length, progress, run, runs]);
+  }, [snapshot]);
 
   useEffect(() => {
+    const run = snapshot.run;
     if (!bridgeReady || !run || !statusEvaluation) {
       if (!bridgeReady) statusSent.current = '';
       return;
@@ -2680,50 +3075,19 @@ function ManagedPanelPage({
       status: run.status,
       evaluation: statusEvaluation,
     });
-  }, [bridgeReady, postToComfy, run, statusEvaluation]);
+  }, [bridgeReady, postToComfy, snapshot, statusEvaluation]);
 
-  const pinMutation = useMutation({
-    mutationFn: (runId: string) => pinRun(token, runId),
-    onSuccess: (updated) => {
-      setSelectedRunId(updated.runId);
-      void queryClient.invalidateQueries({ queryKey: ['managed-runs'] });
-      void runQuery.refetch();
+  const handleLoadRevision = useCallback(
+    (revision: Omit<WorkflowRevision, 'shotId'>): void => {
+      if (!revision.editorGraph) return;
+      postToComfy('workflow.load', {
+        editorGraph: revision.editorGraph,
+        ...(revision.id ? { revisionId: revision.id } : {}),
+      });
+      setBridgeNotice(`Revision ${shortRunId(revision.id)} sent to ComfyUI.`);
     },
-  });
-  const unpinMutation = useMutation({
-    mutationFn: (runId: string) => unpinRun(token, runId),
-    onSuccess: (updated) => {
-      setSelectedRunId(updated.runId);
-      void queryClient.invalidateQueries({ queryKey: ['managed-runs'] });
-      void runQuery.refetch();
-    },
-  });
-  const reviewMutation = useMutation({
-    mutationFn: (input: {
-      readonly runId: string;
-      readonly decision: 'accepted' | 'rejected';
-    }) =>
-      reviewRun(token, input.runId, {
-        decision: input.decision,
-        ...(reviewNote.trim() ? { note: reviewNote.trim() } : {}),
-      }),
-    onSuccess: (updated) => {
-      setReviewNote('');
-      setSelectedRunId(updated.runId);
-      setNotice(`Run annotated ${updated.review?.decision ?? 'reviewed'}.`);
-      void queryClient.invalidateQueries({ queryKey: ['managed-runs'] });
-      void runQuery.refetch();
-    },
-  });
-
-  const loadRevision = (): void => {
-    if (!run?.revision?.editorGraph) return;
-    postToComfy('workflow.load', {
-      editorGraph: run.revision.editorGraph,
-      ...(run.revision.id ? { revisionId: run.revision.id } : {}),
-    });
-    setNotice(`Revision ${shortRunId(run.revision.id)} sent to ComfyUI.`);
-  };
+    [postToComfy],
+  );
 
   return (
     <main className="managed-panel" aria-label="VideoOps managed run panel">
@@ -2756,15 +3120,11 @@ function ManagedPanelPage({
         </div>
       </header>
       {bridgeError && <ErrorNotice error={new Error(bridgeError)} />}
-      {runsQuery.isError && <ErrorNotice error={runsQuery.error} />}
       {createRunMutation.isError && (
         <ErrorNotice error={createRunMutation.error} />
       )}
-      {pinMutation.isError && <ErrorNotice error={pinMutation.error} />}
-      {unpinMutation.isError && <ErrorNotice error={unpinMutation.error} />}
-      {reviewMutation.isError && <ErrorNotice error={reviewMutation.error} />}
-      {notice && <InfoNotice>{notice}</InfoNotice>}
-      {runsQuery.isSuccess && runs.length === 0 && (
+      {bridgeNotice && <InfoNotice>{bridgeNotice}</InfoNotice>}
+      {snapshot.runsLoaded && snapshot.runs.length === 0 && (
         <section className="managed-empty panel">
           <span className="section-kicker">FIRST RUN / MINIMAX H3</span>
           <h2>Template opened in ComfyUI</h2>
@@ -2774,7 +3134,7 @@ function ManagedPanelPage({
           </p>
           <a
             className="button button--quiet"
-            href="/"
+            href="/projects"
             target="_blank"
             rel="noopener noreferrer"
           >
@@ -2782,245 +3142,42 @@ function ManagedPanelPage({
           </a>
         </section>
       )}
-      <div className="managed-panel-grid">
-        <section
-          className="managed-history panel"
-          aria-labelledby="managed-history-title"
-        >
-          <div className="panel-heading">
-            <div>
-              <span className="section-kicker">DURABLE RUNS</span>
-              <h2 id="managed-history-title">History</h2>
-            </div>
-            <span className="count-badge">{runs.length}</span>
-          </div>
-          {runsQuery.isPending && <LoadingState label="Loading run history…" />}
-          {runs.length === 0 && runsQuery.isSuccess && (
-            <EmptyState
-              title="No managed runs"
-              detail="Managed Run exports will be recorded here."
-            />
-          )}
-          <ol className="managed-run-list">
-            {runs.map((item) => (
-              <li key={item.runId}>
-                <button
-                  className={
-                    item.runId === run?.runId
-                      ? 'managed-run-item managed-run-item--selected'
-                      : 'managed-run-item'
-                  }
-                  type="button"
-                  aria-pressed={item.runId === run?.runId}
-                  onClick={() => setSelectedRunId(item.runId)}
-                >
-                  <span>
-                    <strong>{shortRunId(item.runId)}</strong>
-                    <small>{formatDate(item.attempt.createdAt)}</small>
-                  </span>
-                  <StatusBadge status={item.status} />
-                </button>
-              </li>
-            ))}
-          </ol>
-        </section>
-        <section
-          className="managed-detail panel"
-          aria-labelledby="managed-detail-title"
-        >
-          <div className="panel-heading">
-            <div>
-              <span className="section-kicker">RUN / RESULT / REVIEW</span>
-              <h2 id="managed-detail-title">Selected run</h2>
-            </div>
-            {run && <StatusBadge status={run.status} />}
-          </div>
-          {!run && (
-            <EmptyState
-              title="Select a run"
-              detail="Run status, evaluation, findings, and review controls will appear here."
-            />
-          )}
-          {run && (
-            <>
-              <dl className="managed-facts">
-                <div>
-                  <dt>Run ID</dt>
-                  <dd>{run.runId}</dd>
-                </div>
-                <div>
-                  <dt>Evaluation</dt>
-                  <dd>{humanize(run.evaluationStatus)}</dd>
-                </div>
-                <div>
-                  <dt>Estimated cost</dt>
-                  <dd>{formatMoney(run.cost.estimatedCostUsd)}</dd>
-                </div>
-                <div>
-                  <dt>Budget headroom</dt>
-                  <dd>
-                    {run.cost.projectRemainingUsd === null
-                      ? 'Not budgeted'
-                      : formatMoney(run.cost.projectRemainingUsd)}
-                  </dd>
-                </div>
-                <div>
-                  <dt>Keeper</dt>
-                  <dd>{run.pinned ? 'Pinned' : 'Not pinned'}</dd>
-                </div>
-                <div>
-                  <dt>Review</dt>
-                  <dd>
-                    {run.review?.decision
-                      ? humanize(run.review.decision)
-                      : 'Not annotated'}
-                  </dd>
-                </div>
-              </dl>
-              <div className="button-row">
-                {run.revision && (
-                  <button
-                    className="button button--quiet"
-                    type="button"
-                    onClick={loadRevision}
-                  >
-                    Load revision in ComfyUI
-                  </button>
-                )}
-                <button
-                  className="button button--quiet"
-                  type="button"
-                  onClick={() =>
-                    run.pinned
-                      ? unpinMutation.mutate(run.runId)
-                      : pinMutation.mutate(run.runId)
-                  }
-                  disabled={pinMutation.isPending || unpinMutation.isPending}
-                >
-                  {run.pinned ? 'Unpin keeper' : 'Pin keeper'}
-                </button>
-              </div>
-              <section
-                className="managed-subsection"
-                aria-labelledby="managed-progress-title"
-              >
-                <div className="panel-heading">
-                  <h3 id="managed-progress-title">Progress and trace</h3>
-                  <span className="live-chip">Live SSE</span>
-                </div>
-                {progress ? (
-                  <progress max={progress.max} value={progress.value} />
-                ) : (
-                  <p className="muted">No execution progress reported yet.</p>
-                )}
-                {run.attempt.failureCode && (
-                  <p className="failure-line">
-                    {run.attempt.failureCode}:{' '}
-                    {run.attempt.failureMessage ?? 'Execution failed.'}
-                  </p>
-                )}
-                {run.attempt.traceId && (
-                  <p className="trace-line">Trace ID: {run.attempt.traceId}</p>
-                )}
-                <p className="muted">
-                  Node durations: not recorded in the durable Phase 7 feed.
-                </p>
-                {run.artifact && (
-                  <p>
-                    Artifact recorded: {String(run.artifact.id ?? 'available')}
-                  </p>
-                )}
-              </section>
-              <section
-                className="managed-subsection"
-                aria-labelledby="managed-findings-title"
-              >
-                <div className="panel-heading">
-                  <h3 id="managed-findings-title">Findings</h3>
-                  <span className="count-badge">{pendingFindings.length}</span>
-                </div>
-                {pendingFindings.length === 0 ? (
-                  <p className="muted">No pending operator findings.</p>
-                ) : (
-                  <ul className="managed-finding-list">
-                    {pendingFindings.map((finding) => (
-                      <li key={finding.id}>
-                        <StatusBadge status={finding.severity} />
-                        <strong>{finding.title}</strong>
-                        <span>{finding.detail}</span>
-                      </li>
-                    ))}
-                  </ul>
-                )}
-              </section>
-              <section
-                className="managed-subsection"
-                aria-labelledby="managed-review-title"
-              >
-                <div className="panel-heading">
-                  <h3 id="managed-review-title">Human review</h3>
-                </div>
-                <textarea
-                  aria-label="Review note"
-                  rows={3}
-                  maxLength={2_000}
-                  value={reviewNote}
-                  onChange={(event) => setReviewNote(event.target.value)}
-                  placeholder="Optional review note"
-                />
-                <div className="button-row">
-                  <button
-                    className="button button--primary"
-                    type="button"
-                    onClick={() =>
-                      reviewMutation.mutate({
-                        runId: run.runId,
-                        decision: 'accepted',
-                      })
-                    }
-                    disabled={reviewMutation.isPending}
-                  >
-                    Accept annotation
-                  </button>
-                  <button
-                    className="button button--quiet"
-                    type="button"
-                    onClick={() =>
-                      reviewMutation.mutate({
-                        runId: run.runId,
-                        decision: 'rejected',
-                      })
-                    }
-                    disabled={reviewMutation.isPending}
-                  >
-                    Reject annotation
-                  </button>
-                </div>
-              </section>
-              <section
-                className="managed-subsection"
-                aria-labelledby="managed-events-title"
-              >
-                <div className="panel-heading">
-                  <h3 id="managed-events-title">Event feed</h3>
-                  <span className="count-badge">{run.events.length}</span>
-                </div>
-                <ol className="managed-event-list">
-                  {run.events
-                    .slice(-8)
-                    .reverse()
-                    .map((event) => (
-                      <li key={event.id}>
-                        <strong>{humanize(event.type)}</strong>
-                        <small>{formatDate(event.occurredAt)}</small>
-                      </li>
-                    ))}
-                </ol>
-              </section>
-            </>
-          )}
-        </section>
-      </div>
+      <RunView
+        token={token}
+        selectRunId={requestedRunId}
+        onRunSnapshot={setSnapshot}
+        onLoadRevision={handleLoadRevision}
+      />
+    </main>
+  );
+}
+
+/**
+ * `RunView` mounted alone at `/`, for when no ComfyUI origin exists at all
+ * (the rented-GPU topology in `infra/gpu-executor/README.md` destroys the
+ * ComfyUI host between sessions). This is the only view of the durable
+ * record at exactly the moment the record is all that is left, so it carries
+ * playback, retry, and findings the same way the ComfyUI-embedded panel
+ * does — same `RunView`, no bridge wrapped around it.
+ */
+function StandaloneRunPage({
+  token,
+}: {
+  readonly token: string;
+}): ReactElement {
+  return (
+    <main className="managed-panel" aria-label="H3 VideoOps run view">
+      <header className="managed-panel-header">
+        <div>
+          <p className="eyebrow">VIDEOOPS / RUN VIEW</p>
+          <h1>Run history</h1>
+          <p className="managed-panel-lede">
+            The durable execution and monitoring record for every submitted
+            graph, readable even when no ComfyUI executor is running.
+          </p>
+        </div>
+      </header>
+      <RunView token={token} />
     </main>
   );
 }
@@ -3058,7 +3215,8 @@ export function App(): ReactElement {
   return (
     <AppShell onSignOut={signOut}>
       <Routes>
-        <Route path="/" element={<ProjectListPage token={token} />} />
+        <Route path="/" element={<StandaloneRunPage token={token} />} />
+        <Route path="/projects" element={<ProjectListPage token={token} />} />
         <Route
           path="/projects/:projectId"
           element={<ProjectStudioPage token={token} />}

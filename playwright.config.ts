@@ -28,6 +28,21 @@ const commonEnvironment = {
   COMFY_FRONTEND_URL: fakeComfyOrigin,
   COMFY_CLIENT_ID_PREFIX: 'h3-e2e',
   GPU_WORKER_ID: 'e2e-worker',
+  // Overrides the 300s production default (packages/config/src/index.ts) so
+  // e2e/run-view.spec.ts's `timeout` scenario resolves within this file's
+  // 60s per-test budget (playwright.config.ts `timeout` below), without
+  // relying on a shell-set variable the suite would otherwise silently pass
+  // or fail depending on. `GenerationWorker` fires this as a plain
+  // `setTimeout` (apps/api/src/generation.ts), so the wall-clock cost of a
+  // real timeout is ~ATTEMPT_TIMEOUT_SECONDS, not a fraction of it: 20s
+  // leaves the rest of that test's steps (three API-seeded shots, two full
+  // "success"-scenario completions, and the UI navigation, retry, and
+  // finding-apply interactions around them) comfortable room inside 60s.
+  // Measured "success"-scenario completion (attempt creation to
+  // `awaiting_review` with evaluation, this machine, 5 trials): 344-349ms,
+  // so 20s is ~57x that -- ample margin against a slower or loaded CI host
+  // before any happy-path attempt could plausibly graze this threshold.
+  ATTEMPT_TIMEOUT_SECONDS: '20',
   H3_MEDIA_FIXTURE_PATH: `${process.cwd()}/.data/fixtures/h3-t2v-fixture.mp4`,
   PI_PROVIDER: 'faux',
   API_HOST: '127.0.0.1',
