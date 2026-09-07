@@ -178,7 +178,10 @@ function updatedAt<Value extends { readonly updatedAt: IsoUtcTimestamp }>(
  * for status changes; annotation-only writes must use this.
  */
 function revise<
-  Value extends { readonly updatedAt: IsoUtcTimestamp; readonly version: number },
+  Value extends {
+    readonly updatedAt: IsoUtcTimestamp;
+    readonly version: number;
+  },
 >(value: Value, clock: Clock): Value {
   return {
     ...value,

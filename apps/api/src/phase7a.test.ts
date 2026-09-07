@@ -482,10 +482,7 @@ describe('graph-first runs are not capped by the storyboard shot count', () => {
 });
 
 describe('pinning is an annotation, not an acceptance', () => {
-  async function shotOf(
-    store: TransactionalStore,
-    projectId: string,
-  ) {
+  async function shotOf(store: TransactionalStore, projectId: string) {
     return store.withTransaction(async (repositories) => {
       const shots = await repositories.shots.listByProject(
         assertUuid(projectId),

@@ -173,10 +173,11 @@ export class ProjectApplicationService {
     // One implicit shot per run, so a project's run count is unbounded. The
     // three-shot limit belongs to storyboard proposals, which are validated
     // separately; it must not cap direct graph-first submissions.
-    const ordinal: ShotOrdinal = existingShots.reduce(
-      (highest, shot) => Math.max(highest, shot.ordinal),
-      0,
-    ) + 1;
+    const ordinal: ShotOrdinal =
+      existingShots.reduce(
+        (highest, shot) => Math.max(highest, shot.ordinal),
+        0,
+      ) + 1;
     const now = toIsoUtc(this.clock.now());
     const shot = createShot({
       id: this.idGenerator.next(),
@@ -337,4 +338,3 @@ export function transitionShotForFuturePhases(
 ): Shot {
   return transitionShot(shot, nextStatus);
 }
-

@@ -326,7 +326,9 @@ describe('readManagedBridgeContext embedder corroboration', () => {
   });
 
   it('rejects a declared parentOrigin that cannot be corroborated', () => {
-    expect(readManagedBridgeContext(managed('https://comfy.example.com'), '')).toBeNull();
+    expect(
+      readManagedBridgeContext(managed('https://comfy.example.com'), ''),
+    ).toBeNull();
   });
 
   it('falls back to the embedder when no origin is declared', () => {
@@ -399,7 +401,11 @@ describe('sidebar mount lifecycle', () => {
         addEventListener: () => {},
         removeEventListener: () => {},
       },
-      documentRef: { body: {}, querySelector: () => null, createElement: () => ({}) },
+      documentRef: {
+        body: {},
+        querySelector: () => null,
+        createElement: () => ({}),
+      },
     });
     expect(disabled.enabled).toBe(false);
     expect(() => disabled.detach?.()).not.toThrow();

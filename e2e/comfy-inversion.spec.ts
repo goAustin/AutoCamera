@@ -231,7 +231,9 @@ test.describe('ComfyUI plugin inversion', () => {
     // any export it cannot express, so a submission that happens at all covers
     // every node the user built. See web.test.ts for the refusal cases.
     expect(createPayload?.apiGraph).toBeTruthy();
-    expect(Object.keys(createPayload?.apiGraph as object).length).toBeGreaterThan(0);
+    expect(
+      Object.keys(createPayload?.apiGraph as object).length,
+    ).toBeGreaterThan(0);
     // Surface the response body on failure; a validation rejection is the most
     // likely reason a managed run never appears.
     await expect
