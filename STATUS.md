@@ -1,58 +1,69 @@
-# Release status
+# Status
 
-## Phase 7C — ComfyUI-first plugin inversion
+Evidence level: **Offline fake**. No real MiniMax H3 clip has been generated,
+and no remote executor has been exercised in this environment.
 
-Status: complete for the **Offline fake** evidence level (`v0.1.0-mvp`).
-Phase 7A and Phase 7B are complete and preserved. ComfyUI now opens as the
-graph shell, the VideoOps sidebar is a Studio-origin iframe, native browser
-queueing is refused, and the managed panel records runs through the 7A API.
-The VideoOps bearer token never enters the ComfyUI origin.
+## What is implemented
 
-### Completed gates
+The durable control plane is complete and tested: PostgreSQL as the authority
+for business state, immutable server-hashed workflow revisions pinned to the
+executor capability fingerprint, reclaimable queue leases, retry lineage,
+reconciliation of duplicate and uncertain executor events, deterministic media
+evaluation, authorized byte-range artifact delivery, an append-only domain
+event timeline over REST and SSE, and trace propagation across worker, outbox,
+executor observation, and stream boundaries.
 
-- pinned frontend ref `3697a1bc3ba7f6b98a1ead888721f7676b536eb5` verified for
-  the public extension APIs used by the plugin;
-- shared reversed bridge contract with exact origin/source/nonce/replay/size
-  validation and credential-field rejection;
-- ComfyUI entry canvas, VideoOps left sidebar iframe, bottom status tab, and
-  topbar managed badge;
-- Studio-only token storage and authenticated API calls;
-- native queue and queue-mode controls disabled; public `Managed Run` action
-  exported through `app.graphToPrompt()`;
-- empty-state H3 template load, brief on-ramp, run history/detail, revision
-  restore, pin, review, findings, progress, and trace display;
-- standalone Studio fallback retained, with Phase 5 routes left available for
-  legacy callers;
-- updated ComfyUI-first screenshots and evidence manifest.
+ComfyUI is the entry point. The VideoOps panel mounts inside it as a
+Studio-origin iframe, native browser queueing is refused, and a loaded graph is
+submitted through one managed `POST /v1/runs`. The VideoOps bearer token never
+enters the ComfyUI origin. A standalone run view remains available at `/` for
+use when no ComfyUI host is running, which is the normal case on a rented GPU
+whose host is destroyed between sessions.
 
-### Verification record
+The brief-first workflow — planner, storyboard approval, and the per-shot
+authoring screens — has been removed. What remains is a durable execution and
+monitoring record for a ComfyUI executor running on a separate GPU host.
+
+The Pi operator adapter is read-only, bounded, and human-gated: it proposes,
+and a person applies or dismisses. It currently runs against the `faux`
+provider and produces fixed findings from a lookup table; no model reasons yet.
+
+## What is not implemented
+
+- **Real H3 inference.** No GPU has been provisioned, no weights are bundled,
+  and no real clip has been generated. Deferred to Phase 8.
+- **The remote ComfyUI contract.** `COMFY_LIVE_TEST=1 COMFY_MODE=remote pnpm
+  test:comfy-live` reports SKIP, not pass, because no pinned remote executor is
+  configured here. Also Phase 8.
+- **A reasoning operator.** A real provider behind the operator adapter,
+  findings delivered without the panel open, and a cross-run digest are
+  specified but not built.
+- Production billing, autoscaling, multitenancy, SLOs, and Kubernetes.
+
+Fake output is not a quality or throughput benchmark, and no capture in this
+repository may be read as evidence of H3 inference. Capture provenance is
+recorded in [`EVIDENCE-MANIFEST.md`](EVIDENCE-MANIFEST.md).
+
+## Verification record
 
 | Check | Result |
 |---|---|
 | Frozen install | PASS |
-| Unit suite | PASS — 26 files, 152 tests |
-| Typecheck and production build | PASS |
-| Formatting | PASS — one expected large fixture warning |
-| Full browser gate | PASS — 9/9 tests; includes the ComfyUI inversion flow, token isolation, 405 queue refusal, one managed run, pin/review, and revision restore |
-| Token isolation output | PASS — `storageHasCredential: false`, `globalsHaveCredential: false`, `crossOriginProtected: true` |
+| Format, lint, strict TypeScript, production build | PASS — all exit 0 |
+| Unit suite | PASS — 172 tests across 24 files |
+| Integration suite | PASS — 14 tests across 7 files, PostgreSQL-backed |
+| Browser suite | PASS — 10/10 at the last recorded full run |
+| Token isolation | PASS — `storageHasCredential: false`, `globalsHaveCredential: false`, `crossOriginProtected: true` |
+| Documentation and provenance | PASS — 13 captures accounted for |
+| Secret scan | PASS — 179 tracked files inspected |
 | Live ComfyUI contract | SKIP — no configured pinned remote executor |
 | Real H3 GPU smoke | NOT RUN — Phase 8 |
 
-The pinned frontend exposes no supported queue interception hook. This release
-does not monkey-patch frontend internals; it disables the native control and
-surfaces the managed action, as required by the checkpoint. Its topbar badge
-metadata is static in the pinned ref, so live readiness/count/budget details
-are carried by the postMessage status feed and bottom panel.
+## Known issues
 
-## Historical Phase 6 record
-
-Phase 6's local Project Studio, fake ComfyUI, durable worker,
-artifact/evaluation, recovery, observability, and browser release remain green.
-The remote pinned ComfyUI contract and real MiniMax H3 GPU generation were not
-available in this environment and remain deferred to **Phase 8**. No real H3
-generation claim is made.
-
-## Next document
-
-`docs/90-POST-MVP-ROADMAP.md` remains the next long-term document. It is not part
-of this Phase 7C implementation, and Phase 8 was not started.
+The pinned ComfyUI frontend exposes no supported queue-interception hook. This
+release does not monkey-patch frontend internals; it disables the native
+control and surfaces the managed action instead. Its topbar badge metadata is
+static in the pinned ref, so live readiness, count, and budget values are
+carried by the postMessage status feed and the bottom panel rather than the
+badge.

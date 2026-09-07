@@ -107,7 +107,10 @@ for (const phrase of [
   }
 }
 
-for (const phrase of ['Phase 6', 'Phase 8', 'offline fake', 'live ComfyUI']) {
+// 'Phase 6' was dropped for the same reason as the README's completed-phase
+// phrases: requiring it forced the document to carry a historical section for a
+// finished phase. 'Phase 8' stays because it names work that is still deferred.
+for (const phrase of ['Phase 8', 'offline fake', 'live ComfyUI']) {
   if (!status.toLowerCase().includes(phrase.toLowerCase())) {
     throw new Error(`Status document is missing: ${phrase}`);
   }
@@ -132,7 +135,6 @@ const screenshotNames = [
   '09-grafana-dashboard.png',
   'comfy-frontend/01-editor-loaded.png',
   'comfy-frontend/02-h3-template-open.png',
-  'comfy-frontend/03-graph-to-prompt.png',
   'comfy-frontend/04-videoops-sidebar.png',
   'comfy-frontend/05-videoops-managed-run.png',
 ];

@@ -1,6 +1,7 @@
-import { existsSync, mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync, statSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { expect, test, type Page } from '@playwright/test';
+import { screenshotRoot as resolveScreenshotRoot } from './evidence-path.js';
 
 const fakeComfyOrigin =
   process.env.E2E_FAKE_COMFY_ORIGIN ??
@@ -9,10 +10,7 @@ const frontendRoot = resolve(
   process.env.COMFY_FRONTEND_DIST ?? '.data/comfy-frontend/dist',
 );
 const frontendAvailable = existsSync(resolve(frontendRoot, 'index.html'));
-const screenshotRoot = resolve(
-  process.cwd(),
-  'assets/screenshots/comfy-frontend',
-);
+const screenshotRoot = resolveScreenshotRoot('comfy-frontend');
 const skipReason =
   'pinned ComfyUI frontend build is absent; run pnpm comfy:frontend before running @comfy-frontend specs';
 
@@ -22,6 +20,12 @@ if (!frontendAvailable) {
 
 async function waitForEditor(page: Page): Promise<void> {
   await expect(page.locator('#graph-canvas')).toBeVisible({ timeout: 30_000 });
+  // `#splash-loader` is a fixed z-index-9999 overlay that covers the canvas
+  // until the Vue app mounts, and `app.rootGraph` is populated before it
+  // clears. Waiting on the JS objects alone therefore screenshots the splash,
+  // which is what made `01-editor-loaded.png` regenerate as a 10 KB Comfy logo
+  // in a file whose name claims the editor is loaded.
+  await expect(page.locator('#splash-loader')).toBeHidden({ timeout: 30_000 });
   await page.waitForFunction(() => {
     const candidate = (
       window as unknown as {
@@ -71,6 +75,27 @@ function graphState(page: Page): Promise<{
   });
 }
 
+// A capture that renders nothing still writes a valid PNG, and the
+// documentation gate only checks that the file exists and is cited. Both
+// observed failures were therefore invisible: `01-editor-loaded.png`
+// regenerating as the splash screen collapsed it from ~44 KB to ~10 KB, and two
+// captures of the same state came out byte-identical. Guard the bytes directly
+// -- it needs no knowledge of ComfyUI's DOM, and it fails on exactly the two
+// things that went wrong.
+const MINIMUM_CAPTURE_BYTES = 20_000;
+
+async function capture(page: Page, filename: string): Promise<number> {
+  mkdirSync(screenshotRoot, { recursive: true });
+  const path = resolve(screenshotRoot, filename);
+  await page.screenshot({ path, fullPage: true, animations: 'disabled' });
+  const { size } = statSync(path);
+  expect(
+    size,
+    `${filename} is ${size} bytes; an unrendered editor collapses to roughly 10 KB`,
+  ).toBeGreaterThan(MINIMUM_CAPTURE_BYTES);
+  return size;
+}
+
 test.describe('@comfy-frontend pinned editor shell', () => {
   test.skip(!frontendAvailable, skipReason);
 
@@ -78,12 +103,7 @@ test.describe('@comfy-frontend pinned editor shell', () => {
     await page.goto(`${fakeComfyOrigin}/`);
     await waitForEditor(page);
     await page.keyboard.press('Escape');
-    mkdirSync(screenshotRoot, { recursive: true });
-    await page.screenshot({
-      path: resolve(screenshotRoot, '01-editor-loaded.png'),
-      fullPage: true,
-      animations: 'disabled',
-    });
+    await capture(page, '01-editor-loaded.png');
   });
 
   test('opens the pinned H3 workflow template', async ({ page }) => {
@@ -91,12 +111,7 @@ test.describe('@comfy-frontend pinned editor shell', () => {
     const state = await graphState(page);
     expect(state.nodeCount).toBeGreaterThan(0);
     expect(state.nodeTypes).toContain('SaveVideo');
-    mkdirSync(screenshotRoot, { recursive: true });
-    await page.screenshot({
-      path: resolve(screenshotRoot, '02-h3-template-open.png'),
-      fullPage: true,
-      animations: 'disabled',
-    });
+    await capture(page, '02-h3-template-open.png');
   });
 
   test('exports workflow and output through app.graphToPrompt', async ({
@@ -127,11 +142,10 @@ test.describe('@comfy-frontend pinned editor shell', () => {
     expect(
       Object.keys(exported.output as Record<string, unknown>),
     ).not.toHaveLength(0);
-    mkdirSync(screenshotRoot, { recursive: true });
-    await page.screenshot({
-      path: resolve(screenshotRoot, '03-graph-to-prompt.png'),
-      fullPage: true,
-      animations: 'disabled',
-    });
+    // Deliberately captures nothing. `app.graphToPrompt()` is a pure read of
+    // the graph with no visual effect, so a screenshot here is the same picture
+    // as `02-h3-template-open.png` -- which is why the two regenerated
+    // byte-identical. The export is proven by the assertions above; a duplicate
+    // image named after an operation it cannot depict is not evidence of it.
   });
 });

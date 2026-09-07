@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { expect, test, type Page } from '@playwright/test';
+import { screenshotRoot as resolveScreenshotRoot } from './evidence-path.js';
 
 const token = 'e2e-token';
 const studioOrigin =
@@ -13,10 +14,7 @@ const frontendRoot = resolve(
   process.env.COMFY_FRONTEND_DIST ?? '.data/comfy-frontend/dist',
 );
 const frontendAvailable = existsSync(resolve(frontendRoot, 'index.html'));
-const screenshotRoot = resolve(
-  process.cwd(),
-  'assets/screenshots/comfy-frontend',
-);
+const screenshotRoot = resolveScreenshotRoot('comfy-frontend');
 
 async function waitForEditor(page: Page): Promise<void> {
   await expect(page.locator('#graph-canvas')).toBeVisible({ timeout: 30_000 });

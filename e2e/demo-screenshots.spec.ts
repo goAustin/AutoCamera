@@ -1,6 +1,7 @@
 import { mkdirSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { expect, test, type Page } from '@playwright/test';
+import { screenshotRoot as resolveScreenshotRoot } from './evidence-path.js';
 
 // Phase 7D step 6: the legacy Studio screens this spec used to walk through
 // (project create, storyboard approve, managed workflow shaping, revision
@@ -23,7 +24,7 @@ const token = 'e2e-token';
 const apiOrigin =
   process.env.E2E_API_ORIGIN ??
   `http://127.0.0.1:${process.env.E2E_API_PORT ?? '3300'}`;
-const screenshotRoot = resolve(process.cwd(), 'assets/screenshots');
+const screenshotRoot = resolveScreenshotRoot();
 
 async function capture(page: Page, filename: string): Promise<void> {
   await page.screenshot({

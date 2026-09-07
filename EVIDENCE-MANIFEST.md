@@ -12,6 +12,11 @@ evidence of H3 output quality, throughput, or cost.
 The named deterministic project alias is `demo-project`. No capture contains a
 bearer token, a private executor credential, or a model path.
 
+Captures are regenerated only on request. The specs that produce them write to
+the ignored `test-results/screenshots/` tree unless `CAPTURE_EVIDENCE=1` is set,
+so an ordinary `pnpm test:e2e` cannot overwrite anything published here. The
+capture commands below set it where it is needed.
+
 The offline set is captured from `StandaloneRunPage`, the durable run view
 mounted at `/` with no ComfyUI origin present. The ComfyUI-sidebar half of the
 same run view has its own captures in the inversion set below
@@ -42,19 +47,26 @@ no GPU, model weights, or real H3 inference is involved.
 
 ## Pinned ComfyUI editor shell set
 
-This is a separate shell-compatibility set captured by
-`pnpm test:e2e e2e/comfy-frontend.spec.ts` after `pnpm comfy:frontend` has
-created the ignored `.data/comfy-frontend/dist`. It proves that the pinned
-frontend loads the captured node catalogue, opens the pinned H3 template, and
-exports both graph forms through `app.graphToPrompt()`. The fake executor still
-provides the protocol; no GPU, model weights, or real H3 inference is involved.
-The evidence level therefore remains **Offline fake**.
+This is a separate shell-compatibility set captured by the `@comfy-frontend`
+spec after `pnpm comfy:frontend` has created the ignored
+`.data/comfy-frontend/dist`. It proves that the pinned frontend loads the
+captured node catalogue, opens the pinned H3 template, and exports both graph
+forms through `app.graphToPrompt()`.
+
+The export is asserted by the spec but deliberately not captured.
+`graphToPrompt()` is a pure read with no visual effect, so an image of it would
+be the same picture as `02-h3-template-open.png` — which is exactly what a
+former `03-graph-to-prompt.png` turned out to be. Each capture below is
+size-checked after it is written, because an editor that never rendered still
+produces a valid PNG and would otherwise be published unnoticed.
+
+The fake executor provides the protocol; no GPU, model weights, or real H3
+inference is involved. The evidence level therefore remains **Offline fake**.
 
 | Filename | Capture command | Evidence level | What is shown | Secret review |
 |---|---|---|---|---|
-| `assets/screenshots/comfy-frontend/01-editor-loaded.png` | `pnpm test:e2e e2e/comfy-frontend.spec.ts` (`@comfy-frontend`) | `offline-fake` | Pinned ComfyUI editor shell loaded | captured locally; no tokens, private URLs, or model paths |
-| `assets/screenshots/comfy-frontend/02-h3-template-open.png` | `pnpm test:e2e e2e/comfy-frontend.spec.ts` (`@comfy-frontend`) | `offline-fake` | Pinned MiniMax H3 workflow template open in the graph | captured locally; no tokens, private URLs, or model paths |
-| `assets/screenshots/comfy-frontend/03-graph-to-prompt.png` | `pnpm test:e2e e2e/comfy-frontend.spec.ts` (`@comfy-frontend`) | `offline-fake` | Dual graph export assertion completed | captured locally; no tokens, private URLs, or model paths |
+| `assets/screenshots/comfy-frontend/01-editor-loaded.png` | `CAPTURE_EVIDENCE=1 pnpm test:e2e e2e/comfy-frontend.spec.ts` (`@comfy-frontend`) | `offline-fake` | Pinned ComfyUI editor shell loaded | captured locally; no tokens, private URLs, or model paths |
+| `assets/screenshots/comfy-frontend/02-h3-template-open.png` | `CAPTURE_EVIDENCE=1 pnpm test:e2e e2e/comfy-frontend.spec.ts` (`@comfy-frontend`) | `offline-fake` | Pinned MiniMax H3 workflow template open in the graph | captured locally; no tokens, private URLs, or model paths |
 
 The tagged set is intentionally skipped with a printed remediation reason when
 the ignored build is absent. The offline run-view walkthrough above and the
@@ -74,8 +86,8 @@ origin cannot read the Studio iframe document.
 
 | Filename | Capture command | Evidence level | What is shown | Secret review |
 |---|---|---|---|---|
-| `assets/screenshots/comfy-frontend/04-videoops-sidebar.png` | `pnpm test:e2e e2e/comfy-inversion.spec.ts` | `offline-fake` | ComfyUI graph canvas with the Studio-origin VideoOps sidebar, H3 empty state, and managed-mode badge | Playwright asserts Comfy storage/global credential absence, cross-origin protection, and credential-free iframe URL |
-| `assets/screenshots/comfy-frontend/05-videoops-managed-run.png` | `pnpm test:e2e e2e/comfy-inversion.spec.ts` | `offline-fake` | One validated managed run in the sidebar with progress/evaluation and revision controls | same token-isolation assertions; no direct executor submission |
+| `assets/screenshots/comfy-frontend/04-videoops-sidebar.png` | `CAPTURE_EVIDENCE=1 pnpm test:e2e e2e/comfy-inversion.spec.ts` | `offline-fake` | ComfyUI graph canvas with the Studio-origin VideoOps sidebar, H3 empty state, and managed-mode badge | Playwright asserts Comfy storage/global credential absence, cross-origin protection, and credential-free iframe URL |
+| `assets/screenshots/comfy-frontend/05-videoops-managed-run.png` | `CAPTURE_EVIDENCE=1 pnpm test:e2e e2e/comfy-inversion.spec.ts` | `offline-fake` | One validated managed run in the sidebar with progress/evaluation and revision controls | same token-isolation assertions; no direct executor submission |
 
 Recorded gate values: `storageHasCredential: false`,
 `globalsHaveCredential: false`, `crossOriginProtected: true`, browser
