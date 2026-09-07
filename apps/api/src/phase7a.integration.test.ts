@@ -150,7 +150,12 @@ describe.skipIf(!databaseAvailable)('Phase 7A PostgreSQL thin core', () => {
     expect(persisted.shots).toHaveLength(1);
     expect(persisted.shots[0]).toMatchObject({
       implicit: true,
-      acceptedAttemptId: runId,
+      pinnedAttemptId: runId,
     });
+    // Pin marks the keeper only; it must not write `acceptedAttemptId`,
+    // which records human acceptance and is what project completion counts.
+    // This run was only reviewed (an annotation) and pinned, never accepted
+    // through the legacy accept route, so acceptance must stay unset.
+    expect(persisted.shots[0]?.acceptedAttemptId).toBeUndefined();
   });
 });
