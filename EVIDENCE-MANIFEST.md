@@ -1,18 +1,22 @@
-# Phase 7D evidence manifest
+# Release provenance
 
-Release evidence level: **Offline fake**. Phase 6's named deterministic alias is
-`demo-project`; the screenshots contain no bearer tokens, private executor
-credentials, or model paths. The release commit is the commit containing this
-manifest; its hash is reported by the handoff after commit creation.
+This file records where every published capture came from, what it does and does
+not demonstrate, and how it was reviewed for secrets. It exists so that no image
+in this repository has to be taken on trust.
 
-Phase 7D removed the brief-first product (planning, storyboard approval, and
-the legacy per-shot workflow-authoring screens the previous evidence set
-walked through). The offline screenshot set below is regenerated from what
-replaced it: `StandaloneRunPage`, the durable run view mounted at `/` with no
-ComfyUI origin present, described in `70-PHASE-7-DESIGN-REFERENCE.md`. The
-ComfyUI-sidebar half of the run view already has its own evidence in the
-pinned ComfyUI editor shell set below (`comfy-frontend/05-videoops-managed-run.png`);
-this set does not duplicate it.
+Current evidence level: **Offline fake**. Every capture below was produced by
+the deterministic fake executor under `COMFY_MODE=fake`. No GPU, model weights,
+or real H3 inference is involved in any of them, and none may be read as
+evidence of H3 output quality, throughput, or cost.
+
+The named deterministic project alias is `demo-project`. No capture contains a
+bearer token, a private executor credential, or a model path.
+
+The offline set is captured from `StandaloneRunPage`, the durable run view
+mounted at `/` with no ComfyUI origin present. The ComfyUI-sidebar half of the
+same run view has its own captures in the inversion set below
+(`comfy-frontend/05-videoops-managed-run.png`); the offline set does not
+duplicate it.
 
 ## Offline screenshot set
 

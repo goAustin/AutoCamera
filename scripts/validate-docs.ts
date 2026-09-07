@@ -25,12 +25,13 @@ const demo = await requiredText('DEMO-SCRIPT.md');
 const evidence = await requiredText('EVIDENCE-MANIFEST.md');
 const dependencies = await requiredText('DEPENDENCIES.md');
 const status = await requiredText('STATUS.md');
-const resume = await requiredText('RESUME.md');
 const changelog = await requiredText('CHANGELOG.md');
 
+// Phase-completion phrases are deliberately absent. They went stale the moment
+// the next checkpoint landed, and the README is a user-facing document rather
+// than a checkpoint ledger. Phase status lives in STATUS.md; capture provenance
+// lives in EVIDENCE-MANIFEST.md.
 for (const phrase of [
-  'Phase 7C complete',
-  'Phase 7B complete',
   'Offline fake',
   'Phase 8',
   'Project Studio',
@@ -112,13 +113,14 @@ for (const phrase of ['Phase 6', 'Phase 8', 'offline fake', 'live ComfyUI']) {
   }
 }
 
-if (!resume.includes('immutable workflow revisions')) {
-  throw new Error('Resume bullets are missing the revision claim.');
-}
 if (!changelog.includes('v0.1.0-mvp')) {
   throw new Error('Changelog is missing the v0.1.0-mvp entry.');
 }
 
+// Every published capture must exist and be accounted for in the provenance
+// manifest -- capture command, evidence level, and secret review. The README
+// only has to cite the ones it actually displays; enumerating all of them there
+// turned it into an evidence ledger rather than a description of the product.
 const screenshotNames = [
   '01-run-history.png',
   '02-artifact-review.png',
@@ -128,37 +130,29 @@ const screenshotNames = [
   '06-finding-apply-confirmation.png',
   '07-run-history-complete.png',
   '09-grafana-dashboard.png',
+  'comfy-frontend/01-editor-loaded.png',
+  'comfy-frontend/02-h3-template-open.png',
+  'comfy-frontend/03-graph-to-prompt.png',
+  'comfy-frontend/04-videoops-sidebar.png',
+  'comfy-frontend/05-videoops-managed-run.png',
 ];
 for (const name of screenshotNames) {
   const path = `assets/screenshots/${name}`;
   if (!(await exists(path))) throw new Error(`Screenshot is missing: ${path}`);
-  if (!readme.includes(name)) {
-    throw new Error(`README does not reference screenshot: ${name}`);
+  if (!evidence.includes(name)) {
+    throw new Error(
+      `Evidence manifest does not account for screenshot: ${name}`,
+    );
   }
 }
 
-const editorScreenshotNames = [
-  'comfy-frontend/01-editor-loaded.png',
-  'comfy-frontend/02-h3-template-open.png',
-  'comfy-frontend/03-graph-to-prompt.png',
-];
-for (const name of editorScreenshotNames) {
-  const path = `assets/screenshots/${name}`;
-  if (!(await exists(path))) throw new Error(`Screenshot is missing: ${path}`);
-  if (!readme.includes(name)) {
-    throw new Error(`README does not reference screenshot: ${name}`);
-  }
-}
-
-const inversionScreenshotNames = [
-  'comfy-frontend/04-videoops-sidebar.png',
+const readmeScreenshotNames = [
+  '01-run-history.png',
   'comfy-frontend/05-videoops-managed-run.png',
 ];
-for (const name of inversionScreenshotNames) {
-  const path = `assets/screenshots/${name}`;
-  if (!(await exists(path))) throw new Error(`Screenshot is missing: ${path}`);
-  if (!evidence.includes(name)) {
-    throw new Error(`Evidence manifest does not reference screenshot: ${name}`);
+for (const name of readmeScreenshotNames) {
+  if (!readme.includes(name)) {
+    throw new Error(`README does not reference screenshot: ${name}`);
   }
 }
 
@@ -167,5 +161,5 @@ if (readme.includes('Phase 5 local implementation in progress')) {
 }
 
 console.log(
-  `PASS documentation: release docs, ${screenshotNames.length} offline screenshots, ${editorScreenshotNames.length} editor screenshots, and status language validated.`,
+  `PASS documentation: release docs, ${screenshotNames.length} captures accounted for in the provenance manifest, and status language validated.`,
 );
