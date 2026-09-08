@@ -203,6 +203,18 @@ describe('historical domain-event retention (Phase 7D)', () => {
   });
 });
 
+describe('Phase 7E operational event type', () => {
+  it('adds recommendation.created to DOMAIN_EVENT_TYPES without disturbing existing entries', () => {
+    expect(DOMAIN_EVENT_TYPES).toContain('recommendation.created');
+  });
+
+  it('round-trips recommendation.created through parseDomainEventType', () => {
+    expect(parseDomainEventType('recommendation.created')).toBe(
+      'recommendation.created',
+    );
+  });
+});
+
 describe('domain money, identity, and constructors', () => {
   it('uses exact integer micro-dollars for conversion and arithmetic', () => {
     const one = parseUsdToMicrousd('1.000001');

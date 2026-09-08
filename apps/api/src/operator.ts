@@ -28,6 +28,7 @@ import {
   type OperationalWorkflowRevisionToolView,
 } from '@h3/agent-tools';
 import {
+  createDomainEvent,
   isUuidV7,
   subtractMicrousd,
   toIsoUtc,
@@ -101,6 +102,7 @@ export interface OperationalPiAdapterOptions {
   readonly idGenerator?: IdGenerator;
   readonly provider?: string;
   readonly model?: string;
+  readonly producer?: string;
   readonly telemetry?: AgentTelemetry;
   readonly metrics?: MetricsRegistry;
   readonly services: OperationalToolServiceFactory;
@@ -511,6 +513,7 @@ export class OperationalPiAdapter {
   readonly idGenerator: IdGenerator;
   readonly provider: string;
   readonly modelName: string;
+  readonly producer: string;
   readonly telemetry: AgentTelemetry;
   readonly metrics: MetricsRegistry | undefined;
   readonly services: OperationalToolServiceFactory;
@@ -527,6 +530,7 @@ export class OperationalPiAdapter {
     };
     this.provider = options.provider ?? 'faux';
     this.modelName = options.model ?? 'h3-videoops-operator-v1';
+    this.producer = options.producer ?? 'h3-operator';
     this.telemetry = options.telemetry ?? new InMemoryTelemetry();
     this.metrics = options.metrics;
     this.services = options.services;
@@ -792,6 +796,30 @@ export class OperationalPiAdapter {
       }
       throw error;
     }
+    // Exactly one durable `recommendation.created` event per persisted
+    // finding: this line is reached only when `create` above succeeded, so
+    // neither the early `existing` return nor the `UNIQUE_VIOLATION`
+    // recovery above emits anything.
+    const recommendationCreatedEvent = createDomainEvent({
+      id: this.idGenerator.next(),
+      type: 'recommendation.created',
+      producer: this.producer,
+      tenantId: this.tenantId,
+      ...(event.projectId ? { projectId: event.projectId } : {}),
+      ...(event.shotId ? { shotId: event.shotId } : {}),
+      ...(event.attemptId ? { attemptId: event.attemptId } : {}),
+      ...(event.traceId ? { traceId: event.traceId } : {}),
+      payload: {
+        recommendationId: recommendation.id,
+        severity: recommendation.severity,
+        recommendationCode: recommendation.recommendationCode,
+        proposedActionType: recommendation.proposedActionType,
+        triggeringEventType: event.type,
+      },
+      clock: this.clock,
+    });
+    await repositories.events.append(recommendationCreatedEvent);
+    await repositories.outbox.enqueue(recommendationCreatedEvent);
     if (this.metrics) {
       try {
         this.metrics.increment('pi_agent_runs_total', {

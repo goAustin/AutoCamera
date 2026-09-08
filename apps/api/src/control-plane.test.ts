@@ -232,6 +232,58 @@ describe('Phase 5 control-plane APIs', () => {
     expect(unauthorized.statusCode).toBe(401);
   });
 
+  it('streams a recommendation.created finding over SSE with its full payload contract intact', async () => {
+    const { app, store } = await setupApi();
+    const { projectId, shotId } = await createApprovedShot(
+      app,
+      'recommendation-sse',
+    );
+    const events = await request(app, {
+      method: 'GET',
+      url: `/v1/projects/${projectId}/events`,
+    });
+    const previousSequence = Number(events.json().events.at(-1).eventSequence);
+
+    const recommendationId = testId();
+    await store.withTransaction(async (repositories) => {
+      await repositories.events.append(
+        createDomainEvent({
+          id: testId(),
+          type: 'recommendation.created',
+          producer: 'control-plane-test',
+          tenantId: DEV_TENANT_ID,
+          projectId: projectId as Uuid,
+          shotId: shotId as Uuid,
+          payload: {
+            recommendationId,
+            severity: 'critical',
+            recommendationCode: 'EXECUTOR_UNAVAILABLE',
+            proposedActionType: 'wait_for_executor',
+            triggeringEventType: 'executor.unavailable',
+          },
+          clock: { now: () => new Date() },
+        }),
+      );
+    });
+
+    const stream = await request(app, {
+      method: 'GET',
+      url: `/v1/projects/${projectId}/events/stream`,
+      headers: { 'last-event-id': String(previousSequence) },
+    });
+    expect(stream.statusCode).toBe(200);
+    expect(stream.body).toContain('event: recommendation.created');
+    expect(stream.body).toContain(`"recommendationId":"${recommendationId}"`);
+    expect(stream.body).toContain('"severity":"critical"');
+    expect(stream.body).toContain(
+      '"recommendationCode":"EXECUTOR_UNAVAILABLE"',
+    );
+    expect(stream.body).toContain('"proposedActionType":"wait_for_executor"');
+    expect(stream.body).toContain(
+      '"triggeringEventType":"executor.unavailable"',
+    );
+  });
+
   it('recovers expired worker state and applies recommendations idempotently', async () => {
     const { app, store, comfy, worker } = await setupApi();
     const { projectId, shotId } = await createApprovedShot(app, 'recovery');

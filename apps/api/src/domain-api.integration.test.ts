@@ -8,13 +8,17 @@ import {
   createPostgresStore,
   runMigrations,
 } from '@h3/db';
+import { createDomainEvent, createUuidV7, type Uuid } from '@h3/domain';
 import { loadMinimaxH3Fixtures } from '@h3/workflow-compiler';
+import { DEV_TENANT_ID } from './application.js';
 import { buildApiApp } from './app.js';
+import type { OperationalPiAdapter } from './operator.js';
 
 const databaseUrl =
   process.env.DATABASE_URL ??
   'postgres://h3_videoops:h3_videoops@127.0.0.1:5432/h3_videoops';
 const pool = createDatabasePool(databaseUrl);
+const store = createPostgresStore(pool);
 const app = buildApiApp({
   config: getApiConfig({
     NODE_ENV: 'test',
@@ -22,7 +26,7 @@ const app = buildApiApp({
     DATABASE_URL: databaseUrl,
   }),
   databaseReady: () => checkDatabaseReady(pool),
-  store: createPostgresStore(pool),
+  store,
 });
 
 function authHeaders(key?: string): Record<string, string> {
@@ -285,5 +289,89 @@ describe('Phase 2 PostgreSQL persistence', () => {
     });
     expect(conflict.statusCode).toBe(409);
     expect(conflict.json()).toMatchObject({ code: 'IDEMPOTENCY_KEY_REUSED' });
+  });
+});
+
+describe('Phase 7E operational event durability', () => {
+  it('persists recommendation.created to real domain_events and outbox_events', async () => {
+    // The unit suite proves this against the in-memory store. This is the
+    // PostgreSQL half: that the new event type survives the real
+    // `domain_events` insert, its JSONB payload round-trips, and the outbox
+    // row that carries it to a consumer is actually there.
+    const create = await app.inject({
+      method: 'POST',
+      url: '/v1/projects',
+      headers: authHeaders(uniqueKey('pg-recommendation')),
+      payload: {
+        title: 'PostgreSQL operator finding project',
+        brief: 'A durable operational finding verification.',
+        targetDurationSeconds: 5,
+      },
+    });
+    expect(create.statusCode).toBe(201);
+    const projectId = create.json().project.id as Uuid;
+
+    // Driven through the adapter directly rather than through the outbox
+    // worker: integration files share one database, so a `pollOnce()` here
+    // could claim another file's message and make this test order-dependent.
+    // The emit path under test is the same either way.
+    const trigger = createDomainEvent({
+      id: createUuidV7(),
+      type: 'executor.unavailable',
+      producer: 'domain-api-integration-test',
+      tenantId: DEV_TENANT_ID,
+      projectId,
+      traceId: `trace-${randomUUID()}`,
+      payload: { code: 'COMFY_UNAVAILABLE' },
+      clock: { now: () => new Date() },
+    });
+    await store.withTransaction(async (repositories) => {
+      await repositories.events.append(trigger);
+    });
+
+    const adapter = (
+      app as unknown as { readonly operationalPiAdapter: OperationalPiAdapter }
+    ).operationalPiAdapter;
+    const processed = await adapter.processEvent(trigger);
+    expect(processed.handled).toBe(true);
+    expect(processed.duplicate).toBe(false);
+    const recommendation = processed.recommendation;
+    if (!recommendation) {
+      throw new Error('Expected a persisted operational recommendation.');
+    }
+
+    const persistedEvents = await pool.query<{
+      trace_id: string | null;
+      payload: Record<string, unknown>;
+    }>(
+      `SELECT trace_id, payload
+       FROM domain_events
+       WHERE project_id = $1 AND type = 'recommendation.created'`,
+      [projectId],
+    );
+    expect(persistedEvents.rows).toHaveLength(1);
+    expect(persistedEvents.rows[0]?.trace_id).toBe(trigger.traceId);
+    expect(persistedEvents.rows[0]?.payload).toEqual({
+      recommendationId: recommendation.id,
+      severity: recommendation.severity,
+      recommendationCode: recommendation.recommendationCode,
+      proposedActionType: recommendation.proposedActionType,
+      triggeringEventType: 'executor.unavailable',
+    });
+
+    const persistedOutbox = await pool.query<{ count: number }>(
+      `SELECT count(*)::int AS count
+       FROM outbox_events AS outbox
+       JOIN domain_events AS event ON event.id = outbox.event_id
+       WHERE event.project_id = $1 AND event.type = 'recommendation.created'`,
+      [projectId],
+    );
+    expect(persistedOutbox.rows[0]?.count).toBe(1);
+
+    const persistedRecommendations = await pool.query<{ id: string }>(
+      'SELECT id FROM operational_recommendations WHERE project_id = $1',
+      [projectId],
+    );
+    expect(persistedRecommendations.rows).toEqual([{ id: recommendation.id }]);
   });
 });

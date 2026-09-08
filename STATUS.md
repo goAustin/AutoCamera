@@ -25,8 +25,10 @@ authoring screens — has been removed. What remains is a durable execution and
 monitoring record for a ComfyUI executor running on a separate GPU host.
 
 The Pi operator adapter is read-only, bounded, and human-gated: it proposes,
-and a person applies or dismisses. It currently runs against the `faux`
-provider and produces fixed findings from a lookup table; no model reasons yet.
+and a person applies or dismisses. A finding now emits `recommendation.created`
+into the durable timeline and the outbox, so it reaches a reader who is not
+watching the panel. The adapter still runs against the `faux` provider and
+produces fixed findings from a lookup table; no model reasons yet.
 
 ## What is not implemented
 
@@ -50,8 +52,8 @@ recorded in [`EVIDENCE-MANIFEST.md`](EVIDENCE-MANIFEST.md).
 |---|---|
 | Frozen install | PASS |
 | Format, lint, strict TypeScript, production build | PASS — all exit 0 |
-| Unit suite | PASS — 172 tests across 24 files |
-| Integration suite | PASS — 14 tests across 7 files, PostgreSQL-backed |
+| Unit suite | PASS — 182 tests across 24 files |
+| Integration suite | PASS — 15 tests across 7 files, PostgreSQL-backed |
 | Browser suite | PASS — 10/10 at the last recorded full run |
 | Token isolation | PASS — `storageHasCredential: false`, `globalsHaveCredential: false`, `crossOriginProtected: true` |
 | Documentation and provenance | PASS — 13 captures accounted for |

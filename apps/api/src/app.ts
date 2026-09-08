@@ -1096,6 +1096,11 @@ const SSE_PAYLOAD_KEYS = new Set([
   'autoCreatedProject',
   'evaluationStatusAtPin',
   'decision',
+  'recommendationId',
+  'severity',
+  'recommendationCode',
+  'proposedActionType',
+  'triggeringEventType',
 ]);
 
 function sanitizedEventSummary(event: DomainEvent): Record<string, unknown> {

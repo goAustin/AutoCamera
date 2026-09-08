@@ -11,6 +11,7 @@ import {
 import {
   createInMemoryStore,
   type OutboxDispatcher,
+  type Repositories,
   type TransactionalStore,
 } from '@h3/db';
 import {
@@ -23,6 +24,7 @@ import { buildApiApp } from './app.js';
 import {
   createOperationalToolServices,
   OperationalPiAdapter,
+  OPERATIONAL_TRIGGER_EVENT_TYPES,
   type FauxOperationalScript,
 } from './operator.js';
 
@@ -397,5 +399,211 @@ describe('Checkpoint 5 operational Pi adapter', () => {
         })
       ).json().attempts,
     ).toHaveLength(2);
+  });
+
+  it('emits recommendation.created exactly once, in domain_events and the outbox, with the full payload contract and scoping', async () => {
+    const { app, store, dispatcher } = await setup();
+    const projectId = await createProject(app, 'emit-once');
+    await drain(dispatcher);
+
+    const traceId = 'trace-emit-once';
+    const event = createDomainEvent({
+      id: testId(),
+      type: 'executor.unavailable',
+      producer: 'operator-test',
+      tenantId: DEV_TENANT_ID,
+      projectId,
+      traceId,
+      clock: { now: () => new Date('2026-01-01T00:00:00.000Z') },
+    });
+    await store.withTransaction(async (repositories) => {
+      await repositories.events.append(event);
+      await repositories.outbox.enqueue(event);
+    });
+
+    // Processes the trigger: the operator persists a recommendation and, in
+    // the same transaction, appends and enqueues exactly one
+    // `recommendation.created`.
+    expect(await dispatcher.pollOnce()).toBe(true);
+
+    const recommendation = (await recommendations(store, projectId))[0];
+    if (!recommendation) {
+      throw new Error('Expected a persisted recommendation.');
+    }
+
+    const projectEvents = await store.withTransaction((repositories) =>
+      repositories.events.listByProject(projectId),
+    );
+    const createdEvents = projectEvents.filter(
+      (candidate) => candidate.type === 'recommendation.created',
+    );
+    expect(createdEvents).toHaveLength(1);
+    const createdEvent = createdEvents[0];
+    if (!createdEvent) {
+      throw new Error('Expected a recommendation.created event.');
+    }
+
+    expect(createdEvent.projectId).toBe(projectId);
+    expect(createdEvent.traceId).toBe(traceId);
+    expect(createdEvent.payload.recommendationId).toBe(recommendation.id);
+    expect(createdEvent.payload.severity).toBe(recommendation.severity);
+    expect(createdEvent.payload.recommendationCode).toBe(
+      recommendation.recommendationCode,
+    );
+    expect(createdEvent.payload.proposedActionType).toBe(
+      recommendation.proposedActionType,
+    );
+    expect(createdEvent.payload.triggeringEventType).toBe(event.type);
+
+    // Exactly one outbox row: the only thing left pending is the
+    // `recommendation.created` message itself. It is not a trigger, so
+    // draining it is a silent no-op, and after that the outbox is empty --
+    // proving there was exactly one new row, not merely that one exists.
+    expect(await dispatcher.pollOnce()).toBe(true);
+    expect(await dispatcher.pollOnce()).toBe(false);
+  });
+
+  it('emits no second event when the identical trigger event is delivered twice (existing-recommendation short-circuit)', async () => {
+    const { app, store, dispatcher, adapter } = await setup();
+    const projectId = await createProject(app, 'no-loop-existing');
+    await drain(dispatcher);
+    const event = await appendEvent(store, {
+      projectId,
+      type: 'executor.unavailable',
+    });
+
+    expect(await dispatcher.pollOnce()).toBe(true); // trigger -> one recommendation.created
+    await drain(dispatcher); // drains that recommendation.created message itself
+
+    const before = await store.withTransaction((repositories) =>
+      repositories.events.listByProject(projectId),
+    );
+    expect(
+      before.filter((candidate) => candidate.type === 'recommendation.created'),
+    ).toHaveLength(1);
+
+    // Re-process the identical trigger event directly: the natural way to
+    // reach the early `existing` return at operator.ts:558.
+    const duplicate = await adapter.processEvent(event);
+    expect(duplicate.duplicate).toBe(true);
+    expect(await recommendations(store, projectId)).toHaveLength(1);
+
+    const after = await store.withTransaction((repositories) =>
+      repositories.events.listByProject(projectId),
+    );
+    expect(
+      after.filter((candidate) => candidate.type === 'recommendation.created'),
+    ).toHaveLength(1);
+    expect(await dispatcher.pollOnce()).toBe(false);
+  });
+
+  it('emits no event when create() loses a concurrent UNIQUE_VIOLATION race and recovers the winning duplicate', async () => {
+    const { app, store, dispatcher, adapter } = await setup();
+    const projectId = await createProject(app, 'race-unique');
+    await drain(dispatcher);
+
+    // Appended to `events` only (not the outbox): this test drives the race
+    // through a direct `processEventInTransaction` call below, and an
+    // undelivered trigger row sitting in the outbox would confuse the final
+    // "the outbox is empty" assertion.
+    const event = createDomainEvent({
+      id: testId(),
+      type: 'executor.unavailable',
+      producer: 'operator-test',
+      tenantId: DEV_TENANT_ID,
+      projectId,
+      clock: { now: () => new Date('2026-01-01T00:00:00.000Z') },
+    });
+    await store.withTransaction((repositories) =>
+      repositories.events.append(event),
+    );
+
+    const winnerId = testId();
+    const result = await store.withTransaction(async (repositories) => {
+      let createCalls = 0;
+      const patched: Repositories = {
+        ...repositories,
+        operationalRecommendations: {
+          ...repositories.operationalRecommendations,
+          create: async (candidate) => {
+            createCalls += 1;
+            if (createCalls === 1) {
+              // Simulate a second operator instance winning the insert for
+              // the same trigger event and code, in the window between this
+              // call's existence check (already past, above) and its own
+              // create() attempt (below). This reuses the real repository's
+              // own uniqueness constraint instead of fabricating a
+              // RepositoryError by hand, so the UNIQUE_VIOLATION thrown next
+              // is the store's genuine error for a genuinely occupied
+              // (triggerEventId, code) slot -- faithful to what a second
+              // concurrent process would leave behind, not merely a stubbed
+              // exception that exercises the catch block in isolation.
+              await repositories.operationalRecommendations.create({
+                ...candidate,
+                id: winnerId,
+              });
+            }
+            return repositories.operationalRecommendations.create(candidate);
+          },
+        },
+      };
+      return adapter.processEventInTransaction(patched, event);
+    });
+
+    expect(result.handled).toBe(true);
+    expect(result.duplicate).toBe(true);
+    expect(result.recommendation?.id).toBe(winnerId);
+    expect(await recommendations(store, projectId)).toHaveLength(1);
+
+    const projectEvents = await store.withTransaction((repositories) =>
+      repositories.events.listByProject(projectId),
+    );
+    expect(
+      projectEvents.filter(
+        (candidate) => candidate.type === 'recommendation.created',
+      ),
+    ).toHaveLength(0);
+    expect(await dispatcher.pollOnce()).toBe(false);
+  });
+
+  it('keeps the trigger set and recommendation.created disjoint, and never re-triggers itself', async () => {
+    expect(OPERATIONAL_TRIGGER_EVENT_TYPES).not.toContain(
+      'recommendation.created',
+    );
+
+    const { app, store, dispatcher, adapter } = await setup();
+    const projectId = await createProject(app, 'no-self-trigger');
+    await drain(dispatcher);
+
+    const selfEvent = await appendEvent(store, {
+      projectId,
+      type: 'recommendation.created',
+      payload: {
+        recommendationId: testId(),
+        severity: 'warning',
+        recommendationCode: 'SOME_CODE',
+        proposedActionType: 'no_action',
+        triggeringEventType: 'executor.unavailable',
+      },
+    });
+    const direct = await adapter.processEvent(selfEvent);
+    expect(direct).toEqual({
+      handled: false,
+      duplicate: false,
+      reason: 'not_trigger',
+    });
+    // The self-typed event still sits undelivered; draining it through the
+    // real outbox-consumer path must agree with the direct call above.
+    expect(await dispatcher.pollOnce()).toBe(true);
+    expect(await recommendations(store, projectId)).toEqual([]);
+
+    // Bonus: a genuine finding's own `recommendation.created` message does
+    // not re-trigger the operator when the dispatcher drains it.
+    await appendEvent(store, { projectId, type: 'executor.unavailable' });
+    expect(await dispatcher.pollOnce()).toBe(true); // trigger -> one recommendation
+    expect(await recommendations(store, projectId)).toHaveLength(1);
+    expect(await dispatcher.pollOnce()).toBe(true); // drains recommendation.created itself
+    expect(await recommendations(store, projectId)).toHaveLength(1); // unchanged
+    expect(await dispatcher.pollOnce()).toBe(false); // outbox now empty
   });
 });

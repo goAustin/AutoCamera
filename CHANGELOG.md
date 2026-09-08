@@ -1,5 +1,39 @@
 # Changelog
 
+## Phase 7E step 1 — A finding enters the timeline
+
+Evidence level: Offline fake. No provider call was made; the operator still
+runs against `faux`. Additive only — no change to the worker, leases, retries,
+reconciliation, evaluation, SSE transport, or the metric allowlist.
+
+- The operator now emits `recommendation.created` when it persists a finding,
+  carrying `{ recommendationId, severity, recommendationCode,
+  proposedActionType, triggeringEventType }`. Until now a finding was written
+  to `operational_recommendations` and announced nowhere: it never reached
+  `domain_events`, never reached `outbox_events`, and was visible only to a
+  client polling the recommendations route. On a rented GPU running
+  asynchronously, nobody is polling.
+- The event is emitted once per persisted finding, inside the same transaction,
+  and only after the insert succeeds — neither duplicate path announces a
+  finding twice. `domain_events` is append-only, so an emit on the duplicate
+  path would append another announcement on every outbox retry of the same
+  message.
+- `recommendation.created` is deliberately absent from
+  `OPERATIONAL_TRIGGER_EVENT_TYPES`; a test proves the operator returns
+  `not_trigger` for its own output rather than looping on it. This is free
+  today under `faux` and will not be once a paid provider is wired in.
+- Five unit tests and one PostgreSQL integration test. Each was verified by
+  mutation — breaking the implementation fails them — including the SSE test,
+  which guards an allowlist (`SSE_PAYLOAD_KEYS`) that drops unregistered
+  payload keys silently. Unit suite 177 to 182; integration suite 14 to 15.
+- Recorded, not fixed: the `UNIQUE_VIOLATION` recovery branch at
+  `operator.ts:776-798` is unreachable under PostgreSQL. The repository does
+  not translate `23505` into a `RepositoryError`, and the transaction is
+  aborted by the violation regardless, so the recovery query inside the catch
+  would fail with `25P02`. A collision still resolves correctly by retry, and
+  the branch predates this checkpoint. The test covering it is meaningful only
+  as a guard on the emit's placement, not as proof the branch works.
+
 ## Unreleased — correctness and documentation
 
 Evidence level: Offline fake. No behaviour change to the durable core beyond

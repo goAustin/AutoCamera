@@ -102,6 +102,7 @@ export const DOMAIN_EVENT_TYPES = [
   'run.pinned',
   'run.unpinned',
   'run.reviewed',
+  'recommendation.created',
 ] as const;
 export type DomainEventType = (typeof DOMAIN_EVENT_TYPES)[number];
 
