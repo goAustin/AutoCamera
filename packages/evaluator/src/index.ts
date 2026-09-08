@@ -169,6 +169,10 @@ function hasMotionEvidence(output: ProcessResult): boolean {
   const freezeDuration = /freeze_duration\s*[:=]\s*([\d.]+)/.exec(text)?.[1];
   if (blackDuration && Number(blackDuration) > 0) return false;
   if (freezeDuration && Number(freezeDuration) > 0) return false;
+  // `freezedetect` emits `freeze_start` when a freeze begins and a duration
+  // only once it ends, so a clip frozen through to EOF reports a start and no
+  // duration at all. The start alone has to count as evidence.
+  if (/freeze_start\s*[:=]/.test(text)) return false;
   if (/all-black|static|freeze_detected/.test(text)) return false;
   return true;
 }
@@ -301,11 +305,17 @@ export class MediaEvaluator {
         decode.exitCode === 0 && !decode.timedOut
           ? pass('Decoder completed without errors.')
           : fail('Decoder did not complete successfully.');
+      // `blackdetect` and `freezedetect` report at info level, so running this
+      // probe at `-v error` -- as it did -- discarded the only output
+      // `hasMotionEvidence` reads. An all-black clip produced no text and
+      // therefore passed. The decoder probe above stays at `-v error`, where
+      // errors are the whole signal.
       motion = await this.process.run(
         'ffmpeg',
         [
+          '-hide_banner',
           '-v',
-          'error',
+          'info',
           '-i',
           filePath,
           '-vf',

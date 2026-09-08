@@ -144,6 +144,24 @@ const failureCases: readonly FailureCase[] = [
     name: 'motion',
     runner: new ProbeRunner({ motionOutput: 'freeze_duration: 5' }),
   },
+  // Verbatim ffmpeg output for an all-black clip. Before the probe ran at a
+  // log level that surfaces it, this text never reached the evaluator and an
+  // all-black artifact passed.
+  {
+    name: 'motion from real blackdetect output',
+    runner: new ProbeRunner({
+      motionOutput:
+        '[Parsed_blackdetect_0 @ 0x600003290a50] black_start:0 black_end:2.958333 black_duration:2.958333',
+    }),
+  },
+  // A freeze that runs to end-of-file reports a start and never a duration.
+  {
+    name: 'motion from a freeze that never ends',
+    runner: new ProbeRunner({
+      motionOutput:
+        '[Parsed_freezedetect_1 @ 0x600003290b00] lavfi.freezedetect.freeze_start: 0',
+    }),
+  },
 ];
 
 describe('deterministic media evaluator', () => {
@@ -202,4 +220,28 @@ describe('deterministic media evaluator', () => {
       expect(result.failureCode).toMatch(/^MEDIA_/);
     },
   );
+
+  it('probes for motion at a log level that surfaces the detectors', async () => {
+    const runner = new CapturingRunner();
+    await evaluate(runner);
+
+    const motion = runner.calls.find((call) => call.args.includes('-vf'));
+    if (!motion) throw new Error('Expected a motion probe.');
+
+    // `blackdetect` and `freezedetect` report at info level. At `-v error` they
+    // emit nothing, `hasMotionEvidence` finds no duration to object to, and the
+    // check passes for every input including an all-black one -- which is what
+    // it did. The log level is the whole guard, so assert it directly.
+    const level = motion.args[motion.args.indexOf('-v') + 1];
+    expect(level).toBe('info');
+    expect(motion.args).not.toContain('error');
+
+    // The decoder probe is a different case: it is judged by exit code, so it
+    // stays quiet.
+    const decoder = runner.calls.find(
+      (call) => call.command === 'ffmpeg' && !call.args.includes('-vf'),
+    );
+    if (!decoder) throw new Error('Expected a decoder probe.');
+    expect(decoder.args[decoder.args.indexOf('-v') + 1]).toBe('error');
+  });
 });
