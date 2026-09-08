@@ -1,5 +1,85 @@
 # Changelog
 
+## Unreleased — correctness and documentation
+
+Evidence level: Offline fake. No behaviour change to the durable core beyond
+the evaluator fix below.
+
+- Fixed the media evaluator's motion check, which could not fail.
+  `blackdetect` and `freezedetect` report at info level while the probe ran at
+  `-v error`, so their output never reached the parser and any artifact that
+  decoded was recorded as having motion. An all-black clip passed. The probe
+  now runs at info, and a `freeze_start` with no duration — what a clip frozen
+  through to end-of-file produces — counts as evidence on its own.
+- Fixed the browser suite overwriting published evidence. Three specs wrote
+  captures straight into the tracked `assets/screenshots/`, so an ordinary
+  `pnpm test:e2e` rewrote 12 published images, including the README's. Captures
+  now go to the ignored `test-results/` tree unless `CAPTURE_EVIDENCE=1`.
+- Fixed `01-editor-loaded.png` capturing the ComfyUI splash screen instead of
+  the editor. `#splash-loader` covers the canvas until the Vue app mounts, and
+  `app.rootGraph` is populated before it clears, so waiting on the JS objects
+  alone photographed the splash. The failure was order-dependent and appeared
+  only in the full suite. Every capture is now size-checked.
+- Removed `comfy-frontend/03-graph-to-prompt.png`. `app.graphToPrompt()` is a
+  pure read with no visual effect, so its capture was the same image as
+  `02-h3-template-open.png` by construction. The export assertion remains;
+  only the duplicate image is gone. Published captures: 13 to 12.
+- Fixed a Phase 7A integration assertion that expected `acceptedAttemptId`
+  after a run was reviewed `rejected` and pinned. Pin sets `pinnedAttemptId`;
+  only human acceptance sets `acceptedAttemptId`. The test contradicted the
+  design it was testing.
+- Rewrote `README.md` for users rather than reviewers, moved `RESUME.md` out of
+  the tracked tree, reframed `EVIDENCE-MANIFEST.md` as release provenance, and
+  brought `STATUS.md` up to date. `validate-docs.ts` no longer requires
+  completed-phase phrases that went stale as soon as the next checkpoint
+  landed, and now requires every capture to be accounted for in the provenance
+  manifest rather than enumerated in the README.
+- Cleared the `format:check` baseline, which had been failing on five files and
+  taking `pnpm check` and `pnpm release:verify` down with it.
+
+## Phase 7D — Remove the brief-first product
+
+Evidence level: Offline fake. The creative-brief workflow is gone. What remains
+is a durable execution and monitoring record for a ComfyUI executor running on
+a separate GPU host. Net -5,561 lines, with no change to the durable core.
+
+**Breaking — removed API routes.** Ten registrations:
+
+- `POST   /v1/projects/:projectId/plan`
+- `GET    /v1/projects/:projectId/storyboard`
+- `POST   /v1/projects/:projectId/storyboard/approve`
+- `GET    /v1/projects/:projectId/shots`
+- `GET    /v1/projects/:projectId/shots/:shotId/workflow-draft`
+- `PUT    /v1/projects/:projectId/shots/:shotId/workflow-draft`
+- `GET    /v1/projects/:projectId/shots/:shotId/workflow-revisions`
+- `POST   /v1/projects/:projectId/shots/:shotId/workflow-revisions`
+- `POST   /v1/projects/:projectId/shots/:shotId/managed-attempts`
+- `POST   /v1/attempts/:attemptId/regenerate`
+
+`POST /v1/shots/:shotId/attempts` is unaffected, as are the revision-scoped
+`GET /v1/workflow-revisions/:revisionId` and its `/validate`.
+
+- Extracted `RunView` as a single implementation used by both the ComfyUI
+  sidebar panel and the standalone route, carrying playback, retry, findings,
+  and the recovery path.
+- Deleted the Pi planning agent, the `PlanningAgent` interface,
+  `StaticStoryboardPlanner`, the storyboard domain and repository types, and
+  nine web components.
+- Added migration `0009`, which drops the `0006` CHECK constraint first —
+  it references the column being dropped — then converts non-implicit shots to
+  implicit rather than dropping them, preserving each row with its attempts and
+  events.
+- Kept deliberately: `POST /v1/projects` with `budgetUsd` and its `/cost`
+  route, the only way to arm cost enforcement against a metered GPU;
+  `apps/fake-comfy` and `COMFY_MODE=fake`, which is the entire local loop on a
+  workstation with no GPU; the evaluator; the operator adapter; telemetry; the
+  three audit invariants; and `agent_runs`.
+- The five planner-era strings remain in `DOMAIN_EVENT_TYPES`. `domain_events`
+  is append-only and `parseDomainEventType` throws on an unknown value, so
+  removing them would not delete old rows — it would make them unreadable,
+  taking the event timeline and SSE replay with them. The emitters are gone;
+  the strings are a retention schema, not an API surface.
+
 ## Phase 7C — ComfyUI-first plugin inversion
 
 Evidence level: Offline fake. ComfyUI is the graph-shell entry point and the
