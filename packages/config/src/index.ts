@@ -69,6 +69,8 @@ export const environmentSchema = z.object({
     .refine((value) => Number(value) > 0, 'must be greater than zero')
     .default('25.00'),
   OTEL_EXPORTER_OTLP_ENDPOINT: optionalUrl,
+  NOTIFY_WEBHOOK_URL: optionalUrl,
+  NOTIFY_TIMEOUT_MS: requestTimeoutMs.default(5_000),
   FAKE_COMFY_HOST: z.string().trim().min(1).default('127.0.0.1'),
   FAKE_COMFY_PORT: port.default(8188),
   WEB_HOST: z.string().trim().min(1).default('127.0.0.1'),
@@ -183,6 +185,8 @@ export interface ApiConfig {
   readonly attemptTimeoutSeconds: number;
   readonly projectDefaultBudgetUsd: string;
   readonly otelExporterOtlpEndpoint?: string;
+  readonly notifyWebhookUrl?: string;
+  readonly notifyTimeoutMs: number;
 }
 
 export function getApiConfig(raw: NodeJS.ProcessEnv = process.env): ApiConfig {
@@ -211,13 +215,15 @@ export function getApiConfig(raw: NodeJS.ProcessEnv = process.env): ApiConfig {
     attemptLeaseSeconds: environment.ATTEMPT_LEASE_SECONDS,
     attemptTimeoutSeconds: environment.ATTEMPT_TIMEOUT_SECONDS,
     projectDefaultBudgetUsd: environment.PROJECT_DEFAULT_BUDGET_USD,
+    notifyTimeoutMs: environment.NOTIFY_TIMEOUT_MS,
   };
 
   if (
     environment.COMFY_AUTH_TOKEN ||
     environment.PI_API_KEY ||
     environment.PI_BASE_URL ||
-    environment.OTEL_EXPORTER_OTLP_ENDPOINT
+    environment.OTEL_EXPORTER_OTLP_ENDPOINT ||
+    environment.NOTIFY_WEBHOOK_URL
   ) {
     return {
       ...config,
@@ -230,6 +236,9 @@ export function getApiConfig(raw: NodeJS.ProcessEnv = process.env): ApiConfig {
         : {}),
       ...(environment.OTEL_EXPORTER_OTLP_ENDPOINT
         ? { otelExporterOtlpEndpoint: environment.OTEL_EXPORTER_OTLP_ENDPOINT }
+        : {}),
+      ...(environment.NOTIFY_WEBHOOK_URL
+        ? { notifyWebhookUrl: environment.NOTIFY_WEBHOOK_URL }
         : {}),
     };
   }

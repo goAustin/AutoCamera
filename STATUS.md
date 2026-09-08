@@ -27,7 +27,9 @@ monitoring record for a ComfyUI executor running on a separate GPU host.
 The Pi operator adapter is read-only, bounded, and human-gated: it proposes,
 and a person applies or dismisses. A finding now emits `recommendation.created`
 into the durable timeline and the outbox, so it reaches a reader who is not
-watching the panel. The adapter still runs against the `faux` provider and
+watching the panel, and — when `NOTIFY_WEBHOOK_URL` is configured — an
+operator running a rented GPU asynchronously is notified directly, without
+polling anything. The adapter still runs against the `faux` provider and
 produces fixed findings from a lookup table; no model reasons yet.
 
 ## What is not implemented
@@ -37,9 +39,8 @@ produces fixed findings from a lookup table; no model reasons yet.
 - **The remote ComfyUI contract.** `COMFY_LIVE_TEST=1 COMFY_MODE=remote pnpm
   test:comfy-live` reports SKIP, not pass, because no pinned remote executor is
   configured here. Also Phase 8.
-- **A reasoning operator.** A real provider behind the operator adapter,
-  findings delivered without the panel open, and a cross-run digest are
-  specified but not built.
+- **A reasoning operator.** A real provider behind the operator adapter and a
+  cross-run digest are specified but not built.
 - Production billing, autoscaling, multitenancy, SLOs, and Kubernetes.
 
 Fake output is not a quality or throughput benchmark, and no capture in this
@@ -52,8 +53,8 @@ recorded in [`EVIDENCE-MANIFEST.md`](EVIDENCE-MANIFEST.md).
 |---|---|
 | Frozen install | PASS |
 | Format, lint, strict TypeScript, production build | PASS — all exit 0 |
-| Unit suite | PASS — 182 tests across 24 files |
-| Integration suite | PASS — 15 tests across 7 files, PostgreSQL-backed |
+| Unit suite | PASS — 196 tests across 25 files |
+| Integration suite | PASS — 16 tests across 8 files, PostgreSQL-backed |
 | Browser suite | PASS — 10/10 at the last recorded full run |
 | Token isolation | PASS — `storageHasCredential: false`, `globalsHaveCredential: false`, `crossOriginProtected: true` |
 | Documentation and provenance | PASS — 13 captures accounted for |

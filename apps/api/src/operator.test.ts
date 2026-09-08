@@ -10,6 +10,7 @@ import {
 } from '@h3/domain';
 import {
   createInMemoryStore,
+  RepositoryError,
   type OutboxDispatcher,
   type Repositories,
   type TransactionalStore,
@@ -497,64 +498,47 @@ describe('Checkpoint 5 operational Pi adapter', () => {
     expect(await dispatcher.pollOnce()).toBe(false);
   });
 
-  it('emits no event when create() loses a concurrent UNIQUE_VIOLATION race and recovers the winning duplicate', async () => {
+  it('propagates a genuine UNIQUE_VIOLATION from create() instead of recovering it, and a later retry finds the committed winner', async () => {
+    // 7E step 2 prerequisite finding: the recovery branch this test used to
+    // exercise is dead code on PostgreSQL (operator.ts:774) and is deleted.
+    // A genuine collision now aborts the transaction and relies on retry --
+    // this test proves that shape instead of a same-transaction recovery.
     const { app, store, dispatcher, adapter } = await setup();
     const projectId = await createProject(app, 'race-unique');
     await drain(dispatcher);
-
-    // Appended to `events` only (not the outbox): this test drives the race
-    // through a direct `processEventInTransaction` call below, and an
-    // undelivered trigger row sitting in the outbox would confuse the final
-    // "the outbox is empty" assertion.
-    const event = createDomainEvent({
-      id: testId(),
-      type: 'executor.unavailable',
-      producer: 'operator-test',
-      tenantId: DEV_TENANT_ID,
+    const event = await appendEvent(store, {
       projectId,
-      clock: { now: () => new Date('2026-01-01T00:00:00.000Z') },
+      type: 'executor.unavailable',
     });
-    await store.withTransaction((repositories) =>
-      repositories.events.append(event),
-    );
 
-    const winnerId = testId();
-    const result = await store.withTransaction(async (repositories) => {
-      let createCalls = 0;
+    // A concurrent operator instance wins the race and commits first.
+    expect(await dispatcher.pollOnce()).toBe(true);
+    await drain(dispatcher);
+    const winner = (await recommendations(store, projectId))[0];
+    if (!winner) throw new Error('Expected the winning recommendation.');
+
+    // This instance's own existence check ran *before* the winner committed
+    // -- the TOCTOU window the deleted branch used to guard. Patching only
+    // that check (not `create`) reproduces the real race precisely: the
+    // in-memory store's own uniqueness constraint, not a fabricated error,
+    // is what `create()` collides with below.
+    const raced = store.withTransaction(async (repositories) => {
       const patched: Repositories = {
         ...repositories,
         operationalRecommendations: {
           ...repositories.operationalRecommendations,
-          create: async (candidate) => {
-            createCalls += 1;
-            if (createCalls === 1) {
-              // Simulate a second operator instance winning the insert for
-              // the same trigger event and code, in the window between this
-              // call's existence check (already past, above) and its own
-              // create() attempt (below). This reuses the real repository's
-              // own uniqueness constraint instead of fabricating a
-              // RepositoryError by hand, so the UNIQUE_VIOLATION thrown next
-              // is the store's genuine error for a genuinely occupied
-              // (triggerEventId, code) slot -- faithful to what a second
-              // concurrent process would leave behind, not merely a stubbed
-              // exception that exercises the catch block in isolation.
-              await repositories.operationalRecommendations.create({
-                ...candidate,
-                id: winnerId,
-              });
-            }
-            return repositories.operationalRecommendations.create(candidate);
-          },
+          findByTriggerEventAndCode: async () => null,
         },
       };
       return adapter.processEventInTransaction(patched, event);
     });
+    await expect(raced).rejects.toBeInstanceOf(RepositoryError);
+    await expect(raced).rejects.toMatchObject({ code: 'UNIQUE_VIOLATION' });
 
-    expect(result.handled).toBe(true);
-    expect(result.duplicate).toBe(true);
-    expect(result.recommendation?.id).toBe(winnerId);
+    // Nothing from the raced attempt survived its transaction's rollback:
+    // still exactly the one winner, one recommendation.created event, and
+    // one agent run -- no second model run, no orphaned partial state.
     expect(await recommendations(store, projectId)).toHaveLength(1);
-
     const projectEvents = await store.withTransaction((repositories) =>
       repositories.events.listByProject(projectId),
     );
@@ -562,7 +546,18 @@ describe('Checkpoint 5 operational Pi adapter', () => {
       projectEvents.filter(
         (candidate) => candidate.type === 'recommendation.created',
       ),
-    ).toHaveLength(0);
+    ).toHaveLength(1);
+    const runs = await store.withTransaction((repositories) =>
+      repositories.agentRuns.listByProject(DEV_TENANT_ID, projectId),
+    );
+    expect(runs).toHaveLength(1);
+
+    // A genuine retry -- unpatched -- takes the early `existing` return and
+    // recovers cleanly, without re-running the model.
+    const retried = await adapter.processEvent(event);
+    expect(retried.duplicate).toBe(true);
+    expect(retried.recommendation?.id).toBe(winner.id);
+    expect(await recommendations(store, projectId)).toHaveLength(1);
     expect(await dispatcher.pollOnce()).toBe(false);
   });
 

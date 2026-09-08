@@ -19,9 +19,24 @@ describe('configuration', () => {
     expect(config.comfyMode).toBe('fake');
     expect(config.comfyFrontendUrl).toBe('http://127.0.0.1:8188');
     expect(config.comfyRequestTimeoutMs).toBe(15_000);
+    expect(config.notifyTimeoutMs).toBe(5_000);
+    expect(config.notifyWebhookUrl).toBeUndefined();
     expect(getWebConfig({ NODE_ENV: 'test' }).apiOrigin).toBe(
       'http://127.0.0.1:3000',
     );
+  });
+
+  it('accepts an optional notify webhook and its timeout override', () => {
+    expect(
+      getApiConfig({
+        NODE_ENV: 'test',
+        NOTIFY_WEBHOOK_URL: 'https://ntfy.example.test/h3-videoops',
+        NOTIFY_TIMEOUT_MS: '2000',
+      }),
+    ).toMatchObject({
+      notifyWebhookUrl: 'https://ntfy.example.test/h3-videoops',
+      notifyTimeoutMs: 2_000,
+    });
   });
 
   it('rejects invalid names without exposing secret values', () => {

@@ -1,5 +1,91 @@
 # Changelog
 
+## Phase 7E step 2 — A finding reaches a webhook without the panel
+
+Evidence level: Offline fake. No provider call was made; the operator still
+runs against `faux`. Additive only, composed alongside the existing outbox
+consumer only when configured — no code change to the worker, leases,
+retries, reconciliation, evaluation, SSE transport, or the metric
+allowlist. A configured webhook does change the worker's timing; that is
+recorded below, not fixed here.
+
+- Added `NotifyingOutboxConsumer` (`apps/api/src/notify.ts`), wrapping the
+  existing `OperationalOutboxConsumer` behind the single `OutboxDispatcher`
+  when `NOTIFY_WEBHOOK_URL` is configured. Isolation rule, normative: the
+  operator's `consume()` runs first and is authoritative — its errors still
+  propagate so the outbox retries the message — and the notifier's errors
+  are caught, recorded on an `operator.notify` telemetry span, and
+  swallowed. A failed webhook call therefore never fails the outbox message
+  and never re-runs the operator (a second paid inference call, once a real
+  provider lands) for the same event. Verified with a permanently
+  unreachable webhook: the finding still commits, the operator runs exactly
+  once, and the outbox still drains.
+- Notifies on `recommendation.created`, `project.budget_denied`, and
+  `executor.unavailable`; no success event is notified.
+  `project.budget_denied` is not in `OPERATIONAL_TRIGGER_EVENT_TYPES`, so a
+  webhook is the only way it reaches an operator who is not polling.
+  `executor.unavailable` is notified twice by design — once as the raw
+  trigger, again once its `recommendation.created` finding exists.
+- `WebhookNotificationDelivery` POSTs one bounded JSON body with a
+  configurable timeout: `NOTIFY_WEBHOOK_URL` (unset disables notification
+  entirely), `NOTIFY_TIMEOUT_MS` (default 5000). Unset leaves the dispatcher
+  byte-for-byte the pre-step-2 consumer, not merely a no-op wrapper. Works
+  with ntfy, Slack, Discord, or a local listener; no SMTP dependency.
+- Redaction: every text field in the notification body is run through the
+  existing `safeRecommendationText` (now exported from `operator.ts`, the
+  same sanitizer already relied on for persisted recommendation
+  title/detail), and a `recommendation.created` body looks up the finding's
+  title and detail so the notification reads as something other than a bare
+  identifier dump. Verified with a seeded recommendation whose detail
+  contains a bearer token, a `token=` credential, and a filesystem path:
+  none of the three raw values reach the delivered body.
+- Recorded, not a hostname filter: `safeRecommendationText` has no
+  hostname-matching rule — its bearer, credential, path, and prompt patterns
+  do not cover a bare private hostname embedded in free text. Nothing in
+  this codebase writes a hostname into recommendation title/detail today, so
+  this is a latent gap for whatever step 3's real model produces, not a
+  regression.
+- Recorded, not fixed — delivery runs inside the outbox transaction.
+  `OutboxDispatcher.pollOnce` (`packages/db/src/index.ts:5100`) wraps
+  `consume()` in `store.withTransaction`, so the webhook POST executes
+  between `BEGIN` and `COMMIT`. Measured against the live database with a
+  600ms stub webhook: a second connection counted zero
+  `operational_recommendations` rows mid-delivery and one after, and
+  `pollOnce()` took 680ms. A pooled connection therefore sits
+  idle-in-transaction holding the claimed outbox row for the whole round
+  trip, and because `OperationalOutboxWorker.run` polls serially, a slow
+  webhook is head-of-line blocking for the whole operational outbox — up
+  to `NOTIFY_TIMEOUT_MS` per notifiable message, two messages per
+  finding, and the config admits 120_000. `stop()` awaits `currentWork`,
+  so shutdown inherits the same delay. Delivery also fires before the
+  commit, so a transaction that then fails to commit has already sent a
+  notification for a finding that rolled back, and the retry sends a
+  second one. None of this violates the isolation rule, which fixed
+  whether a notifier failure propagates, not when delivery runs. Deferred
+  to step 3 rather than fixed here: the fix is a post-commit hand-off,
+  and step 3 forces that work anyway — `runPi` (`operator.ts:696`) is
+  called from inside the same transaction, so a real provider puts a
+  multi-second inference call between the same `BEGIN` and `COMMIT`,
+  against which the notifier's 5s is the smaller half.
+- Prerequisite finding from step 1, resolved: deleted the `UNIQUE_VIOLATION`
+  recovery branch (old `operator.ts:776-798`), dead code on PostgreSQL
+  because `PostgresOperationalRecommendationRepository.create` does not
+  translate `23505` and `withDatabaseTransaction` has no `SAVEPOINT` to
+  survive it. A genuine collision now aborts the transaction and relies on
+  retry, which the code already did correctly by falling through to the
+  `existing` check. Added the PostgreSQL-side test step 1 could not write
+  (`apps/api/src/operator.integration.test.ts`): it forces a real `create()`
+  call to collide with an already-committed row, asserts the raw error
+  carries Postgres code `23505`, and asserts a subsequent retry resolves to
+  the committed winner without a second event or a second model run.
+  Rewrote the corresponding unit test in `operator.test.ts`, which exercised
+  the now-deleted branch, to the same shape against `InMemoryStore`.
+- Fifteen new tests: 13 unit (`notify.test.ts`), 1 unit (`config.test.ts`,
+  the `NOTIFY_WEBHOOK_URL`/`NOTIFY_TIMEOUT_MS` config surface), 1 PostgreSQL
+  integration. The `operator.test.ts` UNIQUE_VIOLATION test was rewritten in
+  place, not added. Unit suite 182 to 196 across 24 to 25 files; integration
+  suite 15 to 16 across 7 to 8 files.
+
 ## Phase 7E step 1 — A finding enters the timeline
 
 Evidence level: Offline fake. No provider call was made; the operator still

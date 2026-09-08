@@ -37,6 +37,7 @@ import {
   OutboxDispatcher,
   RepositoryError,
   runMigrations,
+  type OutboxConsumer,
   type Repositories,
   type OperationalRecommendationRecord,
   type TransactionalStore,
@@ -87,6 +88,10 @@ import {
   OperationalOutboxWorker,
   OperationalPiAdapter,
 } from './operator.js';
+import {
+  NotifyingOutboxConsumer,
+  WebhookNotificationDelivery,
+} from './notify.js';
 
 export interface ApiLiveResponse {
   readonly service: 'api';
@@ -128,6 +133,8 @@ export interface ApiAppOptions {
   readonly operationalAdapter?: OperationalPiAdapter;
   readonly operationalDispatcher?: OutboxDispatcher;
   readonly startOperationalWorker?: boolean;
+  /** Test injection point for the notify webhook's HTTP client. */
+  readonly notifyFetchImpl?: typeof fetch;
 }
 
 export interface StartApiOptions {
@@ -1916,13 +1923,25 @@ export function buildApiApp(options: ApiAppOptions = {}): FastifyInstance {
             },
         }),
     });
+  // When unset, this is exactly the pre-7E-step-2 consumer: no wrapping, no
+  // behavior change (`75-PHASE-7E-OPERATIONAL-INTELLIGENCE.md` step 2 test:
+  // "NOTIFY_WEBHOOK_URL unset leaves the Phase 7D behaviour unchanged").
+  const operationalConsumer: OutboxConsumer = config.notifyWebhookUrl
+    ? new NotifyingOutboxConsumer({
+        inner: new OperationalOutboxConsumer(operationalAdapter),
+        delivery: new WebhookNotificationDelivery({
+          webhookUrl: config.notifyWebhookUrl,
+          timeoutMs: config.notifyTimeoutMs,
+          ...(options.notifyFetchImpl
+            ? { fetchImpl: options.notifyFetchImpl }
+            : {}),
+        }),
+        telemetry,
+      })
+    : new OperationalOutboxConsumer(operationalAdapter);
   const operationalDispatcher =
     options.operationalDispatcher ??
-    new OutboxDispatcher(
-      store,
-      new OperationalOutboxConsumer(operationalAdapter),
-      clock,
-    );
+    new OutboxDispatcher(store, operationalConsumer, clock);
   const operationalWorker = new OperationalOutboxWorker({
     dispatcher: operationalDispatcher,
   });

@@ -37,19 +37,18 @@ import {
   type IdGenerator,
   type Uuid,
 } from '@h3/domain';
-import {
-  type OutboxDispatcher,
-  RepositoryError,
-  type AgentRunFailureCode,
-  type AgentRunRecord,
-  type AgentRunStatus,
-  type OperationalRecommendationRecord,
-  type RecommendationActionType,
-  type RecommendationSeverity,
-  type Repositories,
-  type TransactionalStore,
-  type OutboxConsumer,
-  type OutboxMessage,
+import type {
+  OutboxDispatcher,
+  AgentRunFailureCode,
+  AgentRunRecord,
+  AgentRunStatus,
+  OperationalRecommendationRecord,
+  RecommendationActionType,
+  RecommendationSeverity,
+  Repositories,
+  TransactionalStore,
+  OutboxConsumer,
+  OutboxMessage,
 } from '@h3/db';
 import {
   type AgentTelemetry,
@@ -250,7 +249,10 @@ function defaultOutput(
   };
 }
 
-function safeRecommendationText(value: string, fallback: string): string {
+export function safeRecommendationText(
+  value: string,
+  fallback: string,
+): string {
   const sanitized = value
     .replace(/(?:raw\s+)?prompt(?:\s*[:=]|\s+)[^.;\n]*/gi, '[prompt redacted]')
     .replace(
@@ -772,34 +774,23 @@ export class OperationalPiAdapter {
       createdAt: finishedAt,
       updatedAt: finishedAt,
     };
-    try {
-      await repositories.operationalRecommendations.create(recommendation);
-    } catch (error) {
-      if (
-        error instanceof RepositoryError &&
-        error.code === 'UNIQUE_VIOLATION'
-      ) {
-        const duplicate =
-          await repositories.operationalRecommendations.findByTriggerEventAndCode(
-            this.tenantId,
-            event.id,
-            recommendationCode,
-          );
-        if (duplicate) {
-          return {
-            handled: true,
-            duplicate: true,
-            recommendation: duplicate,
-            agentRun: terminalRun,
-          };
-        }
-      }
-      throw error;
-    }
+    // No UNIQUE_VIOLATION recovery here, by design (7E step 2 prerequisite
+    // finding). PostgresOperationalRecommendationRepository.create() does
+    // not translate 23505, and withDatabaseTransaction has no SAVEPOINT, so
+    // a genuine collision aborts this whole transaction regardless of any
+    // catch here -- there is nothing to recover into. `claimNext`'s
+    // `SKIP LOCKED` plus the outbox row's event-id primary key mean two
+    // workers never claim the same trigger message, so the collision this
+    // guarded against cannot reach `create()` in the first place. If it
+    // ever did, the raw error rolls the transaction back, the outbox
+    // message retries, and the `existing` check above finds the committed
+    // winner and returns a duplicate without re-running the model -- no
+    // recovery branch required.
+    await repositories.operationalRecommendations.create(recommendation);
     // Exactly one durable `recommendation.created` event per persisted
     // finding: this line is reached only when `create` above succeeded, so
-    // neither the early `existing` return nor the `UNIQUE_VIOLATION`
-    // recovery above emits anything.
+    // the early `existing` return above is the only other path out of this
+    // method, and it emits nothing.
     const recommendationCreatedEvent = createDomainEvent({
       id: this.idGenerator.next(),
       type: 'recommendation.created',
