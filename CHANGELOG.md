@@ -1,5 +1,47 @@
 # Changelog
 
+## Phase 7E step 3 follow-up — Review findings 2-4
+
+Evidence level: Offline fake. No provider call was made. Closes the three
+remaining review findings against `ad93d57`.
+
+- **One normalization, everywhere (finding 2).** `prepareArguments`
+  normalized its candidate before parsing; `validateOperationalRecommendation`
+  and `describeOperationalRecommendationIssues` parsed the raw one. So a
+  lower-case `recommendationCode` was accepted through the tool and reported
+  as a violation by the exported helper, whose own doc called itself "the text
+  handed back to the model on a bounce" for a bounce that never happened.
+  `normalizeOperationalSubmission` moved inside
+  `parseOperationalRecommendation`, which all three already shared, so the
+  behaviour is now defined once. This also removes a tier-1/tier-2 asymmetry:
+  a lower-case code recovered from the model's prose is now accepted the same
+  way the tool accepts it.
+- **The tier family's total is the operator's run count (finding 3).**
+  `video_operator_output_tier_total` was incremented only in `persistOutcome`,
+  while `pi_agent_runs_total` is also incremented in `recordDeferredOutcome`
+  when a deferred run fails. The "Operator output tier" panel therefore
+  under-reported against "Pi planning and operator runs" by exactly the number
+  of findings lost to a persistence failure -- the case the code comment
+  claimed the two stayed reconcilable for. `recordDeferredOutcome` now mirrors
+  the increment with `tier: "error"`: whatever the model reached, no finding
+  arrived.
+- **Neither counter double-counts a lost COMMIT.** `withDatabaseTransaction`
+  runs its callback and then commits, so `persistOutcome` can count a run and
+  the transaction still fail afterwards -- which counted that run twice, once
+  succeeded and once failed. `runDeferred` now records whether
+  `persistOutcome` ran, and `recordDeferredOutcome` counts only when it did
+  not. Pre-existing, and fixed here because the tier counter would otherwise
+  have inherited it.
+- **`OPERATIONAL_SUBMISSION_MAX_REJECTIONS` says what it counts (finding 4).**
+  Its doc said "Consecutive"; the counter is cumulative across the run and is
+  never reset by an accepted submission, which matches how Claude Code counts
+  its structured-output retries. The distinction is unreachable in practice --
+  a lone accepted submission terminates the batch -- and the comment now says
+  so rather than describing a reset that does not exist.
+- 2 new tests, unit suite 244 to 245 across 25 files (the tier assertion joins
+  an existing case); integration unchanged at 18 across 10 files. Both were
+  confirmed to fail against `51ee0c4`.
+
 ## Phase 7E step 3 follow-up — Stop the sanitizer garbling the model's own prose
 
 Evidence level: Offline fake. No provider call was made. Fixes review finding

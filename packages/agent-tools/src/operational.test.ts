@@ -4,6 +4,7 @@ import {
   OPERATIONAL_TOOL_NAMES,
   createOperationalReadTools,
   createOperationalSubmissionTool,
+  validateOperationalRecommendation,
   describeOperationalRecommendationIssues,
   type OperationalToolServices,
 } from './index.js';
@@ -291,5 +292,28 @@ describe('operational Pi submission tool', () => {
     expect(
       describeOperationalRecommendationIssues(submissionArgs),
     ).toBeUndefined();
+  });
+
+  it('answers for the tool, not about it: normalization applies everywhere', async () => {
+    // The helper, the tool and tier 2's validator share one parse, so a
+    // lower-case code is accepted by all three. Reporting it as a violation
+    // while the tool accepted it made the helper describe a bounce that never
+    // happened.
+    const lowerCased = {
+      ...submissionArgs,
+      recommendationCode: '  executor_unavailable  ',
+    };
+    expect(describeOperationalRecommendationIssues(lowerCased)).toBeUndefined();
+    expect(validateOperationalRecommendation(lowerCased)).toEqual({
+      ...submissionArgs,
+      recommendationCode: 'EXECUTOR_UNAVAILABLE',
+    });
+
+    const submission = createOperationalSubmissionTool();
+    await callSubmission(submission, lowerCased);
+    expect(submission.accepted()?.recommendationCode).toBe(
+      'EXECUTOR_UNAVAILABLE',
+    );
+    expect(submission.rejections()).toBe(0);
   });
 });

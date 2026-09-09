@@ -863,9 +863,18 @@ type OperationalRecommendationParse =
   | { readonly ok: true; readonly value: OperationalRecommendationOutput }
   | { readonly ok: false; readonly issues: string };
 
+/**
+ * The one place a candidate becomes a recommendation, for every entry point:
+ * the tool's `prepareArguments`, tier 2's text extraction, and
+ * `describeOperationalRecommendationIssues`. Normalizing here rather than in
+ * the tool alone is what keeps them agreeing -- a lower-case
+ * `recommendationCode` used to be accepted through the tool and reported as a
+ * violation by the other two.
+ */
 function parseOperationalRecommendation(
-  candidate: unknown,
+  raw: unknown,
 ): OperationalRecommendationParse {
+  const candidate = normalizeOperationalSubmission(raw);
   const result = operationalRecommendationSchema.safeParse(candidate);
   if (result.success) return { ok: true, value: result.data };
   const lines = result.error.issues
@@ -878,8 +887,9 @@ function parseOperationalRecommendation(
 }
 
 /**
- * The field-by-field text handed back to the model on a bounce, or
- * `undefined` when `candidate` is already a valid recommendation.
+ * The field-by-field text the tool hands back to the model on a bounce, or
+ * `undefined` when `candidate` is one the tool would accept -- normalization
+ * included, so this answers for the tool rather than about it.
  */
 export function describeOperationalRecommendationIssues(
   candidate: unknown,
@@ -889,8 +899,9 @@ export function describeOperationalRecommendationIssues(
 }
 
 /**
- * Tier 2's validator: same schema, but a generic message, because prose the
- * model already stopped narrating cannot be handed back for a retry.
+ * Tier 2's validator: same schema and the same normalization, but a generic
+ * message, because prose the model already stopped narrating cannot be handed
+ * back for a retry.
  */
 export function validateOperationalRecommendation(
   candidate: unknown,
@@ -940,9 +951,7 @@ export function createOperationalSubmissionTool(): OperationalSubmission {
     // rather than a silent fall to the lookup table.
     prepareArguments: (args) => {
       attempts += 1;
-      const parsed = parseOperationalRecommendation(
-        normalizeOperationalSubmission(args),
-      );
+      const parsed = parseOperationalRecommendation(args);
       if (!parsed.ok) {
         rejections += 1;
         throw new Error(parsed.issues);

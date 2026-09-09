@@ -1296,16 +1296,34 @@ describe('Phase 7E step 3 review: deferred-run isolation and bounds', () => {
       repositories.agentRuns.findById(DEV_TENANT_ID, event.id),
     );
     expect(run?.status).toBe('running'); // visibly stuck, as designed
-    expect(
+    const counted = (name: string, labels: Record<string, string> = {}) =>
       metrics
         .snapshot()
-        .find(
+        .filter(
           (entry) =>
-            entry.name === 'pi_agent_runs_total' &&
-            entry.labels.status === 'failure' &&
-            entry.labels.run_type === 'operator',
-        )?.value,
+            entry.name === name &&
+            Object.entries(labels).every(
+              ([key, value]) => entry.labels[key] === value,
+            ),
+        )
+        .reduce((total, entry) => total + entry.value, 0);
+
+    expect(
+      counted('pi_agent_runs_total', {
+        status: 'failure',
+        run_type: 'operator',
+      }),
     ).toBe(1);
+    // The tier family's total is the operator's run count, including the runs
+    // that never reached `persistOutcome` to count themselves. Without the
+    // mirrored increment the panel silently under-reports against the run
+    // counter, by exactly the number of findings lost this way.
+    expect(counted('video_operator_output_tier_total')).toBe(
+      counted('pi_agent_runs_total', { run_type: 'operator' }),
+    );
+    expect(counted('video_operator_output_tier_total', { tier: 'error' })).toBe(
+      1,
+    );
   });
 
   it('continues the trigger event trace into the deferred run span', async () => {

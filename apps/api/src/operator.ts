@@ -76,10 +76,13 @@ export type OperationalTriggerEventType =
 const operationalTriggerSet = new Set<string>(OPERATIONAL_TRIGGER_EVENT_TYPES);
 
 /**
- * Consecutive `submit_recommendation` calls the model may have bounced back
- * to it for repair before a non-faux run gives up and falls to
- * `defaultOutput()`. Claude Code's `MAX_STRUCTURED_OUTPUT_RETRIES` default
- * (75-PHASE-7E step 3 follow-up, N4).
+ * `submit_recommendation` calls bounced back to the model for repair before a
+ * non-faux run gives up and falls to `defaultOutput()`. Counted across the
+ * whole run, not consecutively -- the same way Claude Code counts its
+ * structured-output retries, whose `MAX_STRUCTURED_OUTPUT_RETRIES` default
+ * this shares (75-PHASE-7E step 3 follow-up, N4). An accepted submission
+ * does not reset it, which is unreachable in practice: a lone accepted
+ * submission terminates the batch.
  */
 export const OPERATIONAL_SUBMISSION_MAX_REJECTIONS = 5;
 
@@ -802,13 +805,22 @@ export class OperationalPiAdapter {
 
     const startedAt = Date.now();
     const span = this.startDeferredSpan(event);
+    // `persistOutcome` counts a run itself. It can still have run and then
+    // lost its transaction at COMMIT, so the flag says whether the counters
+    // below would be a second count of the same run rather than the only one.
+    const progress = { counted: false };
     let deferredError: unknown;
     try {
-      await this.runDeferred(event);
+      await this.runDeferred(event, progress);
     } catch (error) {
       deferredError = error;
     }
-    this.recordDeferredOutcome(span, deferredError, Date.now() - startedAt);
+    this.recordDeferredOutcome(
+      span,
+      deferredError,
+      Date.now() - startedAt,
+      progress.counted,
+    );
   }
 
   /** Never throws -- the `afterCommit` contract holds even if telemetry fails. */
@@ -834,6 +846,7 @@ export class OperationalPiAdapter {
     span: TelemetrySpanHandle | undefined,
     deferredError: unknown,
     durationMs: number,
+    alreadyCounted: boolean,
   ): void {
     try {
       span?.setStatus(deferredError ? 'error' : 'ok', deferredError);
@@ -851,12 +864,18 @@ export class OperationalPiAdapter {
     } catch {
       // Telemetry cannot break the `afterCommit` contract.
     }
-    if (!deferredError) return;
+    if (!deferredError || alreadyCounted) return;
     try {
       this.metrics?.increment('pi_agent_runs_total', {
         run_type: 'operator',
         status: 'failure',
         provider: 'hosted',
+      });
+      // Counted beside the run, so the tier family's total stays the
+      // operator's run count. `error` is the honest tier here: whatever the
+      // model reached, no finding arrived.
+      this.metrics?.increment('video_operator_output_tier_total', {
+        tier: 'error',
       });
     } catch {
       // Metrics are diagnostic and cannot change the outcome.
@@ -876,6 +895,7 @@ export class OperationalPiAdapter {
    */
   private async runDeferred(
     event: DomainEvent & { readonly type: OperationalTriggerEventType },
+    progress: { counted: boolean },
   ): Promise<void> {
     const recommendationCode = recommendationCodeFor(event);
 
@@ -916,16 +936,18 @@ export class OperationalPiAdapter {
       services: this.storeBackedServices(),
     });
 
-    await this.store.withTransaction((repositories) =>
-      this.persistOutcome(
+    await this.store.withTransaction(async (repositories) => {
+      const persisted = await this.persistOutcome(
         repositories,
         event,
         recommendationCode,
         prepared.run,
         prepared.views,
         outcome,
-      ),
-    );
+      );
+      progress.counted = true;
+      return persisted;
+    });
   }
 
   /**
@@ -1256,8 +1278,9 @@ export class OperationalPiAdapter {
           severity: recommendation.severity,
         });
         // W5: how the finding arrived, so degradation is measured rather
-        // than assumed. Counted here, beside the run counter, so the two
-        // stay reconcilable when persistence itself fails.
+        // than assumed. Beside the run counter, and mirrored by
+        // `recordDeferredOutcome` when a deferred run never reaches here, so
+        // this family's total is the operator's run count.
         this.metrics.increment('video_operator_output_tier_total', {
           tier: runResult ? runResult.tier : outputTierFor(runError),
         });
