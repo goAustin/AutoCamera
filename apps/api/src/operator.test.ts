@@ -763,6 +763,19 @@ const validRecommendationArgs = {
   proposedActionType: 'wait_for_executor',
 };
 
+/**
+ * A finding the model authored, distinct from `defaultOutput()`'s for
+ * `executor.unavailable` in severity, title and action -- so a test can tell
+ * which of the two was persisted.
+ */
+const modelAuthoredArgs = {
+  severity: 'info',
+  recommendationCode: 'MODEL_AUTHORED_CODE',
+  title: 'Model authored title',
+  detail: 'The model reached this conclusion from the evidence tools.',
+  proposedActionType: 'no_action',
+};
+
 describe('Phase 7E step 3: a non-faux provider via submit_recommendation', () => {
   /**
    * 75-PHASE-7E-STEP-3-FOLLOWUP-TOOL-USE.md, W8. One table over how models
@@ -778,13 +791,6 @@ describe('Phase 7E step 3: a non-faux provider via submit_recommendation', () =>
    * discriminator: `completeRun` always takes it from the event
    * (`recommendationCodeFor`), never from the model.
    */
-  const modelFinding = {
-    severity: 'info',
-    recommendationCode: 'MODEL_AUTHORED_CODE',
-    title: 'Model authored title',
-    detail: 'The model reached this conclusion from the evidence tools.',
-    proposedActionType: 'no_action',
-  };
   const modelPersisted = {
     severity: 'info',
     title: 'Model authored title',
@@ -834,7 +840,7 @@ describe('Phase 7E step 3: a non-faux provider via submit_recommendation', () =>
     {
       row: 1,
       name: 'submits alone',
-      responses: [submits(modelFinding)],
+      responses: [submits(modelAuthoredArgs)],
       persisted: modelPersisted,
       status: 'succeeded',
       result: 'submitted',
@@ -842,7 +848,10 @@ describe('Phase 7E step 3: a non-faux provider via submit_recommendation', () =>
     {
       row: 2,
       name: 'submits batched with a read call (D1)',
-      responses: [submits(modelFinding, {}), fauxAssistantMessage('Done.')],
+      responses: [
+        submits(modelAuthoredArgs, {}),
+        fauxAssistantMessage('Done.'),
+      ],
       persisted: modelPersisted,
       status: 'succeeded',
       result: 'submitted',
@@ -851,7 +860,7 @@ describe('Phase 7E step 3: a non-faux provider via submit_recommendation', () =>
       row: 3,
       name: 'submits with an extra key (D2)',
       responses: [
-        submits({ ...modelFinding, reasoning: 'a field it volunteered' }),
+        submits({ ...modelAuthoredArgs, reasoning: 'a field it volunteered' }),
       ],
       persisted: modelPersisted,
       status: 'succeeded',
@@ -861,8 +870,8 @@ describe('Phase 7E step 3: a non-faux provider via submit_recommendation', () =>
       row: 4,
       name: 'submits an over-long detail, then corrects it (D2)',
       responses: [
-        submits({ ...modelFinding, detail: 'x'.repeat(2_280) }),
-        submits(modelFinding),
+        submits({ ...modelAuthoredArgs, detail: 'x'.repeat(2_280) }),
+        submits(modelAuthoredArgs),
       ],
       persisted: modelPersisted,
       status: 'succeeded',
@@ -874,8 +883,8 @@ describe('Phase 7E step 3: a non-faux provider via submit_recommendation', () =>
       row: 5,
       name: 'submits a bad enum, then corrects it',
       responses: [
-        submits({ ...modelFinding, severity: 'urgent' }),
-        submits(modelFinding),
+        submits({ ...modelAuthoredArgs, severity: 'urgent' }),
+        submits(modelAuthoredArgs),
       ],
       persisted: modelPersisted,
       status: 'succeeded',
@@ -889,14 +898,14 @@ describe('Phase 7E step 3: a non-faux provider via submit_recommendation', () =>
       responses: [
         submits(
           {
-            ...modelFinding,
+            ...modelAuthoredArgs,
             severity: 'warning',
             title: 'An earlier conclusion',
             proposedActionType: 'wait_for_executor',
           },
           {},
         ),
-        submits(modelFinding),
+        submits(modelAuthoredArgs),
       ],
       persisted: modelPersisted,
       status: 'succeeded',
@@ -906,11 +915,11 @@ describe('Phase 7E step 3: a non-faux provider via submit_recommendation', () =>
       row: 7,
       name: 'submits, then keeps talking: tier 1 still beats the prose',
       responses: [
-        submits(modelFinding, {}),
+        submits(modelAuthoredArgs, {}),
         // Parseable, and a *different* finding -- tier 2 would take it if
         // tier 1 had been lost.
         fenced({
-          ...modelFinding,
+          ...modelAuthoredArgs,
           severity: 'critical',
           title: 'Prose afterthought',
           proposedActionType: 'wait_for_executor',
@@ -925,7 +934,7 @@ describe('Phase 7E step 3: a non-faux provider via submit_recommendation', () =>
       name: 'exhausts the rejection cap',
       responses: Array.from(
         { length: OPERATIONAL_SUBMISSION_MAX_REJECTIONS },
-        () => submits({ ...modelFinding, severity: 'urgent' }),
+        () => submits({ ...modelAuthoredArgs, severity: 'urgent' }),
       ),
       persisted: fallbackPersisted,
       status: 'failed',
@@ -935,7 +944,7 @@ describe('Phase 7E step 3: a non-faux provider via submit_recommendation', () =>
     {
       row: 9,
       name: 'never submits, JSON in fenced prose (tier 2)',
-      responses: [fenced(modelFinding)],
+      responses: [fenced(modelAuthoredArgs)],
       persisted: modelPersisted,
       status: 'succeeded',
       result: 'text',
@@ -972,6 +981,7 @@ describe('Phase 7E step 3: a non-faux provider via submit_recommendation', () =>
         readonly apiKey: string | undefined;
         readonly transcript: string;
       }> = [];
+      const metrics = new MetricsRegistry();
       const { app, store, dispatcher, telemetry } = await setupHosted(
         hostedStreamFn(behaviour.responses, (_model, context, options) =>
           calls.push({
@@ -979,7 +989,7 @@ describe('Phase 7E step 3: a non-faux provider via submit_recommendation', () =>
             transcript: transcriptText(context.messages),
           }),
         ),
-        { apiKey: 'test-deepseek-key' },
+        { apiKey: 'test-deepseek-key', metrics },
       );
       const projectId = await createProject(app, `matrix-${behaviour.row}`);
       await drain(dispatcher);
@@ -1027,6 +1037,20 @@ describe('Phase 7E step 3: a non-faux provider via submit_recommendation', () =>
         .filter((span) => span.name === 'agent.operator.run');
       expect(runSpans).toHaveLength(1);
       expect(runSpans[0]?.attributes.result).toBe(behaviour.result);
+      // W5: the same vocabulary reaches the counter, so degradation is
+      // measurable in aggregate and not only per-span. A run that failed
+      // before it looked for a tier reports `error`.
+      expect(
+        metrics
+          .snapshot()
+          .filter((entry) => entry.name === 'video_operator_output_tier_total'),
+      ).toEqual([
+        {
+          name: 'video_operator_output_tier_total',
+          labels: { tier: behaviour.result ?? 'error' },
+          value: 1,
+        },
+      ]);
     });
   }
 
@@ -1377,5 +1401,151 @@ describe('Phase 7E step 3 review: deferred-run isolation and bounds', () => {
         .flatMap((span) => span.events)
         .filter((candidate) => candidate.name === 'run.budget_exhausted'),
     ).toHaveLength(0);
+  });
+});
+
+describe('Phase 7E step 3 follow-up: W4 -- a captured conclusion survives the bound', () => {
+  /**
+   * A finding the model actually reached is not the operator's to throw
+   * away. Before W4 every one of these persisted `defaultOutput()` and
+   * recorded the run as `failed`, which reads from the outside exactly like
+   * a model that never answered.
+   *
+   * Each case submits batched with a read call, so the batch does not
+   * terminate (`agent-loop.js:376`) and the run is still going when the
+   * bound arrives -- which is the only way to reach these paths at all.
+   */
+  const submitThenRead = () =>
+    fauxAssistantMessage([
+      fauxToolCall('submit_recommendation', modelAuthoredArgs),
+      fauxToolCall('get_project_status', {}),
+    ]);
+
+  async function expectRescued(
+    store: ReturnType<typeof createInMemoryStore>,
+    telemetry: InMemoryTelemetry,
+    projectId: Uuid,
+    outcome: string,
+  ): Promise<void> {
+    const recommendation = (await recommendations(store, projectId))[0];
+    if (!recommendation) throw new Error('Expected a persisted finding.');
+    expect(recommendation).toMatchObject({
+      severity: 'info',
+      title: 'Model authored title',
+      proposedActionType: 'no_action',
+    });
+    const runs = await store.withTransaction((repositories) =>
+      repositories.agentRuns.listByProject(DEV_TENANT_ID, projectId),
+    );
+    expect(runs[0]).toMatchObject({ status: 'succeeded' });
+    expect(runs[0]?.failureCode ?? undefined).toBeUndefined();
+    // The bound still happened, and still says so.
+    const runSpan = telemetry
+      .getSpans()
+      .find((span) => span.name === 'agent.operator.run');
+    expect(runSpan?.attributes.outcome).toBe(outcome);
+    expect(runSpan?.attributes.result).toBe('submitted');
+  }
+
+  it('keeps the finding when the run times out after the model submitted', async () => {
+    // The second stream call outlives the run timeout, so `timedOut` is set
+    // with a submission already captured.
+    const responses = [submitThenRead(), fauxAssistantMessage('Still going.')];
+    const inner = hostedStreamFn(responses);
+    let call = 0;
+    const streamFn: StreamFn = async (model, context, options) => {
+      call += 1;
+      if (call > 1) {
+        await new Promise((resolve) => setTimeout(resolve, 300));
+      }
+      return inner(model, context, options);
+    };
+    const { app, store, telemetry, dispatcher } = await setupHosted(streamFn, {
+      timeoutMs: 100,
+    });
+    const projectId = await createProject(app, 'w4-timeout');
+    await drain(dispatcher);
+    await appendEvent(store, { projectId, type: 'executor.unavailable' });
+
+    expect(await dispatcher.pollOnce()).toBe(true);
+    await expectRescued(store, telemetry, projectId, 'timed_out');
+  });
+
+  it('keeps the finding when a later turn comes back a provider error', async () => {
+    const { app, store, telemetry, dispatcher } = await setupHosted(
+      hostedStreamFn([
+        submitThenRead(),
+        fauxAssistantMessage('', {
+          stopReason: 'error',
+          errorMessage: 'simulated provider failure',
+        }),
+      ]),
+    );
+    const projectId = await createProject(app, 'w4-provider-error');
+    await drain(dispatcher);
+    await appendEvent(store, { projectId, type: 'executor.unavailable' });
+
+    expect(await dispatcher.pollOnce()).toBe(true);
+    await expectRescued(store, telemetry, projectId, 'provider_error');
+  });
+
+  it('keeps the finding when the budget runs out after the model submitted', async () => {
+    // Guards what W1 already made true: the budget bound stops the loop at a
+    // turn boundary, and the conclusion reached before it still stands.
+    const { app, store, telemetry, dispatcher } = await setupHosted(
+      hostedStreamFn([
+        submitThenRead(),
+        fauxAssistantMessage([fauxToolCall('get_project_status', {})]),
+      ]),
+      { maxRunTokens: 1 },
+    );
+    const projectId = await createProject(app, 'w4-budget');
+    await drain(dispatcher);
+    await appendEvent(store, { projectId, type: 'executor.unavailable' });
+
+    expect(await dispatcher.pollOnce()).toBe(true);
+    await expectRescued(store, telemetry, projectId, 'budget_exhausted');
+  });
+
+  it('still fails when the bound arrives before the model submitted anything', async () => {
+    // The negative control: the rescue is conditional on a real capture, not
+    // a blanket downgrade of every timeout to a success.
+    const metrics = new MetricsRegistry();
+    const inner = hostedStreamFn([
+      fauxAssistantMessage([fauxToolCall('get_project_status', {})]),
+      fauxAssistantMessage('Still going.'),
+    ]);
+    let call = 0;
+    const streamFn: StreamFn = async (model, context, options) => {
+      call += 1;
+      if (call > 1) {
+        await new Promise((resolve) => setTimeout(resolve, 300));
+      }
+      return inner(model, context, options);
+    };
+    const { app, store, dispatcher } = await setupHosted(streamFn, {
+      timeoutMs: 100,
+      metrics,
+    });
+    const projectId = await createProject(app, 'w4-timeout-no-finding');
+    await drain(dispatcher);
+    await appendEvent(store, { projectId, type: 'executor.unavailable' });
+
+    expect(await dispatcher.pollOnce()).toBe(true);
+    expect((await recommendations(store, projectId))[0]).toMatchObject({
+      title: 'Wait for the executor to recover',
+      severity: 'critical',
+    });
+    const runs = await store.withTransaction((repositories) =>
+      repositories.agentRuns.listByProject(DEV_TENANT_ID, projectId),
+    );
+    expect(runs[0]).toMatchObject({ status: 'failed', failureCode: 'TIMEOUT' });
+    // W5: a run that never got as far as a tier reports `error`, not silence.
+    expect(
+      metrics
+        .snapshot()
+        .find((entry) => entry.name === 'video_operator_output_tier_total')
+        ?.labels.tier,
+    ).toBe('error');
   });
 });

@@ -530,8 +530,49 @@ function toolCallsFor(
   return calls;
 }
 
+/**
+ * Which tier of the output path produced a run's finding (W5). `submitted`
+ * is the intended path and everything after it is a degradation: `text`
+ * recovered JSON from the model's prose, `rejected_cap` and `none` fell to
+ * `defaultOutput()`, and `error` never got as far as looking. `faux` has no
+ * tiers -- it parses a scripted response -- and is reported as itself so the
+ * counter's total stays the operator's run count.
+ */
+export const OPERATOR_OUTPUT_TIERS = [
+  'submitted',
+  'text',
+  'rejected_cap',
+  'none',
+  'error',
+  'faux',
+] as const;
+
+export type OperatorOutputTier = (typeof OPERATOR_OUTPUT_TIERS)[number];
+
+const operatorOutputTierSet = new Set<string>(OPERATOR_OUTPUT_TIERS);
+
+/**
+ * Carries the tier out of `runPi`'s throw, the way `code` already travels on
+ * these errors -- `persistOutcome` needs it on the failure path too, and the
+ * failure codes do not distinguish `rejected_cap` from `none`.
+ */
+function taggedWithTier(error: unknown, tier: OperatorOutputTier): unknown {
+  if (typeof error === 'object' && error !== null && !('tier' in error)) {
+    return Object.assign(error, { tier });
+  }
+  return error;
+}
+
+function outputTierFor(error: unknown): OperatorOutputTier {
+  const tier = (error as { readonly tier?: unknown } | null | undefined)?.tier;
+  return typeof tier === 'string' && operatorOutputTierSet.has(tier)
+    ? (tier as OperatorOutputTier)
+    : 'error';
+}
+
 interface OperatorRunResult {
   readonly output: OperationalRecommendationOutput;
+  readonly tier: OperatorOutputTier;
   readonly toolCalls: number;
   readonly inputTokens: number;
   readonly outputTokens: number;
@@ -1191,6 +1232,12 @@ export class OperationalPiAdapter {
           status: recommendation.status,
           severity: recommendation.severity,
         });
+        // W5: how the finding arrived, so degradation is measured rather
+        // than assumed. Counted here, beside the run counter, so the two
+        // stay reconcilable when persistence itself fails.
+        this.metrics.increment('video_operator_output_tier_total', {
+          tier: runResult ? runResult.tier : outputTierFor(runError),
+        });
       } catch {
         // Metrics are diagnostic and cannot change the recommendation result.
       }
@@ -1232,6 +1279,10 @@ export class OperationalPiAdapter {
         });
     let toolsUsed = 0;
     let terminalStatus: 'ok' | 'error' = 'error';
+    // Stays `error` until the run gets far enough to know better, so a throw
+    // from anywhere above the extraction reports itself honestly. Declared
+    // out here because the catch below has to read it.
+    let outputTier: OperatorOutputTier = 'error';
     try {
       const revisionId = evidence.revision?.id;
       const toolContext: OperationalToolContext = {
@@ -1366,6 +1417,7 @@ export class OperationalPiAdapter {
         validated = validateOperationalRecommendation(
           JSON.parse(assistantText(final)),
         );
+        outputTier = 'faux';
         totals = usageTotals(messages);
       } else {
         // Non-faux: a real (or test-overridden) provider via a terminal
@@ -1451,39 +1503,55 @@ export class OperationalPiAdapter {
         } finally {
           clearTimeout(timeout);
         }
-        if (timedOut) {
-          throw Object.assign(new Error('Operational Pi run timed out.'), {
-            code: 'TIMEOUT',
-          });
-        }
         const messages = assistantMessages(agent.state.messages);
         const final = messages.at(-1);
-        if (!final || final.stopReason === 'error') {
-          throw Object.assign(
-            new Error(
-              'Operational Pi provider did not return a recommendation.',
-            ),
-            { code: 'PROVIDER_ERROR' },
-          );
-        }
+        // W4: a conclusion the model actually reached is never thrown away
+        // for a bound or a fault that arrived after it. Timeout, abort and
+        // budget exhaustion become an attribute on a run that still delivers
+        // the model's own finding, rather than a failure that persists the
+        // lookup table in its place.
         const captured = submission.accepted();
-        const rejectedOut =
-          submission.rejections() >= OPERATIONAL_SUBMISSION_MAX_REJECTIONS;
+        const interrupted = timedOut
+          ? 'timed_out'
+          : budgetExhausted
+            ? 'budget_exhausted'
+            : !final || final.stopReason === 'error'
+              ? 'provider_error'
+              : undefined;
+        if (!captured) {
+          if (timedOut) {
+            throw Object.assign(new Error('Operational Pi run timed out.'), {
+              code: 'TIMEOUT',
+            });
+          }
+          if (!final || final.stopReason === 'error') {
+            throw Object.assign(
+              new Error(
+                'Operational Pi provider did not return a recommendation.',
+              ),
+              { code: 'PROVIDER_ERROR' },
+            );
+          }
+        }
+        if (interrupted) rootSpan.setAttributes({ outcome: interrupted });
         // Which tier produced the finding, on the generic allowlisted
         // `result` key -- `outcome` already carries how the run *ended*.
         try {
-          validated = extractOperationalOutput(captured, assistantText(final));
+          validated = extractOperationalOutput(
+            captured,
+            final ? assistantText(final) : '',
+          );
         } catch (error) {
-          rootSpan.setAttributes({
-            result: rejectedOut ? 'rejected_cap' : 'none',
-          });
+          outputTier =
+            submission.rejections() >= OPERATIONAL_SUBMISSION_MAX_REJECTIONS
+              ? 'rejected_cap'
+              : 'none';
+          rootSpan.setAttributes({ result: outputTier });
           throw error;
         }
-        rootSpan.setAttributes({ result: captured ? 'submitted' : 'text' });
+        outputTier = captured ? 'submitted' : 'text';
+        rootSpan.setAttributes({ result: outputTier });
         totals = usageTotals(messages);
-        if (budgetExhausted) {
-          rootSpan.setAttributes({ outcome: 'budget_exhausted' });
-        }
       }
 
       terminalStatus = 'ok';
@@ -1492,13 +1560,18 @@ export class OperationalPiAdapter {
         recommendationCode: validated.recommendationCode,
         proposedActionType: validated.proposedActionType,
       });
-      return { ...totals, output: validated, toolCalls: toolsUsed };
+      return {
+        ...totals,
+        output: validated,
+        tier: outputTier,
+        toolCalls: toolsUsed,
+      };
     } catch (error) {
       rootSpan.setAttributes({
         status: 'failed',
         failureCode: failureCodeFor(error),
       });
-      throw error;
+      throw taggedWithTier(error, outputTier);
     } finally {
       rootSpan.setStatus(terminalStatus);
       rootSpan.end();

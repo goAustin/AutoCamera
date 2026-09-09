@@ -1,5 +1,48 @@
 # Changelog
 
+## Phase 7E step 3 follow-up — Never discard a captured conclusion; measure the tier (W4, W5)
+
+Evidence level: Offline fake. No provider call was made; every test runs
+against `faux` or an injected `streamFnOverride` stub. Completes
+`docs/75-PHASE-7E-STEP-3-FOLLOWUP-TOOL-USE.md` except W6 and W7, which stay
+recorded there.
+
+- **W4 — a bound no longer throws away a finding the model already
+  reached.** `runPi` consulted `submission.accepted()` only after the timeout
+  and provider-error throws, so a run that captured a conclusion and *then*
+  hit its wall clock, or whose next turn came back an error, persisted
+  `defaultOutput()` and recorded `failed` — from the outside, identical to a
+  model that never answered. Those throws are now conditional on there being
+  nothing captured; when there is, the run succeeds with the model's own
+  finding and the bound becomes `outcome` on the run span (`timed_out`,
+  `budget_exhausted`, `provider_error`). The budget bound already survived
+  W1's capture change; it is covered here as a regression guard rather than a
+  fix. A bound that arrives before any submission still fails exactly as
+  before — the rescue is conditional on a real capture, not a blanket
+  downgrade.
+- **W5 — degradation is measured, not assumed.**
+  `video_operator_output_tier_total{tier}` joins `CORE_METRIC_NAMES` with the
+  same vocabulary the run span's `result` attribute already used —
+  `submitted`, `text`, `rejected_cap`, `none` — plus `error` for a run that
+  failed before it could look and `faux` for the scripted provider, so the
+  family's total is the operator's run count and `submitted / total` is the
+  tier-1 capture rate the follow-up doc wants before revisiting the two-phase
+  design. The counter is incremented beside `pi_agent_runs_total` in
+  `persistOutcome`, so the two stay reconcilable when persistence itself
+  fails; the tier travels out of `runPi` on the result, and on the thrown
+  error the way `code` already does, because the failure codes cannot
+  distinguish `rejected_cap` from `none`.
+- An "Operator output tier" Grafana panel renders the new family, and the
+  panel name is pinned in `scripts/validate-observability.ts` like the other
+  eleven — a metric nothing displays is not visible.
+- Metric labels are validated against the metric family's own allowlist, not
+  `sanitizeTelemetryAttributes`, so `tier` needed no allowlist change. The
+  span attribute still reports through the generic allowlisted `result` and
+  `outcome` keys.
+- 4 new tests, unit suite 226 to 230 across 25 files; integration unchanged at
+  18 across 10 files, unmodified. The two W4 rescue tests were confirmed to
+  fail against `9c4d8c5`; the negative control passes there, as it should.
+
 ## Phase 7E step 3 follow-up — Tool-use redesign for the operator (W1, W2, W8)
 
 Evidence level: Offline fake. No provider call was made; every test runs

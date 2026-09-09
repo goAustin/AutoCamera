@@ -496,6 +496,7 @@ export const CORE_METRIC_NAMES = [
   'video_evaluation_failures_total',
   'video_sse_connections',
   'video_operator_recommendations_total',
+  'video_operator_output_tier_total',
   'pi_agent_runs_total',
   'pi_agent_duration_seconds',
 ] as const;
@@ -581,6 +582,21 @@ const recommendationStatuses = all(
   'expired',
 );
 const severities = all('info', 'warning', 'critical');
+/**
+ * How an operator run's finding actually arrived
+ * (75-PHASE-7E step 3 follow-up, W5). `submitted` is the intended path;
+ * everything after it is a degradation, and `faux` is the scripted provider,
+ * which has no tiers -- it is counted so the family's total is the operator's
+ * run count.
+ */
+const outputTiers = all(
+  'submitted',
+  'text',
+  'rejected_cap',
+  'none',
+  'error',
+  'faux',
+);
 const runTypes = all('planning', 'operator');
 const providers = all('faux', 'hosted');
 const operations = all(
@@ -702,6 +718,9 @@ export const CORE_METRIC_DEFINITIONS: readonly MetricDefinition[] = [
       severity: severities,
     },
   ),
+  metric('video_operator_output_tier_total', 'counter', ['tier'], {
+    tier: outputTiers,
+  }),
   metric('pi_agent_runs_total', 'counter', ['run_type', 'status', 'provider'], {
     run_type: runTypes,
     status: resultValues,

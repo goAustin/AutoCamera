@@ -126,6 +126,18 @@
       "title": "Active SSE connections",
       "gridPos": { "h": 7, "w": 12, "x": 12, "y": 21 },
       "targets": [{ "expr": "video_sse_connections", "legendFormat": "SSE" }]
+    },
+    {
+      "type": "timeseries",
+      "title": "Operator output tier",
+      "description": "How each operator finding arrived. `submitted` is the intended path; every other tier is a degradation, and `faux` is the scripted provider, which has no tiers.",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 28 },
+      "targets": [
+        {
+          "expr": "video_operator_output_tier_total",
+          "legendFormat": "{{tier}}"
+        }
+      ]
     }
   ],
   "refresh": "5s",

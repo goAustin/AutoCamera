@@ -63,6 +63,7 @@ for (const title of [
   'Recorded compute cost (USD)',
   'Pi planning and operator runs',
   'Operator recommendations',
+  'Operator output tier',
   'Active SSE connections',
 ]) {
   if (!panelTitles.has(title)) {
