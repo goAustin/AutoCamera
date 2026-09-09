@@ -5074,6 +5074,21 @@ export function createInMemoryStore(): InMemoryStore {
 export interface OutboxConsumer {
   /** The repositories are from the claim transaction when supplied. */
   consume(message: OutboxMessage, repositories?: Repositories): Promise<void>;
+  /**
+   * Runs after the claim transaction has committed, with no repositories and
+   * no transaction open. This is where a consumer reaches the network: doing
+   * it inside `consume` would hold the claimed outbox row's lock and a pooled
+   * connection across the round trip, and the worker polls serially, so one
+   * slow call stalls every message behind it.
+   *
+   * Called only for a message that actually committed as delivered, so the
+   * side effect can never announce work that was rolled back. It must not
+   * throw -- the message is already delivered and cannot be retried for this,
+   * so the consumer owns swallowing its own failures, as
+   * `NotifyingOutboxConsumer` does. A throw here propagates out of
+   * `pollOnce`.
+   */
+  afterCommit?(message: OutboxMessage): Promise<void>;
 }
 
 export class NoopOutboxConsumer implements OutboxConsumer {
@@ -5097,6 +5112,7 @@ export class OutboxDispatcher {
 
   async pollOnce(): Promise<boolean> {
     let dispatched = false;
+    let committed: OutboxMessage | undefined;
     await this.store.withTransaction(async (repositories) => {
       const now = toIsoUtc(this.clock.now());
       const message = await repositories.outbox.claimNext(now);
@@ -5107,6 +5123,7 @@ export class OutboxDispatcher {
         await this.consumer.consume(message, repositories);
         await repositories.outbox.markDelivered(message.id, now);
         dispatched = true;
+        committed = message;
       } catch (error) {
         await repositories.outbox.markFailed(
           message.id,
@@ -5114,6 +5131,13 @@ export class OutboxDispatcher {
         );
       }
     });
+    // Deliberately after `withTransaction` resolves, so the COMMIT has
+    // landed and nothing above is holding a connection. `committed` is set
+    // only on the delivered path, so a rolled-back or failed message runs no
+    // side effect at all.
+    if (committed) {
+      await this.consumer.afterCommit?.(committed);
+    }
     return dispatched;
   }
 }

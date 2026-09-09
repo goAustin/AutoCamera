@@ -8,6 +8,7 @@ import {
 } from '@h3/domain';
 import {
   createInMemoryStore,
+  OutboxDispatcher,
   type OperationalRecommendationRecord,
   type OutboxConsumer,
   type OutboxMessage,
@@ -120,21 +121,32 @@ class ThrowingDelivery implements NotificationDelivery {
 }
 
 describe('NotifyingOutboxConsumer', () => {
-  it('always runs the inner (operator) consumer first, and only attempts delivery for notifiable event types', async () => {
+  it('runs the inner (operator) consumer in consume() and delivers nothing there', async () => {
     const inner = new NoopConsumer();
     const delivery = new RecordingDelivery();
     const consumer = new NotifyingOutboxConsumer({ inner, delivery });
 
+    // consume() is the part that runs inside the claim transaction, so it
+    // must reach the network for nothing -- not even a notifiable event.
     await consumer.consume(message(event('attempt.accepted')));
-    expect(inner.calls).toHaveLength(1);
-    expect(delivery.bodies).toHaveLength(0);
-
     await consumer.consume(message(event('executor.unavailable')));
     expect(inner.calls).toHaveLength(2);
+    expect(delivery.bodies).toHaveLength(0);
+  });
+
+  it('delivers from afterCommit, and only for notifiable event types', async () => {
+    const inner = new NoopConsumer();
+    const delivery = new RecordingDelivery();
+    const consumer = new NotifyingOutboxConsumer({ inner, delivery });
+
+    await consumer.afterCommit(message(event('attempt.accepted')));
+    expect(delivery.bodies).toHaveLength(0);
+
+    await consumer.afterCommit(message(event('executor.unavailable')));
     expect(delivery.bodies).toHaveLength(1);
   });
 
-  it('propagates an inner (operator) failure and never attempts delivery for that message', async () => {
+  it('propagates an inner (operator) failure so the outbox retries the message', async () => {
     const inner = new ThrowingConsumer();
     const delivery = new RecordingDelivery();
     const consumer = new NotifyingOutboxConsumer({ inner, delivery });
@@ -145,7 +157,7 @@ describe('NotifyingOutboxConsumer', () => {
     expect(delivery.bodies).toHaveLength(0);
   });
 
-  it('swallows a delivery failure -- consume() still resolves and records the failure on a span', async () => {
+  it('swallows a delivery failure -- afterCommit() still resolves and records it on a span', async () => {
     const inner = new NoopConsumer();
     const delivery = new ThrowingDelivery();
     const telemetry = new InMemoryTelemetry();
@@ -156,10 +168,9 @@ describe('NotifyingOutboxConsumer', () => {
     });
 
     await expect(
-      consumer.consume(message(event('executor.unavailable'))),
+      consumer.afterCommit(message(event('executor.unavailable'))),
     ).resolves.toBeUndefined();
     expect(delivery.calls).toBe(1);
-    expect(inner.calls).toHaveLength(1);
 
     const span = telemetry
       .getSpans()
@@ -180,7 +191,7 @@ describe('NotifyingOutboxConsumer', () => {
         reasonCode: 'EXECUTOR_UNAVAILABLE',
       },
     });
-    await consumer.consume(message(unavailable));
+    await consumer.afterCommit(message(unavailable));
     expect(delivery.bodies[0]).toMatchObject({
       eventType: 'executor.unavailable',
       reasonCode: 'EXECUTOR_UNAVAILABLE',
@@ -190,7 +201,7 @@ describe('NotifyingOutboxConsumer', () => {
     const budgetDenied = event('project.budget_denied', {
       payload: { reason: 'budget', estimatedCostMicrousd: 50_000 },
     });
-    await consumer.consume(message(budgetDenied));
+    await consumer.afterCommit(message(budgetDenied));
     expect(delivery.bodies[1]).toMatchObject({
       eventType: 'project.budget_denied',
       reason: 'budget',
@@ -203,9 +214,9 @@ describe('NotifyingOutboxConsumer', () => {
     const delivery = new RecordingDelivery();
     const consumer = new NotifyingOutboxConsumer({ inner, delivery });
 
-    await consumer.consume(message(event('project.created')));
-    await consumer.consume(message(event('attempt.accepted')));
-    await consumer.consume(message(event('run.pinned')));
+    await consumer.afterCommit(message(event('project.created')));
+    await consumer.afterCommit(message(event('attempt.accepted')));
+    await consumer.afterCommit(message(event('run.pinned')));
     expect(delivery.bodies).toHaveLength(0);
   });
 
@@ -246,7 +257,7 @@ describe('NotifyingOutboxConsumer', () => {
 
     const inner = new NoopConsumer();
     const delivery = new RecordingDelivery();
-    const consumer = new NotifyingOutboxConsumer({ inner, delivery });
+    const consumer = new NotifyingOutboxConsumer({ inner, delivery, store });
     const created = event('recommendation.created', {
       projectId,
       payload: {
@@ -258,9 +269,7 @@ describe('NotifyingOutboxConsumer', () => {
       },
     });
 
-    await store.withTransaction((repositories) =>
-      consumer.consume(message(created), repositories),
-    );
+    await consumer.afterCommit(message(created));
 
     expect(delivery.bodies[0]).toMatchObject({
       eventType: 'recommendation.created',
@@ -270,6 +279,30 @@ describe('NotifyingOutboxConsumer', () => {
       title: 'Wait for the executor to recover',
       detail: 'The execution service is unavailable.',
     });
+  });
+
+  it('never notifies for a message whose operator run failed and rolled back', async () => {
+    // The pre-fix ordering delivered from inside the claim transaction, so a
+    // consume() that committed nothing could still announce a finding that
+    // does not exist. afterCommit runs only on the delivered path.
+    const store = createInMemoryStore();
+    const delivery = new RecordingDelivery();
+    const consumer = new NotifyingOutboxConsumer({
+      inner: new ThrowingConsumer(),
+      delivery,
+      store,
+    });
+    const dispatcher = new OutboxDispatcher(store, consumer, {
+      now: () => new Date('2026-01-01T00:00:00.000Z'),
+    });
+    await store.withTransaction(async (repositories) => {
+      const trigger = event('executor.unavailable', { projectId: testId() });
+      await repositories.events.append(trigger);
+      await repositories.outbox.enqueue(trigger);
+    });
+
+    expect(await dispatcher.pollOnce()).toBe(false);
+    expect(delivery.bodies).toHaveLength(0);
   });
 
   it('redacts a bearer token, a generic credential, and a filesystem path from the finding detail before delivery', async () => {
@@ -311,15 +344,13 @@ describe('NotifyingOutboxConsumer', () => {
 
     const inner = new NoopConsumer();
     const delivery = new RecordingDelivery();
-    const consumer = new NotifyingOutboxConsumer({ inner, delivery });
+    const consumer = new NotifyingOutboxConsumer({ inner, delivery, store });
     const created = event('recommendation.created', {
       projectId,
       payload: { recommendationId: recommendation.id },
     });
 
-    await store.withTransaction((repositories) =>
-      consumer.consume(message(created), repositories),
-    );
+    await consumer.afterCommit(message(created));
 
     const body = delivery.bodies[0];
     const serialized = JSON.stringify(body);

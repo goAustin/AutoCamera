@@ -53,8 +53,8 @@ recorded in [`EVIDENCE-MANIFEST.md`](EVIDENCE-MANIFEST.md).
 |---|---|
 | Frozen install | PASS |
 | Format, lint, strict TypeScript, production build | PASS — all exit 0 |
-| Unit suite | PASS — 196 tests across 25 files |
-| Integration suite | PASS — 16 tests across 8 files, PostgreSQL-backed |
+| Unit suite | PASS — 198 tests across 25 files |
+| Integration suite | PASS — 17 tests across 9 files, PostgreSQL-backed |
 | Browser suite | PASS — 10/10 at the last recorded full run |
 | Token isolation | PASS — `storageHasCredential: false`, `globalsHaveCredential: false`, `crossOriginProtected: true` |
 | Documentation and provenance | PASS — 13 captures accounted for |

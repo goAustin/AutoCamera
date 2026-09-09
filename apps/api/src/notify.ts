@@ -1,5 +1,10 @@
 import { isUuidV7, type DomainEvent } from '@h3/domain';
-import type { OutboxConsumer, OutboxMessage, Repositories } from '@h3/db';
+import type {
+  OutboxConsumer,
+  OutboxMessage,
+  Repositories,
+  TransactionalStore,
+} from '@h3/db';
 import { InMemoryTelemetry, type AgentTelemetry } from '@h3/telemetry';
 import { safeRecommendationText } from './operator.js';
 
@@ -154,11 +159,19 @@ export class WebhookNotificationDelivery implements NotificationDelivery {
 export interface NotifyingOutboxConsumerOptions {
   readonly inner: OutboxConsumer;
   readonly delivery: NotificationDelivery;
+  /**
+   * Read side for the post-commit finding lookup. The claim transaction is
+   * gone by the time the body is built, so the title and detail come from a
+   * short read of their own. Optional: without it the body still stands on
+   * the event payload alone.
+   */
+  readonly store?: TransactionalStore;
   readonly telemetry?: AgentTelemetry;
 }
 
 /**
  * Wraps the operator's outbox consumer with best-effort delivery.
+ *
  * Isolation rule, normative (`75-PHASE-7E-OPERATIONAL-INTELLIGENCE.md` step
  * 2): `inner.consume()` is authoritative and its errors propagate so the
  * outbox retries the message; delivery errors are caught, recorded on a
@@ -168,15 +181,25 @@ export interface NotifyingOutboxConsumerOptions {
  * call once a real provider is wired in. A missed notification is
  * recoverable from `operational_recommendations`; a duplicated paid run is
  * not.
+ *
+ * Delivery runs in `afterCommit`, not in `consume`, so the webhook round
+ * trip happens with no transaction open and no outbox row locked. Two
+ * consequences beyond the latency it stops holding: the finding is durable
+ * before it is announced, so a rolled-back transaction can no longer send a
+ * notification for a finding that does not exist; and this class is the sole
+ * owner of the "never throw after commit" rule the dispatcher's
+ * `afterCommit` contract requires.
  */
 export class NotifyingOutboxConsumer implements OutboxConsumer {
   private readonly inner: OutboxConsumer;
   private readonly delivery: NotificationDelivery;
+  private readonly store: TransactionalStore | undefined;
   private readonly telemetry: AgentTelemetry;
 
   constructor(options: NotifyingOutboxConsumerOptions) {
     this.inner = options.inner;
     this.delivery = options.delivery;
+    this.store = options.store;
     this.telemetry = options.telemetry ?? new InMemoryTelemetry();
   }
 
@@ -184,7 +207,11 @@ export class NotifyingOutboxConsumer implements OutboxConsumer {
     message: OutboxMessage,
     repositories?: Repositories,
   ): Promise<void> {
+    // Nothing but the operator runs inside the claim transaction.
     await this.inner.consume(message, repositories);
+  }
+
+  async afterCommit(message: OutboxMessage): Promise<void> {
     if (!notifiableEventSet.has(message.event.type)) return;
 
     const span = this.telemetry.startSpan('operator.notify', {
@@ -193,13 +220,19 @@ export class NotifyingOutboxConsumer implements OutboxConsumer {
     const startedAt = Date.now();
     let deliveryError: unknown;
     try {
-      const body = await buildNotificationBody(message.event, repositories);
+      // The lookup gets a short transaction of its own; the POST below gets
+      // none, which is the whole point of running here.
+      const body = this.store
+        ? await this.store.withTransaction((repositories) =>
+            buildNotificationBody(message.event, repositories),
+          )
+        : await buildNotificationBody(message.event, undefined);
       await this.delivery.deliver(body);
       span.setStatus('ok');
     } catch (error) {
-      // Isolation rule: never rethrow. Swallowing here, after recording on
-      // the span above, is what keeps a notifier failure from failing this
-      // outbox message.
+      // Isolation rule: never rethrow. The message is already delivered, so
+      // there is nothing for the outbox to retry, and the dispatcher's
+      // `afterCommit` contract requires this method not to throw.
       deliveryError = error;
       span.setStatus('error', error);
     } finally {

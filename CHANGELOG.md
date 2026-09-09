@@ -1,5 +1,50 @@
 # Changelog
 
+## Phase 7E step 2 follow-up — delivery leaves the outbox transaction
+
+Evidence level: Offline fake. No provider call was made. Resolves the
+"Recorded, not fixed" item in the step 2 entry below. No change to the
+operator, the trigger set, the isolation rule, leases, retries,
+reconciliation, evaluation, SSE transport, or the metric allowlist.
+
+- `OutboxConsumer` gains an optional `afterCommit(message)`
+  (`packages/db/src/index.ts:5091`), which `OutboxDispatcher.pollOnce` calls
+  after `withTransaction` resolves and only for a message that committed as
+  delivered. `NotifyingOutboxConsumer.consume` is now a pass-through to the
+  operator and the webhook POST moved to `afterCommit`, so the round trip
+  holds no open transaction, no pooled connection, and no lock on the
+  claimed outbox row. The finding's title and detail are read back through a
+  short transaction of the consumer's own — a `store`, newly passed from
+  `app.ts` — instead of borrowing the claim transaction.
+- Two properties come free with the reordering. A notification can no longer
+  announce a finding that rolled back: `afterCommit` runs only on the
+  delivered path, where the pre-fix code delivered from inside a transaction
+  that might still fail to commit. And `OperationalOutboxWorker.run`, which
+  polls serially, no longer queues every operational message behind one slow
+  webhook.
+- Contract, normative: `afterCommit` must not throw. The message is already
+  delivered, so there is nothing for the outbox to retry, and
+  `NotifyingOutboxConsumer` stays the single owner of swallowing — the same
+  rule step 2 established for delivery failures, applied one step later.
+- Verified against PostgreSQL (`apps/api/src/notify.integration.test.ts`):
+  while the webhook is being called, a second connection already counts the
+  finding as committed, for both the `executor.unavailable` and the
+  `recommendation.created` message. The same measurement read zero before
+  this change. The test records every delivery rather than only the last,
+  which is what makes it fail under the old ordering — proven by mutation:
+  restoring the in-transaction call yields `[0, 1]` against an expected
+  `[1]`.
+- Not fixed, and now step 3's: the operator's own provider call still runs
+  inside the claim transaction. `agentRuns.create` commits before `runPi`
+  (`operator.ts:679` and `operator.ts:696`), so moving the model call out is
+  a multi-transaction run state machine — the in-flight run row committed
+  before the call, updated after — not a reordering. Against `faux` that
+  buys nothing measurable, so it is specified in step 3 rather than designed
+  here.
+- Three new tests: 2 unit (`notify.test.ts`), 1 PostgreSQL integration.
+  Unit suite 196 to 198 across 25 files; integration 16 to 17 across 8 to 9
+  files.
+
 ## Phase 7E step 2 — A finding reaches a webhook without the panel
 
 Evidence level: Offline fake. No provider call was made; the operator still

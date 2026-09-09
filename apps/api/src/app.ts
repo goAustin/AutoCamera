@@ -1936,6 +1936,7 @@ export function buildApiApp(options: ApiAppOptions = {}): FastifyInstance {
             ? { fetchImpl: options.notifyFetchImpl }
             : {}),
         }),
+        store,
         telemetry,
       })
     : new OperationalOutboxConsumer(operationalAdapter);
