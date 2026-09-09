@@ -1,5 +1,185 @@
 # Changelog
 
+## Phase 7E step 3 review follow-up — deferred-run isolation, bounds, and signal
+
+Evidence level: Offline fake. No provider call was made; every test runs
+against `faux` or an injected `streamFnOverride` stub. Fixes the review
+findings on step 3 that are not about tool design; the two tool-design defects
+are planned separately in
+`docs/75-PHASE-7E-STEP-3-FOLLOWUP-TOOL-USE.md` (W1/W2/W8) and are untouched
+here.
+
+- **The model call now runs with no transaction open at all.** Step 3 moved it
+  out of the outbox *claim* transaction but still wrapped it in one of its own,
+  so `withDatabaseTransaction` held a pooled client with `BEGIN` open across
+  the whole provider round trip — only the first half of the
+  `OutboxConsumer.afterCommit` contract in `packages/db/src/index.ts`, which
+  names the claimed row's lock *and* the pooled connection.
+  `completeRun` split into `runModel` (no repositories) and `persistOutcome`;
+  `runDeferred` now runs three phases — a short transaction for the guards and
+  evidence, the model call with nothing held, then a short transaction to
+  persist. `faux` is unchanged: `completeRun` still composes both halves inside
+  the caller's transaction.
+- **The read tools each get their own short transaction** on the deferred path
+  (`storeBackedServices`), so the agent loop holds no connection *between* tool
+  calls either. `getExecutorReadiness` is the one remaining case that spans a
+  network call, documented in place; it reaches ComfyUI rather than PostgreSQL
+  and is bounded by `COMFY_REQUEST_TIMEOUT_MS`.
+- **A failed deferred run is no longer silent.** The design deliberately leaves
+  the run visibly `'running'` with nothing to retry, so that signal was the
+  only one — and it reached nowhere: no logger on the adapter, no metric
+  (`pi_agent_runs_total` is incremented inside `completeRun`, which never runs
+  on that path), `BufferedSpan.setStatus` drops the error object, and with no
+  OTLP endpoint no span is exported at all. `completeDeferredRun` now
+  increments `pi_agent_runs_total{status="failure"}` and records `failureCode`
+  as a span attribute.
+- **`completeDeferredRun` cannot throw.** Its telemetry calls sat outside its
+  own try/catch; a throw would have reached `pollOnce` and from there the
+  outbox worker's unawaited `run()`. Span creation and the outcome record are
+  both isolated now, and the span continues the trigger event's `traceId` like
+  every other operator span instead of starting a detached trace.
+- **The webhook no longer queues behind the model call.**
+  `NotifyingOutboxConsumer.afterCommit` forwarded to the inner consumer first,
+  so an `executor.unavailable` alert waited for an unrelated DeepSeek round
+  trip. The two side effects are independent and now run concurrently under
+  `Promise.allSettled`, with the forward wrapped so a throwing inner consumer
+  is recorded on an `operator.notify.inner` span rather than escaping — the
+  class doc claimed sole ownership of the "never throw" rule, which the
+  unguarded forward had made false.
+- **A run that keeps calling tools is now bounded by spend, not the wall
+  clock.** Pi's loop already ends when the model stops calling tools
+  (`dist/agent-loop.js:132`), the same condition Claude Code uses, so no turn
+  cap is wanted; what it lacks is a bound on a model that does not stop.
+  `maxRunCostMicrousd` (default 50,000 = $0.05, ~100x the recorded spike) and
+  `maxRunTokens` (default 200,000) stop the run at the next turn boundary
+  through Pi's `shouldStopAfterTurn` hook. The token limit is not redundant:
+  a provider that reports no cost would disable the cost ceiling silently.
+  Neither is wired to an environment variable yet.
+- `processEvent` now documents that it is only the first half of a non-faux
+  run — it returns no `recommendation` and leaves a `'running'` row that only
+  `completeDeferredRun` finishes. Two integration tests call it directly and
+  pass only because the default provider is `faux`.
+- Telemetry note: `sanitizeTelemetryAttributes` silently drops keys outside its
+  allowlist, and `SENSITIVE_ATTRIBUTE_KEY` rejects anything containing "token"
+  as credential-shaped. The budget event therefore reports through the generic
+  allowlisted `outcome`/`value`/`max` keys rather than extending the allowlist.
+- 7 new tests, unit suite 210 to 217 across 25 files (no new file); integration
+  unchanged at 18 across 10 files. Each of the 6 behavioural tests was checked
+  against a simulated pre-fix build and fails there; the 7th is the negative
+  control for the budget bound.
+
+## Phase 7E step 3 — A real provider behind the per-incident operator
+
+Evidence level: Offline fake for automated verification — every test in this
+checkpoint runs against `faux` or an injected `streamFnOverride` stub, never
+a paid call. No real DeepSeek request was made during this work; the
+`deepseek-v4-flash` tool-calling spike recorded earlier in
+`75-PHASE-7E-OPERATIONAL-INTELLIGENCE.md` (3 runs, 13,488 tokens, $0.00135
+total) is the only real-provider evidence this checkpoint relies on, and it
+predates this change. `.env` on this workstation already carries
+`PI_PROVIDER=deepseek`, `PI_MODEL=deepseek-v4-flash`, and a `DEEPSEEK_API_KEY`
+— set by that earlier spike, not by this session — so `pnpm dev` will now
+route real operator findings through DeepSeek the next time an operational
+trigger fires; a real call was neither made nor required to finish this
+checkpoint.
+
+- Replaced the `PROVIDER_ERROR` throw for any non-faux provider
+  (`operator.ts`, old `runPi:873-878`) with a real path: `runPi` now branches
+  on `this.provider === 'faux'` (`operator.ts:643`) and, for anything else,
+  resolves a model via `resolveHostedModel` (`operator.ts:1235`) — DeepSeek
+  through `@earendil-works/pi-ai/providers/deepseek`'s `deepseekProvider()`
+  registered into a fresh `createModels()`, or a test-only
+  `streamFnOverride` when one is supplied, regardless of `this.provider`'s
+  value. Unsupported provider strings still throw `PROVIDER_ERROR`.
+- `PI_API_KEY` resolution moved into `packages/config` (`index.ts:120`):
+  when `PI_PROVIDER=deepseek` and `PI_API_KEY` is unset, `DEEPSEEK_API_KEY`
+  is the fallback, checked in both the "non-faux requires a key" validation
+  and the resolved `ApiConfig.piApiKey`. The key is threaded through
+  explicitly, on every stream call (`operator.ts`'s `streamFn` wrapper merges
+  `apiKey: this.apiKey` into stream options), not read from `process.env` by
+  the adapter or left to Pi's own ambient env lookup — so a `PI_API_KEY`
+  without a matching `DEEPSEEK_API_KEY` still works, which ambient
+  resolution alone would not have caught. `app.ts` now constructs the
+  operational adapter from `config.piProvider` / `config.piModel` /
+  `config.piApiKey` instead of a hardcoded `'faux'`. Fixed the stale
+  `PI_MODEL` default (`h3-videoops-storyboard-v1`, a Phase 4 planner label
+  meaningless after 7D) to `h3-videoops-operator-v1`; `.env.example` now
+  documents the DeepSeek variables next to it.
+- Output handling (`operator.ts:1271-1420`), settled by what Pi can actually
+  do: `openai-completions` never sends `response_format`, and `ToolChoice`
+  has no `"required"`, so neither API-level structured output nor a forced
+  tool call is reachable. Added a terminal `submit_recommendation` tool
+  (`createOperationalSubmissionTool`, `packages/agent-tools/src/index.ts`)
+  whose TypeBox parameters are the recommendation schema and which returns
+  `terminate: true`, in a **separate factory** from
+  `createOperationalReadTools` so "the read tools are reads only" stays a
+  property a test asserts, not a judgement call. Three-tier degradation: (1)
+  `submit_recommendation` arguments, read straight off the tool-call content
+  block (`submissionArguments`, `operator.ts:1301`) — no text parsing; (2)
+  else tolerant extraction — strip fenced code blocks, scan for the last
+  brace-balanced JSON object ignoring braces inside string literals
+  (`stripFencedCodeBlocks` / `lastBalancedJsonObject`) — then the same
+  strict `validateOperationalRecommendation`; (3) else throw
+  `INVALID_STRUCTURED_OUTPUT`, which the existing `defaultOutput()` fallback
+  in `completeRun` (old `processEventInTransaction`) already covers.
+  `validateOperationalRecommendation` stays the sole authority at every
+  tier — the tool schema steers the model, it never approves the result.
+- Fixed the other three defects a real spike run surfaced against the old
+  code, none of them DeepSeek's fault: the system prompt now states the
+  five required fields and instructs a single `submit_recommendation` call
+  (`OPERATIONAL_SYSTEM_PROMPT`, `operator.ts:1271`); the user prompt seeds
+  the scoped `projectId`/`shotId`/`attemptId`/`workflowRevisionId` the
+  adapter already holds instead of the old bare `Review durable event
+  {id}.` (`operationalPrompt`, `operator.ts:1284`) — the tools still deny an
+  out-of-scope identifier the model supplies regardless, so this narrows
+  guessing, not scope.
+- Moved the model call out of the outbox claim transaction, the prerequisite
+  step 2 follow-up recorded and deferred here. `processEventInTransaction`
+  now only resolves evidence and commits an `agent_runs` row with status
+  `'running'` before returning (`operator.ts:576`, non-faux branch at
+  `:643`); the model call, recommendation, `recommendation.created` event,
+  and outbox enqueue all move into `completeDeferredRun`
+  (`operator.ts:675`), which `OperationalOutboxConsumer.afterCommit` calls
+  once the claim transaction has committed — never inside it. `faux` is
+  exempt and keeps running synchronously in the claim transaction unchanged,
+  since every existing test and the whole faux contract depends on that.
+  `completeDeferredRun` re-checks the `existing` recommendation and the
+  run's `'running'` status before proceeding, and — matching the
+  `afterCommit` contract `NotifyingOutboxConsumer` established in step
+  2 — never throws; a failure here leaves the run visibly `'running'`
+  rather than losing it silently, deliberately preferring a visible stuck
+  run over a duplicated paid model call. `NotifyingOutboxConsumer.afterCommit`
+  (`notify.ts`) now forwards to `inner.afterCommit` first: without this fix,
+  composing the webhook with a non-faux operator would have silently
+  dropped the deferred model call.
+- Verified against PostgreSQL
+  (`apps/api/src/operator.deferred.integration.test.ts`, modeled on the
+  step-2-follow-up webhook test): across two separate trigger events, a
+  second connection's count of `'running'` `agent_runs` rows was `1` at the
+  moment each model call started — proving the claim transaction had
+  already committed by then, for both calls, not just the first.
+- `agent_runs.provider` / `.model` were already persisted on `create()`
+  (`packages/db/src/index.ts:2654`, columns `$7`/`$8`); this checkpoint
+  exercises that path for a non-faux provider for the first time and adds
+  the assertion.
+- 20 new tests: 1 unit (`config.test.ts`, the four `PI_API_KEY` /
+  `DEEPSEEK_API_KEY` combinations), 2 unit
+  (`packages/agent-tools/src/operational.test.ts`, the submission tool and
+  the read-tools-stay-read-only assertion), 8 unit (`operator.test.ts`, the
+  non-faux paths above), 1 unit (`notify.test.ts`, the `afterCommit`
+  forwarding fix), 1 PostgreSQL integration
+  (`operator.deferred.integration.test.ts`). Unit suite 198 to 210 across 25
+  files (no new unit file); integration 17 to 18 across 9 to 10 files.
+- Not built here, staying step 4/5: `POST /v1/digest` and separating
+  inference spend from attempt spend on `GET
+  /v1/projects/:projectId/cost`.
+- Recorded, not a defect: `.env`'s `DEEPSEEK_API_KEY` reaches the API server
+  process for `pnpm dev` (`scripts/dev.ts` loads `.env` into `process.env`
+  before spawning it) but not for `node dist/main.js` directly, which has no
+  such loader. `~/.zshenv` (not `~/.zshrc`, which does not source for
+  non-interactive shells) is the alternative for that path; nothing in this
+  checkpoint changes server startup.
+
 ## Phase 7E step 2 follow-up — delivery leaves the outbox transaction
 
 Evidence level: Offline fake. No provider call was made. Resolves the

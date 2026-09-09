@@ -14,7 +14,7 @@ describe('configuration', () => {
     expect(config.apiPort).toBe(3000);
     expect(config.projectDefaultBudgetUsd).toBe('25.00');
     expect(config.piProvider).toBe('faux');
-    expect(config.piModel).toBe('h3-videoops-storyboard-v1');
+    expect(config.piModel).toBe('h3-videoops-operator-v1');
     expect(config.piMaxConcurrentRuns).toBe(1);
     expect(config.comfyMode).toBe('fake');
     expect(config.comfyFrontendUrl).toBe('http://127.0.0.1:8188');
@@ -92,6 +92,50 @@ describe('configuration', () => {
         PI_API_KEY: 'secret',
       }).PI_PROVIDER,
     ).toBe('hosted');
+  });
+
+  it('falls back to DEEPSEEK_API_KEY only when PI_PROVIDER=deepseek and PI_API_KEY is unset', () => {
+    // 75-PHASE-7E-OPERATIONAL-INTELLIGENCE.md step 3: the four PI_API_KEY x
+    // DEEPSEEK_API_KEY combinations under PI_PROVIDER=deepseek.
+    expect(() =>
+      parseEnvironment({ NODE_ENV: 'test', PI_PROVIDER: 'deepseek' }),
+    ).toThrowError('PI_API_KEY');
+
+    expect(
+      getApiConfig({
+        NODE_ENV: 'test',
+        PI_PROVIDER: 'deepseek',
+        PI_API_KEY: 'pi-key',
+      }).piApiKey,
+    ).toBe('pi-key');
+
+    expect(
+      getApiConfig({
+        NODE_ENV: 'test',
+        PI_PROVIDER: 'deepseek',
+        DEEPSEEK_API_KEY: 'deepseek-key',
+      }).piApiKey,
+    ).toBe('deepseek-key');
+
+    // PI_API_KEY wins when both are set.
+    expect(
+      getApiConfig({
+        NODE_ENV: 'test',
+        PI_PROVIDER: 'deepseek',
+        PI_API_KEY: 'pi-key',
+        DEEPSEEK_API_KEY: 'deepseek-key',
+      }).piApiKey,
+    ).toBe('pi-key');
+
+    // The fallback is deepseek-specific: an unrelated hosted provider still
+    // requires PI_API_KEY even with DEEPSEEK_API_KEY set.
+    expect(() =>
+      parseEnvironment({
+        NODE_ENV: 'test',
+        PI_PROVIDER: 'hosted',
+        DEEPSEEK_API_KEY: 'deepseek-key',
+      }),
+    ).toThrowError('PI_API_KEY');
   });
 
   it('requires explicit, protocol-safe remote Comfy endpoints', () => {

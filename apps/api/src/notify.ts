@@ -186,9 +186,10 @@ export interface NotifyingOutboxConsumerOptions {
  * trip happens with no transaction open and no outbox row locked. Two
  * consequences beyond the latency it stops holding: the finding is durable
  * before it is announced, so a rolled-back transaction can no longer send a
- * notification for a finding that does not exist; and this class is the sole
- * owner of the "never throw after commit" rule the dispatcher's
- * `afterCommit` contract requires.
+ * notification for a finding that does not exist; and this class enforces the
+ * "never throw after commit" rule the dispatcher's `afterCommit` contract
+ * requires -- for its own delivery *and* for the inner consumer it forwards
+ * to, which it cannot assume is well behaved just because it should be.
  */
 export class NotifyingOutboxConsumer implements OutboxConsumer {
   private readonly inner: OutboxConsumer;
@@ -211,7 +212,47 @@ export class NotifyingOutboxConsumer implements OutboxConsumer {
     await this.inner.consume(message, repositories);
   }
 
+  /**
+   * Two independent side effects, run concurrently. Forwarding first made an
+   * `executor.unavailable` webhook wait for the inner consumer's unrelated
+   * model round trip -- up to the operator's whole run timeout
+   * (75-PHASE-7E step 3 review). Neither settles by rejecting; `allSettled`
+   * is belt and braces on top of that.
+   */
   async afterCommit(message: OutboxMessage): Promise<void> {
+    await Promise.allSettled([
+      this.forwardAfterCommit(message),
+      this.deliver(message),
+    ]);
+  }
+
+  /**
+   * The inner consumer owns its own deferred work (75-PHASE-7E step 3's
+   * non-faux operator run) and its own isolation, but this class cannot rely
+   * on that: a throw here reaches `pollOnce`, and from there the outbox
+   * worker's unawaited `run()`.
+   */
+  private async forwardAfterCommit(message: OutboxMessage): Promise<void> {
+    if (!this.inner.afterCommit) return;
+    const span = this.telemetry.startSpan('operator.notify.inner', {
+      eventType: message.event.type,
+    });
+    let forwardError: unknown;
+    try {
+      await this.inner.afterCommit(message);
+      span.setStatus('ok');
+    } catch (error) {
+      forwardError = error;
+      span.setStatus('error', error);
+    } finally {
+      span.setAttributes({
+        result: forwardError ? 'failure' : 'success',
+      });
+      span.end();
+    }
+  }
+
+  private async deliver(message: OutboxMessage): Promise<void> {
     if (!notifiableEventSet.has(message.event.type)) return;
 
     const span = this.telemetry.startSpan('operator.notify', {

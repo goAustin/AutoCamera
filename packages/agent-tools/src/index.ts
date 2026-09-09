@@ -729,6 +729,55 @@ export function createOperationalReadTools(
   return tools;
 }
 
+/**
+ * Terminal tool for a non-faux provider (75-PHASE-7E step 3): its
+ * parameters ARE `operationalRecommendationSchema`, so the model fills typed
+ * fields instead of narrating JSON prose. Deliberately a separate factory
+ * from `createOperationalReadTools` -- it has no side effects (it returns a
+ * value to the adapter and touches nothing durable) but it is not a read, so
+ * "the operator's read tools are reads only" stays a property a test can
+ * assert on `OPERATIONAL_TOOL_NAMES` / `createOperationalReadTools` alone.
+ */
+export const OPERATIONAL_SUBMISSION_TOOL_NAME = 'submit_recommendation';
+
+const submitRecommendationParams = typeBoxObject({
+  severity: Type.Union([
+    Type.Literal('info'),
+    Type.Literal('warning'),
+    Type.Literal('critical'),
+  ]),
+  recommendationCode: Type.String({
+    pattern: '^[A-Z0-9][A-Z0-9_.-]{0,63}$',
+  }),
+  title: Type.String({ maxLength: 240 }),
+  detail: Type.String({ maxLength: 2_000 }),
+  proposedActionType: Type.Union([
+    Type.Literal('retry_attempt'),
+    Type.Literal('open_workflow_revision'),
+    Type.Literal('wait_for_executor'),
+    Type.Literal('request_human_review'),
+    Type.Literal('no_action'),
+  ]),
+});
+
+/** Builds the one terminal, argument-only submission tool. No evidence access. */
+export function createOperationalSubmissionTool(): AgentTool {
+  return {
+    name: OPERATIONAL_SUBMISSION_TOOL_NAME,
+    label: 'Submit operational recommendation',
+    description:
+      'Submit the one bounded operational recommendation for this incident. Call this exactly once, after gathering evidence, with your final conclusion.',
+    parameters: submitRecommendationParams,
+    execute: async (_toolCallId, params) => ({
+      ...textResult({ ok: true, code: 'OK', data: params }),
+      // The caller (operator.ts) reads arguments straight off the tool-call
+      // content block, not this result -- but stopping the agent loop here,
+      // rather than after the read tools, is this field's job.
+      terminate: true,
+    }),
+  };
+}
+
 export const operationalRecommendationSchema = z
   .object({
     severity: z.enum(['info', 'warning', 'critical']),

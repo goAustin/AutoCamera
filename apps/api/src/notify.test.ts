@@ -99,9 +99,42 @@ class NoopConsumer implements OutboxConsumer {
   }
 }
 
+/** An inner consumer with its own deferred work, as the non-faux operator has since 7E step 3. */
+class DeferredWorkConsumer implements OutboxConsumer {
+  readonly afterCommitCalls: OutboxMessage[] = [];
+  async consume(): Promise<void> {}
+  async afterCommit(message: OutboxMessage): Promise<void> {
+    this.afterCommitCalls.push(message);
+  }
+}
+
 class ThrowingConsumer implements OutboxConsumer {
   async consume(): Promise<never> {
     throw new Error('operator consume failed');
+  }
+}
+
+/** Deferred work that stays pending until the test releases it. */
+class BlockingDeferredConsumer implements OutboxConsumer {
+  started = false;
+  private release: (() => void) | undefined;
+  private readonly gate = new Promise<void>((resolve) => {
+    this.release = resolve;
+  });
+  async consume(): Promise<void> {}
+  async afterCommit(): Promise<void> {
+    this.started = true;
+    await this.gate;
+  }
+  finish(): void {
+    this.release?.();
+  }
+}
+
+class ThrowingAfterCommitConsumer implements OutboxConsumer {
+  async consume(): Promise<void> {}
+  async afterCommit(): Promise<never> {
+    throw new Error('deferred operator run exploded');
   }
 }
 
@@ -146,6 +179,23 @@ describe('NotifyingOutboxConsumer', () => {
     expect(delivery.bodies).toHaveLength(1);
   });
 
+  it('forwards afterCommit to the inner consumer, so a non-faux operator run still completes when a webhook is also configured', async () => {
+    // 75-PHASE-7E-OPERATIONAL-INTELLIGENCE.md step 3: the non-faux operator
+    // defers its model call to its own afterCommit. Composing it under
+    // NotifyingOutboxConsumer (NOTIFY_WEBHOOK_URL set) must not silently
+    // drop that deferred work.
+    const inner = new DeferredWorkConsumer();
+    const delivery = new RecordingDelivery();
+    const consumer = new NotifyingOutboxConsumer({ inner, delivery });
+
+    const trigger = message(event('executor.unavailable'));
+    await consumer.afterCommit(trigger);
+
+    expect(inner.afterCommitCalls).toEqual([trigger]);
+    // The webhook still fires too -- forwarding is additive, not a replacement.
+    expect(delivery.bodies).toHaveLength(1);
+  });
+
   it('propagates an inner (operator) failure so the outbox retries the message', async () => {
     const inner = new ThrowingConsumer();
     const delivery = new RecordingDelivery();
@@ -155,6 +205,51 @@ describe('NotifyingOutboxConsumer', () => {
       consumer.consume(message(event('executor.unavailable'))),
     ).rejects.toThrow('operator consume failed');
     expect(delivery.bodies).toHaveLength(0);
+  });
+
+  it("delivers the webhook without waiting for the inner consumer's deferred work", async () => {
+    // 7E step 3 review: forwarding first made an executor.unavailable alert
+    // wait for an unrelated model round trip -- up to the operator's whole
+    // run timeout. The two side effects are independent and must not queue.
+    const inner = new BlockingDeferredConsumer();
+    const delivery = new RecordingDelivery();
+    const consumer = new NotifyingOutboxConsumer({ inner, delivery });
+
+    const pending = consumer.afterCommit(
+      message(event('executor.unavailable')),
+    );
+    // Let the microtask queue drain while the inner consumer is still blocked.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(inner.started).toBe(true);
+    expect(delivery.bodies).toHaveLength(1); // delivered, inner still pending
+
+    inner.finish();
+    await pending;
+    expect(delivery.bodies).toHaveLength(1);
+  });
+
+  it('resolves when the inner consumer throws from afterCommit, and still delivers', async () => {
+    // `afterCommit` must not throw: a rejection reaches OutboxDispatcher.pollOnce
+    // and from there the outbox worker's unawaited run(). This class cannot
+    // assume the inner consumer keeps that rule just because it should.
+    const telemetry = new InMemoryTelemetry();
+    const delivery = new RecordingDelivery();
+    const consumer = new NotifyingOutboxConsumer({
+      inner: new ThrowingAfterCommitConsumer(),
+      delivery,
+      telemetry,
+    });
+
+    await expect(
+      consumer.afterCommit(message(event('executor.unavailable'))),
+    ).resolves.toBeUndefined();
+    expect(delivery.bodies).toHaveLength(1);
+    const inner = telemetry
+      .getSpans()
+      .find((span) => span.name === 'operator.notify.inner');
+    expect(inner?.status).toBe('error');
+    expect(inner?.attributes.result).toBe('failure');
   });
 
   it('swallows a delivery failure -- afterCommit() still resolves and records it on a span', async () => {

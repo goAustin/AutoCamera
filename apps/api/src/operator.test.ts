@@ -19,7 +19,14 @@ import {
   DeterministicFakeComfyService,
   FakeComfyClient,
 } from '@h3/comfy-client';
-import { InMemoryTelemetry } from '@h3/telemetry';
+import { InMemoryTelemetry, MetricsRegistry } from '@h3/telemetry';
+import type { StreamFn } from '@earendil-works/pi-agent-core';
+import {
+  fauxAssistantMessage,
+  fauxProvider,
+  fauxToolCall,
+  type FauxResponseStep,
+} from '@earendil-works/pi-ai';
 import { DEV_TENANT_ID } from './application.js';
 import { buildApiApp } from './app.js';
 import {
@@ -109,6 +116,130 @@ async function setup(script?: FauxOperationalScript): Promise<TestApp> {
   };
 }
 
+/**
+ * Builds a `streamFnOverride` backed by a throwaway `fauxProvider()` -- the
+ * same public test double the faux path already trusts, replayed for a
+ * non-faux `provider` string so `runPi`'s non-faux branch runs for real with
+ * no network call (75-PHASE-7E-OPERATIONAL-INTELLIGENCE.md step 3). Faux's
+ * `streamSimple` does not validate the `model` it is called with against its
+ * own registered model -- it just replays the queued responses -- so this
+ * works regardless of what model shape the adapter constructs.
+ */
+function hostedStreamFn(
+  responses: readonly FauxResponseStep[],
+  onCall?: (...args: Parameters<StreamFn>) => void,
+): StreamFn {
+  const faux = fauxProvider({
+    provider: 'deepseek-test-stub',
+    models: [{ id: 'stub-model', name: 'stub-model' }],
+  });
+  faux.setResponses([...responses]);
+  return (model, context, options) => {
+    onCall?.(model, context, options);
+    return faux.provider.streamSimple(model, context, options);
+  };
+}
+
+/**
+ * Wraps a store so a test can observe how many transactions are open at any
+ * moment, and make one fail on demand. The depth reading is what proves the
+ * model call runs with none open (7E step 3 review, finding 3).
+ */
+interface TrackedStore {
+  readonly store: TransactionalStore;
+  readonly openDepth: () => number;
+  readonly opened: () => number;
+  failNextTransaction: boolean;
+}
+
+function trackTransactions(inner: TransactionalStore): TrackedStore {
+  let depth = 0;
+  let opened = 0;
+  const tracked: TrackedStore = {
+    store: {
+      withTransaction: async (work) => {
+        if (tracked.failNextTransaction) {
+          tracked.failNextTransaction = false;
+          throw new Error('simulated persistence failure');
+        }
+        depth += 1;
+        opened += 1;
+        try {
+          return await inner.withTransaction(work);
+        } finally {
+          depth -= 1;
+        }
+      },
+    },
+    openDepth: () => depth,
+    opened: () => opened,
+    failNextTransaction: false,
+  };
+  return tracked;
+}
+
+async function setupHosted(
+  streamFnOverride: StreamFn,
+  options?: {
+    readonly apiKey?: string;
+    readonly timeoutMs?: number;
+    readonly maxRunCostMicrousd?: number;
+    readonly maxRunTokens?: number;
+    readonly metrics?: MetricsRegistry;
+    readonly wrapStore?: (inner: TransactionalStore) => TransactionalStore;
+  },
+): Promise<TestApp> {
+  const inMemory = createInMemoryStore();
+  const store = options?.wrapStore ? options.wrapStore(inMemory) : inMemory;
+  const telemetry = new InMemoryTelemetry();
+  const comfy = new DeterministicFakeComfyService();
+  const adapter = new OperationalPiAdapter({
+    store,
+    tenantId: DEV_TENANT_ID,
+    idGenerator: testIds(),
+    telemetry,
+    provider: 'deepseek',
+    model: 'deepseek-v4-flash',
+    ...(options?.apiKey ? { apiKey: options.apiKey } : {}),
+    ...(options?.timeoutMs ? { timeoutMs: options.timeoutMs } : {}),
+    ...(options?.maxRunCostMicrousd !== undefined
+      ? { maxRunCostMicrousd: options.maxRunCostMicrousd }
+      : {}),
+    ...(options?.maxRunTokens !== undefined
+      ? { maxRunTokens: options.maxRunTokens }
+      : {}),
+    ...(options?.metrics ? { metrics: options.metrics } : {}),
+    streamFnOverride,
+    services: (repositories) =>
+      createOperationalToolServices(repositories, DEV_TENANT_ID, {
+        mode: 'fake',
+        getExecutorReadiness: async () => ({
+          mode: 'fake',
+          ready: true,
+          checkedAt: '2026-01-01T00:00:00.000Z',
+          capabilityFingerprint: 'test-fingerprint',
+        }),
+      }),
+  });
+  const app = buildApiApp({
+    store,
+    telemetry,
+    idGenerator: testIds(),
+    config: getApiConfig({ NODE_ENV: 'test', DEV_AUTH_TOKEN: 'test-token' }),
+    comfyClient: new FakeComfyClient(comfy),
+    operationalAdapter: adapter,
+  });
+  apps.push(app);
+  const values = internals(app);
+  return {
+    app,
+    store: inMemory,
+    telemetry,
+    dispatcher: values.operationalDispatcher,
+    adapter: values.operationalPiAdapter,
+  };
+}
+
 async function request(
   app: Awaited<ReturnType<typeof buildApiApp>>,
   options: InjectOptions,
@@ -174,6 +305,7 @@ async function appendEvent(
     readonly type: DomainEvent['type'];
     readonly shotId?: Uuid;
     readonly attemptId?: Uuid;
+    readonly traceId?: string;
     readonly payload?: Readonly<Record<string, unknown>>;
   },
 ): Promise<DomainEvent> {
@@ -185,6 +317,7 @@ async function appendEvent(
     projectId: input.projectId,
     ...(input.shotId ? { shotId: input.shotId } : {}),
     ...(input.attemptId ? { attemptId: input.attemptId } : {}),
+    ...(input.traceId ? { traceId: input.traceId } : {}),
     ...(input.payload ? { payload: input.payload } : {}),
     clock: { now: () => new Date('2026-01-01T00:00:00.000Z') },
   });
@@ -600,5 +733,540 @@ describe('Checkpoint 5 operational Pi adapter', () => {
     expect(await dispatcher.pollOnce()).toBe(true); // drains recommendation.created itself
     expect(await recommendations(store, projectId)).toHaveLength(1); // unchanged
     expect(await dispatcher.pollOnce()).toBe(false); // outbox now empty
+  });
+});
+
+const validRecommendationArgs = {
+  severity: 'critical',
+  recommendationCode: 'EXECUTOR_UNAVAILABLE',
+  title: 'Wait for the executor to recover',
+  detail: 'The execution service is unavailable; wait before retrying.',
+  proposedActionType: 'wait_for_executor',
+};
+
+describe('Phase 7E step 3: a non-faux provider via submit_recommendation', () => {
+  it('produces a finding straight from submit_recommendation arguments, carrying the resolved apiKey, with no text parsing', async () => {
+    const calls: Array<{ readonly apiKey: string | undefined }> = [];
+    const { app, store, dispatcher } = await setupHosted(
+      hostedStreamFn(
+        [
+          fauxAssistantMessage([
+            fauxToolCall('submit_recommendation', validRecommendationArgs),
+          ]),
+        ],
+        (_model, _context, options) => calls.push({ apiKey: options?.apiKey }),
+      ),
+      { apiKey: 'test-deepseek-key' },
+    );
+    const projectId = await createProject(app, 'hosted-tier1');
+    await drain(dispatcher);
+    const event = await appendEvent(store, {
+      projectId,
+      type: 'executor.unavailable',
+    });
+
+    expect(await dispatcher.pollOnce()).toBe(true);
+    const recommendation = (await recommendations(store, projectId))[0];
+    if (!recommendation) {
+      throw new Error('Expected a persisted recommendation.');
+    }
+    expect(recommendation).toMatchObject({
+      triggerEventId: event.id,
+      recommendationCode: 'EXECUTOR_UNAVAILABLE',
+      proposedActionType: 'wait_for_executor',
+      severity: 'critical',
+      status: 'pending',
+    });
+    const runs = await store.withTransaction((repositories) =>
+      repositories.agentRuns.listByProject(DEV_TENANT_ID, projectId),
+    );
+    expect(runs).toHaveLength(1);
+    expect(runs[0]).toMatchObject({
+      status: 'succeeded',
+      provider: 'deepseek',
+      model: 'deepseek-v4-flash',
+    });
+    expect(calls.length).toBeGreaterThan(0);
+    expect(calls.every((call) => call.apiKey === 'test-deepseek-key')).toBe(
+      true,
+    );
+  });
+
+  it('yields a finding from prose wrapped around a fenced JSON block (tier 2)', async () => {
+    const { app, store, dispatcher } = await setupHosted(
+      hostedStreamFn([
+        fauxAssistantMessage(
+          'Let me review the evidence.\n\nHere is my conclusion:\n```json\n' +
+            JSON.stringify(validRecommendationArgs) +
+            '\n```\nThat is my final answer.',
+        ),
+      ]),
+    );
+    const projectId = await createProject(app, 'hosted-tier2');
+    await drain(dispatcher);
+    const event = await appendEvent(store, {
+      projectId,
+      type: 'executor.unavailable',
+    });
+
+    expect(await dispatcher.pollOnce()).toBe(true);
+    const recommendation = (await recommendations(store, projectId))[0];
+    if (!recommendation) {
+      throw new Error('Expected a persisted recommendation.');
+    }
+    expect(recommendation).toMatchObject({
+      triggerEventId: event.id,
+      recommendationCode: 'EXECUTOR_UNAVAILABLE',
+      proposedActionType: 'wait_for_executor',
+      severity: 'critical',
+    });
+    const runs = await store.withTransaction((repositories) =>
+      repositories.agentRuns.listByProject(DEV_TENANT_ID, projectId),
+    );
+    expect(runs[0]?.status).toBe('succeeded');
+  });
+
+  it('falls back to defaultOutput() on unparseable prose, with the INVALID_STRUCTURED_OUTPUT failure code', async () => {
+    const { app, store, dispatcher } = await setupHosted(
+      hostedStreamFn([
+        fauxAssistantMessage('I am not going to return anything structured.'),
+      ]),
+    );
+    const projectId = await createProject(app, 'hosted-unparseable');
+    await drain(dispatcher);
+    await appendEvent(store, { projectId, type: 'executor.unavailable' });
+
+    expect(await dispatcher.pollOnce()).toBe(true);
+    const recommendation = (await recommendations(store, projectId))[0];
+    if (!recommendation) {
+      throw new Error('Expected the defaultOutput() fallback recommendation.');
+    }
+    // The default (faux-equivalent) content for `executor.unavailable`, not
+    // anything derived from the model's prose.
+    expect(recommendation.title).toBe('Wait for the executor to recover');
+    expect(recommendation.proposedActionType).toBe('wait_for_executor');
+    const runs = await store.withTransaction((repositories) =>
+      repositories.agentRuns.listByProject(DEV_TENANT_ID, projectId),
+    );
+    expect(runs[0]).toMatchObject({
+      status: 'failed',
+      failureCode: 'INVALID_STRUCTURED_OUTPUT',
+    });
+  });
+
+  it('falls back to defaultOutput() when submit_recommendation arguments violate the schema, never persisting the invalid proposal', async () => {
+    const { app, store, dispatcher } = await setupHosted(
+      hostedStreamFn([
+        fauxAssistantMessage([
+          fauxToolCall('submit_recommendation', {
+            ...validRecommendationArgs,
+            severity: 'not-a-real-severity',
+          }),
+        ]),
+      ]),
+    );
+    const projectId = await createProject(app, 'hosted-invalid-schema');
+    await drain(dispatcher);
+    await appendEvent(store, { projectId, type: 'executor.unavailable' });
+
+    expect(await dispatcher.pollOnce()).toBe(true);
+    const recommendation = (await recommendations(store, projectId))[0];
+    if (!recommendation) {
+      throw new Error('Expected the defaultOutput() fallback recommendation.');
+    }
+    expect(recommendation.title).toBe('Wait for the executor to recover');
+    // defaultOutput()'s own severity for this event, not the model's
+    // rejected value -- the invalid proposal never reaches this record.
+    expect(recommendation.severity).toBe('critical');
+    const runs = await store.withTransaction((repositories) =>
+      repositories.agentRuns.listByProject(DEV_TENANT_ID, projectId),
+    );
+    // Pi itself may reject a tool call whose arguments fail the tool's own
+    // TypeBox schema before `execute()` ever runs (surfacing as a stream
+    // error, PROVIDER_ERROR); if it lets the call through,
+    // `validateOperationalRecommendation`'s stricter Zod parse rejects it
+    // instead (INVALID_STRUCTURED_OUTPUT). Either is the correct outcome --
+    // what matters, and what every assertion above already proved, is that
+    // the invalid proposal never reaches `operational_recommendations`.
+    expect(['PROVIDER_ERROR', 'INVALID_STRUCTURED_OUTPUT']).toContain(
+      runs[0]?.failureCode,
+    );
+  });
+
+  it('falls back to defaultOutput() on a genuine provider error, with the PROVIDER_ERROR failure code', async () => {
+    const { app, store, dispatcher } = await setupHosted(
+      hostedStreamFn([
+        fauxAssistantMessage('', {
+          stopReason: 'error',
+          errorMessage: 'simulated provider failure',
+        }),
+      ]),
+    );
+    const projectId = await createProject(app, 'hosted-provider-error');
+    await drain(dispatcher);
+    await appendEvent(store, { projectId, type: 'executor.unavailable' });
+
+    expect(await dispatcher.pollOnce()).toBe(true);
+    const recommendation = (await recommendations(store, projectId))[0];
+    if (!recommendation) {
+      throw new Error('Expected the defaultOutput() fallback recommendation.');
+    }
+    expect(recommendation.title).toBe('Wait for the executor to recover');
+    const runs = await store.withTransaction((repositories) =>
+      repositories.agentRuns.listByProject(DEV_TENANT_ID, projectId),
+    );
+    expect(runs[0]).toMatchObject({
+      status: 'failed',
+      failureCode: 'PROVIDER_ERROR',
+    });
+  });
+
+  it('seeds the scoped identifiers into the prompt, and still denies an out-of-scope identifier the model supplies', async () => {
+    const calls: Array<{ readonly promptText: string }> = [];
+    const wrongShotId = testId();
+    const { app, store, dispatcher, telemetry } = await setupHosted(
+      hostedStreamFn(
+        [
+          // `createApprovedShot` below submits a deliberately invalid
+          // graph, which enqueues its own `workflow.revision.invalid`
+          // trigger (a genuine operational trigger); `drain` runs the model
+          // for it too, so this first response is consumed there, not by
+          // the `executor.unavailable` event this test actually cares
+          // about.
+          fauxAssistantMessage([
+            fauxToolCall('submit_recommendation', validRecommendationArgs),
+          ]),
+          fauxAssistantMessage([
+            fauxToolCall('get_shot_status', { shotId: wrongShotId }),
+          ]),
+          fauxAssistantMessage([
+            fauxToolCall('submit_recommendation', validRecommendationArgs),
+          ]),
+        ],
+        (_model, context) =>
+          calls.push({ promptText: JSON.stringify(context.messages) }),
+      ),
+    );
+    const { projectId, shotId } = await createApprovedShot(app, 'hosted-scope');
+    expect(wrongShotId).not.toBe(shotId);
+    await drain(dispatcher);
+    await appendEvent(store, {
+      projectId,
+      shotId,
+      type: 'executor.unavailable',
+    });
+
+    expect(await dispatcher.pollOnce()).toBe(true);
+    // calls[0] belongs to the drained workflow.revision.invalid trigger.
+    expect(calls[1]?.promptText).toContain(`projectId=${projectId}`);
+    expect(calls[1]?.promptText).toContain(`shotId=${shotId}`);
+
+    const denialEvents = telemetry
+      .getSpans()
+      .flatMap((span) => span.events)
+      .filter((candidate) => candidate.name === 'policy.denial');
+    expect(denialEvents).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          attributes: expect.objectContaining({ code: 'SHOT_SCOPE_DENIED' }),
+        }),
+      ]),
+    );
+
+    // Two recommendations exist for this project -- the drained
+    // workflow.revision.invalid trigger's, and the one this test cares
+    // about -- so select by code rather than assuming array order.
+    const recommendation = (await recommendations(store, projectId)).find(
+      (candidate) => candidate.recommendationCode === 'EXECUTOR_UNAVAILABLE',
+    );
+    if (!recommendation) {
+      throw new Error('Expected the run to still complete after the denial.');
+    }
+    const runs = await store.withTransaction((repositories) =>
+      repositories.agentRuns.listByProject(DEV_TENANT_ID, projectId),
+    );
+    const run = runs.find(
+      (candidate) => candidate.id === recommendation.piAgentRunId,
+    );
+    expect(run?.status).toBe('succeeded');
+  });
+
+  it('splits the claim from the model call: phase 1 commits a running run with no recommendation yet', async () => {
+    const { app, store, adapter } = await setupHosted(
+      hostedStreamFn([
+        fauxAssistantMessage([
+          fauxToolCall('submit_recommendation', validRecommendationArgs),
+        ]),
+      ]),
+    );
+    const projectId = await createProject(app, 'hosted-phase-split');
+    const event = await appendEvent(store, {
+      projectId,
+      type: 'executor.unavailable',
+    });
+
+    // Phase 1: the same call `OperationalOutboxConsumer.consume` makes
+    // inside the claim transaction.
+    const phase1 = await store.withTransaction((repositories) =>
+      adapter.processEventInTransaction(repositories, event),
+    );
+    expect(phase1).toMatchObject({ handled: true, duplicate: false });
+    expect(phase1.recommendation).toBeUndefined();
+    expect(await recommendations(store, projectId)).toEqual([]);
+    const runsAfterPhase1 = await store.withTransaction((repositories) =>
+      repositories.agentRuns.listByProject(DEV_TENANT_ID, projectId),
+    );
+    expect(runsAfterPhase1).toHaveLength(1);
+    expect(runsAfterPhase1[0]?.status).toBe('running');
+
+    // Phase 2: the same call `OperationalOutboxConsumer.afterCommit` makes,
+    // once the claim transaction above has already committed -- proven for
+    // real, against PostgreSQL, in
+    // apps/api/src/operator.deferred.integration.test.ts.
+    await adapter.completeDeferredRun(event);
+
+    const recommendation = (await recommendations(store, projectId))[0];
+    if (!recommendation) {
+      throw new Error('Expected completeDeferredRun to finish the job.');
+    }
+    expect(recommendation.recommendationCode).toBe('EXECUTOR_UNAVAILABLE');
+    const runsAfterPhase2 = await store.withTransaction((repositories) =>
+      repositories.agentRuns.listByProject(DEV_TENANT_ID, projectId),
+    );
+    expect(runsAfterPhase2[0]?.status).toBe('succeeded');
+  });
+
+  it('never runs the model twice for one trigger: completeDeferredRun is a no-op once a recommendation exists', async () => {
+    const calls: number[] = [];
+    const { app, store, dispatcher } = await setupHosted(
+      hostedStreamFn(
+        [
+          fauxAssistantMessage([
+            fauxToolCall('submit_recommendation', validRecommendationArgs),
+          ]),
+        ],
+        () => calls.push(1),
+      ),
+    );
+    const projectId = await createProject(app, 'hosted-no-double-run');
+    await drain(dispatcher);
+    const event = await appendEvent(store, {
+      projectId,
+      type: 'executor.unavailable',
+    });
+
+    expect(await dispatcher.pollOnce()).toBe(true);
+    expect(calls).toHaveLength(1);
+    const first = (await recommendations(store, projectId))[0];
+    if (!first) throw new Error('Expected a persisted recommendation.');
+
+    const internalsApp = app as unknown as {
+      readonly operationalPiAdapter: {
+        completeDeferredRun(event: DomainEvent): Promise<void>;
+      };
+    };
+    await internalsApp.operationalPiAdapter.completeDeferredRun(event);
+
+    expect(calls).toHaveLength(1); // no second model call
+    const after = await recommendations(store, projectId);
+    expect(after).toHaveLength(1);
+    expect(after[0]?.id).toBe(first.id);
+  });
+});
+
+describe('Phase 7E step 3 review: deferred-run isolation and bounds', () => {
+  it('calls the model with no transaction open, and opens a short one per tool call', async () => {
+    // Finding 3. Moving the call out of the *claim* transaction was only half
+    // the `OutboxConsumer.afterCommit` contract; it still ran inside a
+    // transaction of its own, leaving a PostgreSQL session idle in
+    // transaction and a pooled connection held for the whole round trip.
+    let tracked: TrackedStore | undefined;
+    const depthAtStreamTime: number[] = [];
+    const openedBeforeStream: number[] = [];
+    const { app, store, dispatcher } = await setupHosted(
+      hostedStreamFn(
+        [
+          fauxAssistantMessage([fauxToolCall('get_project_status', {})]),
+          fauxAssistantMessage([
+            fauxToolCall('submit_recommendation', validRecommendationArgs),
+          ]),
+        ],
+        () => {
+          depthAtStreamTime.push(tracked?.openDepth() ?? -1);
+          openedBeforeStream.push(tracked?.opened() ?? -1);
+        },
+      ),
+      {
+        wrapStore: (inner) => {
+          tracked = trackTransactions(inner);
+          return tracked.store;
+        },
+      },
+    );
+    const projectId = await createProject(app, 'deferred-no-txn');
+    await drain(dispatcher);
+    await appendEvent(store, { projectId, type: 'executor.unavailable' });
+
+    expect(await dispatcher.pollOnce()).toBe(true);
+
+    // Two turns, and no transaction was open during either of them.
+    expect(depthAtStreamTime).toEqual([0, 0]);
+    // The read tool between them still reached the database -- in a short
+    // transaction of its own, opened and committed between the two turns.
+    const [firstTurn, secondTurn] = openedBeforeStream;
+    expect(secondTurn).toBeGreaterThan(firstTurn as number);
+    expect(
+      (await recommendations(store, projectId))[0]?.recommendationCode,
+    ).toBe('EXECUTOR_UNAVAILABLE');
+  });
+
+  it('records a failure metric and stays silent-free when the deferred run cannot persist', async () => {
+    // Finding 4. The design deliberately leaves the run 'running' with nothing
+    // to retry, so this counter is the only signal that a finding was lost:
+    // there is no logger here, BufferedSpan.setStatus drops the error object,
+    // and with no OTLP endpoint no span is exported at all.
+    const metrics = new MetricsRegistry();
+    let tracked: TrackedStore | undefined;
+    const { app, store, dispatcher } = await setupHosted(
+      hostedStreamFn(
+        [
+          fauxAssistantMessage([
+            fauxToolCall('submit_recommendation', validRecommendationArgs),
+          ]),
+        ],
+        // The next transaction after the model call is the one that persists.
+        () => {
+          if (tracked) tracked.failNextTransaction = true;
+        },
+      ),
+      {
+        metrics,
+        wrapStore: (inner) => {
+          tracked = trackTransactions(inner);
+          return tracked.store;
+        },
+      },
+    );
+    const projectId = await createProject(app, 'deferred-persist-fails');
+    await drain(dispatcher);
+    const event = await appendEvent(store, {
+      projectId,
+      type: 'executor.unavailable',
+    });
+
+    // afterCommit must not throw, whatever happens inside it.
+    await expect(dispatcher.pollOnce()).resolves.toBe(true);
+
+    expect(await recommendations(store, projectId)).toEqual([]);
+    const run = await store.withTransaction((repositories) =>
+      repositories.agentRuns.findById(DEV_TENANT_ID, event.id),
+    );
+    expect(run?.status).toBe('running'); // visibly stuck, as designed
+    expect(
+      metrics
+        .snapshot()
+        .find(
+          (entry) =>
+            entry.name === 'pi_agent_runs_total' &&
+            entry.labels.status === 'failure' &&
+            entry.labels.run_type === 'operator',
+        )?.value,
+    ).toBe(1);
+  });
+
+  it('continues the trigger event trace into the deferred run span', async () => {
+    const traceId = 'a'.repeat(32);
+    const { app, store, telemetry, dispatcher } = await setupHosted(
+      hostedStreamFn([
+        fauxAssistantMessage([
+          fauxToolCall('submit_recommendation', validRecommendationArgs),
+        ]),
+      ]),
+    );
+    const projectId = await createProject(app, 'deferred-trace');
+    await drain(dispatcher);
+    await appendEvent(store, {
+      projectId,
+      type: 'executor.unavailable',
+      traceId,
+    });
+
+    expect(await dispatcher.pollOnce()).toBe(true);
+    const deferred = telemetry
+      .getSpans()
+      .find((span) => span.name === 'operator.deferred_run');
+    // Without this the deferred work detaches from the trigger's trace, unlike
+    // every other operator span.
+    expect(deferred?.traceId).toBe(traceId);
+    expect(deferred?.attributes.result).toBe('success');
+  });
+
+  it('stops a run that keeps calling tools once it has spent its budget', async () => {
+    // Pi ends the loop when the model stops calling tools and has no iteration
+    // cap of its own, so an unbounded caller is bounded only by the wall clock.
+    // Bound the spend instead, which is what the risk actually is. The limit is
+    // set to 1 token so the assertion does not depend on faux's token estimate.
+    const turns: number[] = [];
+    const readCall = () =>
+      fauxAssistantMessage([fauxToolCall('get_project_status', {})]);
+    const { app, store, telemetry, dispatcher } = await setupHosted(
+      hostedStreamFn(
+        [
+          readCall(),
+          readCall(),
+          readCall(),
+          readCall(),
+          readCall(),
+          readCall(),
+        ],
+        () => turns.push(1),
+      ),
+      { maxRunTokens: 1 },
+    );
+    const projectId = await createProject(app, 'deferred-budget-cap');
+    await drain(dispatcher);
+    await appendEvent(store, { projectId, type: 'executor.unavailable' });
+
+    expect(await dispatcher.pollOnce()).toBe(true);
+
+    // One turn, not the six the stub scripted.
+    expect(turns).toHaveLength(1);
+    const exhausted = telemetry
+      .getSpans()
+      .flatMap((span) => span.events)
+      .filter((candidate) => candidate.name === 'run.budget_exhausted');
+    expect(exhausted).toHaveLength(1);
+    expect(exhausted[0]?.attributes.outcome).toBe('tokens');
+    expect(exhausted[0]?.attributes.max).toBe(1);
+    // The model never submitted, so the finding is the documented fallback.
+    expect((await recommendations(store, projectId))[0]?.title).toBe(
+      'Wait for the executor to recover',
+    );
+  });
+
+  it('runs every turn the model asks for when no budget is configured', async () => {
+    // The counterpart to the case above: the bound must not fire on its own.
+    // faux reports no cost at all, so a cost-only ceiling would never engage --
+    // which is why the token limit exists next to it.
+    const turns: number[] = [];
+    const readCall = () =>
+      fauxAssistantMessage([fauxToolCall('get_project_status', {})]);
+    const { app, store, telemetry, dispatcher } = await setupHosted(
+      hostedStreamFn([readCall(), readCall(), readCall()], () => turns.push(1)),
+      { maxRunCostMicrousd: 0, maxRunTokens: 0 },
+    );
+    const projectId = await createProject(app, 'deferred-no-cap');
+    await drain(dispatcher);
+    await appendEvent(store, { projectId, type: 'executor.unavailable' });
+
+    expect(await dispatcher.pollOnce()).toBe(true);
+
+    expect(turns.length).toBeGreaterThanOrEqual(3);
+    expect(
+      telemetry
+        .getSpans()
+        .flatMap((span) => span.events)
+        .filter((candidate) => candidate.name === 'run.budget_exhausted'),
+    ).toHaveLength(0);
   });
 });

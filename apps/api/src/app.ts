@@ -1883,11 +1883,14 @@ export function buildApiApp(options: ApiAppOptions = {}): FastifyInstance {
       tenantId: DEV_TENANT_ID,
       clock,
       idGenerator,
-      // The operational loop is always safe to run offline. A hosted provider
-      // may be used by the separate planning adapter, but it is not required
-      // to produce a bounded operational recommendation.
-      provider: 'faux',
-      model: 'h3-videoops-operator-v1',
+      // Configured, not hardcoded, since Phase 7E step 3: PI_PROVIDER
+      // defaults to 'faux' (always safe to run offline, no key required),
+      // and an operator can opt into a real provider -- DeepSeek is the
+      // supported one -- by setting PI_PROVIDER/PI_MODEL/PI_API_KEY (or
+      // DEEPSEEK_API_KEY) in the environment.
+      provider: config.piProvider,
+      model: config.piModel,
+      ...(config.piApiKey ? { apiKey: config.piApiKey } : {}),
       telemetry,
       metrics,
       services: (repositories) =>

@@ -53,13 +53,21 @@ export const environmentSchema = z.object({
   COMFY_CLIENT_ID_PREFIX: z.string().trim().min(1).default('h3-dev'),
   GPU_WORKER_ID: z.string().trim().min(1).default('local-worker-1'),
   PI_PROVIDER: z.string().trim().min(1).default('faux'),
-  PI_MODEL: z.string().trim().min(1).default('h3-videoops-storyboard-v1'),
+  PI_MODEL: z.string().trim().min(1).default('h3-videoops-operator-v1'),
   PI_MAX_CONCURRENT_RUNS: positiveInteger.default(1),
   PI_API_KEY: z.preprocess(
     (value: unknown) => (value === '' ? undefined : value),
     z.string().trim().min(1).optional(),
   ),
   PI_BASE_URL: optionalUrl,
+  // Fallback source for PI_API_KEY when PI_PROVIDER=deepseek
+  // (75-PHASE-7E-OPERATIONAL-INTELLIGENCE.md step 3): matches the
+  // environment the operator already has instead of requiring a second,
+  // redundantly-named key.
+  DEEPSEEK_API_KEY: z.preprocess(
+    (value: unknown) => (value === '' ? undefined : value),
+    z.string().trim().min(1).optional(),
+  ),
   ATTEMPT_LEASE_SECONDS: positiveInteger.default(60),
   ATTEMPT_TIMEOUT_SECONDS: positiveInteger.default(300),
   PROJECT_DEFAULT_BUDGET_USD: z
@@ -112,7 +120,15 @@ export function parseEnvironment(raw: NodeJS.ProcessEnv): Environment {
     throw new ConfigurationError(['DEV_AUTH_TOKEN']);
   }
 
-  if (result.data.PI_PROVIDER !== 'faux' && !result.data.PI_API_KEY) {
+  const fallbackDeepseekKey =
+    result.data.PI_PROVIDER === 'deepseek'
+      ? result.data.DEEPSEEK_API_KEY
+      : undefined;
+  if (
+    result.data.PI_PROVIDER !== 'faux' &&
+    !result.data.PI_API_KEY &&
+    !fallbackDeepseekKey
+  ) {
     throw new ConfigurationError(['PI_API_KEY']);
   }
 
@@ -191,6 +207,15 @@ export interface ApiConfig {
 
 export function getApiConfig(raw: NodeJS.ProcessEnv = process.env): ApiConfig {
   const environment = parseEnvironment(raw);
+  // PI_API_KEY wins when set; DEEPSEEK_API_KEY is a fallback source used only
+  // when PI_PROVIDER=deepseek (75-PHASE-7E-OPERATIONAL-INTELLIGENCE.md step
+  // 3). Resolved once, here, so nothing downstream reads either env var
+  // directly.
+  const resolvedPiApiKey =
+    environment.PI_API_KEY ??
+    (environment.PI_PROVIDER === 'deepseek'
+      ? environment.DEEPSEEK_API_KEY
+      : undefined);
   const config: ApiConfig = {
     nodeEnv: environment.NODE_ENV,
     logLevel: environment.LOG_LEVEL,
@@ -220,7 +245,7 @@ export function getApiConfig(raw: NodeJS.ProcessEnv = process.env): ApiConfig {
 
   if (
     environment.COMFY_AUTH_TOKEN ||
-    environment.PI_API_KEY ||
+    resolvedPiApiKey ||
     environment.PI_BASE_URL ||
     environment.OTEL_EXPORTER_OTLP_ENDPOINT ||
     environment.NOTIFY_WEBHOOK_URL
@@ -230,7 +255,7 @@ export function getApiConfig(raw: NodeJS.ProcessEnv = process.env): ApiConfig {
       ...(environment.COMFY_AUTH_TOKEN
         ? { comfyAuthToken: environment.COMFY_AUTH_TOKEN }
         : {}),
-      ...(environment.PI_API_KEY ? { piApiKey: environment.PI_API_KEY } : {}),
+      ...(resolvedPiApiKey ? { piApiKey: resolvedPiApiKey } : {}),
       ...(environment.PI_BASE_URL
         ? { piBaseUrl: environment.PI_BASE_URL }
         : {}),

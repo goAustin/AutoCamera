@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import {
+  OPERATIONAL_SUBMISSION_TOOL_NAME,
   OPERATIONAL_TOOL_NAMES,
   createOperationalReadTools,
+  createOperationalSubmissionTool,
   type OperationalToolServices,
 } from './index.js';
 
@@ -162,5 +164,37 @@ describe('operational Pi read-only tools', () => {
     expect(serialized).not.toContain('prompt');
     expect(serialized).not.toContain('graph_json');
     expect(serialized).not.toContain('artifact');
+  });
+
+  it('never mixes the submission tool into the read-only tool set', () => {
+    // 75-PHASE-7E-OPERATIONAL-INTELLIGENCE.md step 3: "createOperationalReadTools
+    // returns exactly the six read tools; the submission tool is defined by
+    // a separate factory" -- kept a literally checkable property, not a
+    // judgement call.
+    const names = createOperationalReadTools({
+      tenantId,
+      projectId,
+      services: services(),
+    }).map((candidate) => candidate.name);
+    expect(names).toEqual(OPERATIONAL_TOOL_NAMES);
+    expect(names).not.toContain(OPERATIONAL_SUBMISSION_TOOL_NAME);
+  });
+});
+
+describe('operational Pi submission tool', () => {
+  it('is a terminal tool whose parameters are the recommendation schema', async () => {
+    const tool = createOperationalSubmissionTool();
+    expect(tool.name).toBe(OPERATIONAL_SUBMISSION_TOOL_NAME);
+
+    const args = {
+      severity: 'critical',
+      recommendationCode: 'EXECUTOR_UNAVAILABLE',
+      title: 'Wait for the executor to recover',
+      detail: 'The execution service is unavailable.',
+      proposedActionType: 'wait_for_executor',
+    };
+    const result = await tool.execute('call-1', args);
+    expect(result.terminate).toBe(true);
+    expect(result.details).toMatchObject({ ok: true, code: 'OK', data: args });
   });
 });

@@ -14,9 +14,12 @@ import {
   type AssistantMessage,
   type Model,
 } from '@earendil-works/pi-ai';
+import { deepseekProvider } from '@earendil-works/pi-ai/providers/deepseek';
 import {
   createOperationalReadTools,
+  createOperationalSubmissionTool,
   validateOperationalRecommendation,
+  OPERATIONAL_SUBMISSION_TOOL_NAME,
   type OperationalAttemptToolView,
   type OperationalExecutorToolView,
   type OperationalIncidentToolView,
@@ -101,11 +104,34 @@ export interface OperationalPiAdapterOptions {
   readonly idGenerator?: IdGenerator;
   readonly provider?: string;
   readonly model?: string;
+  /** Required for any non-faux `provider`; resolved by `packages/config`. */
+  readonly apiKey?: string;
   readonly producer?: string;
   readonly telemetry?: AgentTelemetry;
   readonly metrics?: MetricsRegistry;
   readonly services: OperationalToolServiceFactory;
   readonly script?: FauxOperationalScript;
+  /** Non-faux run timeout. Ignored for `provider: 'faux'`, which uses `script.timeoutMs`. */
+  readonly timeoutMs?: number;
+  /**
+   * Cumulative provider spend, in microusd, after which a non-faux run stops
+   * at the next turn boundary. Pi's loop ends when the model stops calling
+   * tools and has no iteration cap of its own, so without this the only bound
+   * on a run that keeps calling tools is `timeoutMs`. Zero disables it.
+   */
+  readonly maxRunCostMicrousd?: number;
+  /**
+   * The same bound in tokens, for a provider that reports no cost. Zero
+   * disables it. Either limit stops the run.
+   */
+  readonly maxRunTokens?: number;
+  /**
+   * Test-only. When set, bypasses real provider construction for a non-faux
+   * `provider` -- the agent streams through this function instead of a real
+   * DeepSeek connection. No test in this checkpoint may make a paid network
+   * call (75-PHASE-7E-OPERATIONAL-INTELLIGENCE.md step 3).
+   */
+  readonly streamFnOverride?: StreamFn;
 }
 
 export interface OperationalPiProcessResult {
@@ -508,6 +534,31 @@ interface OperatorRunResult {
   readonly providerCostMicrousd: number;
 }
 
+/** Durable evidence views. Plain data -- safe to hold across a commit. */
+interface ResolvedOperationalViews {
+  readonly project: OperationalProjectToolView;
+  readonly shot?: OperationalShotToolView;
+  readonly attempt?: OperationalAttemptToolView;
+  readonly revision?: OperationalWorkflowRevisionToolView;
+}
+
+/**
+ * Views plus the tool services that resolved them. `services` is bound to one
+ * set of `Repositories`, and therefore to one transaction, so it must never
+ * outlive it. The deferred path keeps only the views across its commit and
+ * rebuilds services against the store (`storeBackedServices`).
+ */
+interface ResolvedOperationalEvidence extends ResolvedOperationalViews {
+  readonly services: OperationalToolServices;
+}
+
+/** What `runModel` produces, before anything is written. */
+interface OperatorModelOutcome {
+  readonly runResult: OperatorRunResult | undefined;
+  readonly runError: unknown;
+  readonly startedAt: number;
+}
+
 export class OperationalPiAdapter {
   readonly store: TransactionalStore;
   readonly tenantId: Uuid;
@@ -515,11 +566,16 @@ export class OperationalPiAdapter {
   readonly idGenerator: IdGenerator;
   readonly provider: string;
   readonly modelName: string;
+  readonly apiKey: string | undefined;
   readonly producer: string;
   readonly telemetry: AgentTelemetry;
   readonly metrics: MetricsRegistry | undefined;
   readonly services: OperationalToolServiceFactory;
   readonly script: FauxOperationalScript | undefined;
+  readonly timeoutMs: number;
+  readonly maxRunCostMicrousd: number;
+  readonly maxRunTokens: number;
+  readonly streamFnOverride: StreamFn | undefined;
 
   constructor(options: OperationalPiAdapterOptions) {
     this.store = options.store;
@@ -532,13 +588,31 @@ export class OperationalPiAdapter {
     };
     this.provider = options.provider ?? 'faux';
     this.modelName = options.model ?? 'h3-videoops-operator-v1';
+    this.apiKey = options.apiKey;
     this.producer = options.producer ?? 'h3-operator';
     this.telemetry = options.telemetry ?? new InMemoryTelemetry();
     this.metrics = options.metrics;
     this.services = options.services;
     this.script = options.script;
+    this.timeoutMs = Math.max(100, options.timeoutMs ?? 30_000);
+    // ~100x the $0.0005 the phase doc's spike recorded per finding.
+    this.maxRunCostMicrousd = Math.max(0, options.maxRunCostMicrousd ?? 50_000);
+    this.maxRunTokens = Math.max(0, options.maxRunTokens ?? 200_000);
+    this.streamFnOverride = options.streamFnOverride;
   }
 
+  /**
+   * Processes one event in a transaction of its own.
+   *
+   * For a non-faux provider this is only the **first half**: it commits an
+   * `agent_runs` row with status 'running' and returns `handled: true` with no
+   * `recommendation`. `completeDeferredRun` -- which
+   * `OperationalOutboxConsumer.afterCommit` calls once that transaction has
+   * committed -- runs the model and persists the finding. A caller that needs
+   * the finding must call both, in that order. `faux` still completes fully
+   * here, which is why callers asserting on `result.recommendation` keep
+   * working under the default provider.
+   */
   async processEvent(event: DomainEvent): Promise<OperationalPiProcessResult> {
     return this.store.withTransaction((repositories) =>
       this.processEventInTransaction(repositories, event),
@@ -578,76 +652,9 @@ export class OperationalPiAdapter {
       };
     }
 
-    const services = this.services(repositories);
-    const project = await services.getProjectStatus(
-      this.tenantId,
-      event.projectId,
-    );
-    if (!project || project.id !== event.projectId) {
-      return {
-        handled: false,
-        duplicate: false,
-        reason: 'resource_not_found',
-      };
-    }
-
-    const revisionId = eventPayloadUuid(event, 'workflowRevisionId');
-    const hasShot = event.shotId
-      ? await services.getShotStatus(
-          this.tenantId,
-          event.projectId,
-          event.shotId,
-        )
-      : undefined;
-    if (event.shotId && (!hasShot || hasShot.projectId !== event.projectId)) {
-      return {
-        handled: false,
-        duplicate: false,
-        reason: 'resource_not_found',
-      };
-    }
-
-    const hasAttempt = event.attemptId
-      ? await services.getAttemptStatus(
-          this.tenantId,
-          event.projectId,
-          event.attemptId,
-        )
-      : undefined;
-    if (
-      event.attemptId &&
-      (!hasAttempt ||
-        hasAttempt.projectId !== event.projectId ||
-        (event.shotId !== undefined && hasAttempt.shotId !== event.shotId))
-    ) {
-      return {
-        handled: false,
-        duplicate: false,
-        reason: 'resource_not_found',
-      };
-    }
-
-    const hasRevision =
-      revisionId && event.shotId
-        ? await services.getWorkflowRevisionValidation(
-            this.tenantId,
-            event.projectId,
-            event.shotId,
-            revisionId,
-          )
-        : undefined;
-    if (
-      revisionId &&
-      event.shotId &&
-      (!hasRevision ||
-        hasRevision.projectId !== event.projectId ||
-        hasRevision.shotId !== event.shotId)
-    ) {
-      return {
-        handled: false,
-        duplicate: false,
-        reason: 'resource_not_found',
-      };
+    const resolved = await this.resolveEvidence(repositories, event);
+    if (!resolved.ok) {
+      return { handled: false, duplicate: false, reason: 'resource_not_found' };
     }
 
     const runId = event.id;
@@ -679,6 +686,338 @@ export class OperationalPiAdapter {
       await repositories.agentRuns.create(run);
     }
 
+    if (this.provider !== 'faux') {
+      // Defer the model call to `afterCommit`, once this claim transaction
+      // has released the outbox row (75-PHASE-7E-OPERATIONAL-INTELLIGENCE.md
+      // step 3). The 'running' row above is already durable and visible;
+      // `completeDeferredRun` finishes the job in a transaction of its own.
+      // `faux` is exempt: it is a synchronous, free table lookup, and every
+      // existing test depends on it completing inline, in this transaction.
+      return { handled: true, duplicate: false, agentRun: run };
+    }
+
+    return this.completeRun(
+      repositories,
+      event,
+      recommendationCode,
+      run,
+      resolved,
+    );
+  }
+
+  /**
+   * Finishes a non-faux run whose 'running' `agent_runs` row was committed
+   * by `processEventInTransaction` above. Called from
+   * `OperationalOutboxConsumer.afterCommit`, after the claim transaction has
+   * committed (75-PHASE-7E-OPERATIONAL-INTELLIGENCE.md step 3).
+   *
+   * The provider round trip runs with **no transaction open at all**, not
+   * merely outside the outbox transaction: `runDeferred` commits its evidence
+   * read before calling the model and opens a second short transaction to
+   * persist the result. That is both halves of the `OutboxConsumer.afterCommit`
+   * contract in `packages/db/src/index.ts` -- the claimed row's lock and the
+   * pooled connection -- rather than only the first.
+   *
+   * Must never throw: `afterCommit`'s contract requires it, and the trigger
+   * message is already delivered, so there is nothing left to retry for it --
+   * a failure here leaves the run visibly 'running' rather than losing it
+   * silently, which is a deliberate trade against ever re-running a paid
+   * model call for the same event. `pi_agent_runs_total{status="failure"}` is
+   * incremented so that "visibly" means something outside the row itself.
+   */
+  async completeDeferredRun(event: DomainEvent): Promise<void> {
+    if (this.provider === 'faux' || !isOperationalTrigger(event)) return;
+    if (event.tenantId !== this.tenantId || !event.projectId) return;
+
+    const startedAt = Date.now();
+    const span = this.startDeferredSpan(event);
+    let deferredError: unknown;
+    try {
+      await this.runDeferred(event);
+    } catch (error) {
+      deferredError = error;
+    }
+    this.recordDeferredOutcome(span, deferredError, Date.now() - startedAt);
+  }
+
+  /** Never throws -- the `afterCommit` contract holds even if telemetry fails. */
+  private startDeferredSpan(
+    event: DomainEvent,
+  ): TelemetrySpanHandle | undefined {
+    try {
+      const attributes = { eventType: event.type };
+      return this.telemetry.startRootSpan
+        ? this.telemetry.startRootSpan(
+            'operator.deferred_run',
+            attributes,
+            event.traceId as TraceId | undefined,
+          )
+        : this.telemetry.startSpan('operator.deferred_run', attributes);
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Never throws. See `completeDeferredRun`. */
+  private recordDeferredOutcome(
+    span: TelemetrySpanHandle | undefined,
+    deferredError: unknown,
+    durationMs: number,
+  ): void {
+    try {
+      span?.setStatus(deferredError ? 'error' : 'ok', deferredError);
+      span?.setAttributes({
+        result: deferredError ? 'failure' : 'success',
+        durationMs: Math.max(0, durationMs),
+        // The error object itself is dropped by `BufferedSpan.setStatus`, and
+        // with no OTLP endpoint no span is exported at all -- so the code has
+        // to be an attribute, and the counter below has to exist.
+        ...(deferredError
+          ? { failureCode: failureCodeFor(deferredError) }
+          : {}),
+      });
+      span?.end();
+    } catch {
+      // Telemetry cannot break the `afterCommit` contract.
+    }
+    if (!deferredError) return;
+    try {
+      this.metrics?.increment('pi_agent_runs_total', {
+        run_type: 'operator',
+        status: 'failure',
+        provider: 'hosted',
+      });
+    } catch {
+      // Metrics are diagnostic and cannot change the outcome.
+    }
+  }
+
+  /**
+   * Three phases, so the model call holds nothing:
+   * 1. a short transaction re-checks the guards and reads the evidence;
+   * 2. the model call, with no transaction and no pooled connection;
+   * 3. a short transaction persists the run, the finding, and its event.
+   *
+   * Phase 3 needs no repeat of phase 1's guards: `agentRuns.update` is an
+   * optimistic-concurrency write against the version phase 1 read, and the
+   * recommendation's unique trigger-and-code index covers the other race, so
+   * a concurrent winner aborts this transaction instead of double-writing.
+   */
+  private async runDeferred(
+    event: DomainEvent & { readonly type: OperationalTriggerEventType },
+  ): Promise<void> {
+    const recommendationCode = recommendationCodeFor(event);
+
+    const prepared = await this.store.withTransaction(async (repositories) => {
+      const existing =
+        await repositories.operationalRecommendations.findByTriggerEventAndCode(
+          this.tenantId,
+          event.id,
+          recommendationCode,
+        );
+      // Already finished (or this event was never a fresh trigger to begin
+      // with) -- nothing left to do.
+      if (existing) return undefined;
+
+      const run = await repositories.agentRuns.findById(
+        this.tenantId,
+        event.id,
+      );
+      if (run?.status !== 'running') return undefined;
+
+      const resolved = await this.resolveEvidence(repositories, event);
+      if (!resolved.ok) return undefined;
+
+      // Keep the views, drop `resolved.services`: it is bound to this
+      // transaction, which commits as soon as this callback returns.
+      const views: ResolvedOperationalViews = {
+        project: resolved.project,
+        ...(resolved.shot ? { shot: resolved.shot } : {}),
+        ...(resolved.attempt ? { attempt: resolved.attempt } : {}),
+        ...(resolved.revision ? { revision: resolved.revision } : {}),
+      };
+      return { run, views };
+    });
+    if (!prepared) return;
+
+    const outcome = await this.runModel(event, {
+      ...prepared.views,
+      services: this.storeBackedServices(),
+    });
+
+    await this.store.withTransaction((repositories) =>
+      this.persistOutcome(
+        repositories,
+        event,
+        recommendationCode,
+        prepared.run,
+        prepared.views,
+        outcome,
+      ),
+    );
+  }
+
+  /**
+   * The same read tools, each in a short transaction of its own, so the agent
+   * loop holds no pooled connection between tool calls. Used only by the
+   * deferred path; the `faux` path keeps its single-transaction services.
+   *
+   * `getExecutorReadiness` is the one case still holding a connection across a
+   * network call -- it reaches ComfyUI, not PostgreSQL, and the factory
+   * signature requires `Repositories` to build it. It is bounded by
+   * `COMFY_REQUEST_TIMEOUT_MS`, and is reached only for executor triggers.
+   */
+  private storeBackedServices(): OperationalToolServices {
+    const inTransaction = <Result>(
+      work: (services: OperationalToolServices) => Promise<Result>,
+    ): Promise<Result> =>
+      this.store.withTransaction((repositories) =>
+        work(this.services(repositories)),
+      );
+    return {
+      getProjectStatus: (tenantId, projectId) =>
+        inTransaction((services) =>
+          services.getProjectStatus(tenantId, projectId),
+        ),
+      getShotStatus: (tenantId, projectId, shotId) =>
+        inTransaction((services) =>
+          services.getShotStatus(tenantId, projectId, shotId),
+        ),
+      getWorkflowRevisionValidation: (
+        tenantId,
+        projectId,
+        shotId,
+        revisionId,
+      ) =>
+        inTransaction((services) =>
+          services.getWorkflowRevisionValidation(
+            tenantId,
+            projectId,
+            shotId,
+            revisionId,
+          ),
+        ),
+      getAttemptStatus: (tenantId, projectId, attemptId) =>
+        inTransaction((services) =>
+          services.getAttemptStatus(tenantId, projectId, attemptId),
+        ),
+      getRecentIncidents: (tenantId, projectId) =>
+        inTransaction((services) =>
+          services.getRecentIncidents(tenantId, projectId),
+        ),
+      getExecutorReadiness: () =>
+        inTransaction((services) => services.getExecutorReadiness()),
+    };
+  }
+
+  /** Shared evidence resolution for the claim-transaction path and the deferred re-check. */
+  private async resolveEvidence(
+    repositories: Repositories,
+    event: DomainEvent & { readonly type: OperationalTriggerEventType },
+  ): Promise<
+    | { readonly ok: false }
+    | ({ readonly ok: true } & ResolvedOperationalEvidence)
+  > {
+    const projectId = event.projectId as Uuid;
+    const services = this.services(repositories);
+    const project = await services.getProjectStatus(this.tenantId, projectId);
+    if (!project || project.id !== projectId) {
+      return { ok: false };
+    }
+
+    const revisionId = eventPayloadUuid(event, 'workflowRevisionId');
+    const shot = event.shotId
+      ? await services.getShotStatus(this.tenantId, projectId, event.shotId)
+      : undefined;
+    if (event.shotId && (!shot || shot.projectId !== projectId)) {
+      return { ok: false };
+    }
+
+    const attempt = event.attemptId
+      ? await services.getAttemptStatus(
+          this.tenantId,
+          projectId,
+          event.attemptId,
+        )
+      : undefined;
+    if (
+      event.attemptId &&
+      (!attempt ||
+        attempt.projectId !== projectId ||
+        (event.shotId !== undefined && attempt.shotId !== event.shotId))
+    ) {
+      return { ok: false };
+    }
+
+    const revision =
+      revisionId && event.shotId
+        ? await services.getWorkflowRevisionValidation(
+            this.tenantId,
+            projectId,
+            event.shotId,
+            revisionId,
+          )
+        : undefined;
+    if (
+      revisionId &&
+      event.shotId &&
+      (!revision ||
+        revision.projectId !== projectId ||
+        revision.shotId !== event.shotId)
+    ) {
+      return { ok: false };
+    }
+
+    return {
+      ok: true,
+      services,
+      project,
+      ...(shot ? { shot } : {}),
+      ...(attempt ? { attempt } : {}),
+      ...(revision ? { revision } : {}),
+    };
+  }
+
+  /**
+   * Runs the model (or `defaultOutput()` fallback) and persists the finding,
+   * both inside the caller's transaction. The `faux` path uses this; the
+   * deferred path calls `runModel` and `persistOutcome` separately, with a
+   * commit between them.
+   */
+  private async completeRun(
+    repositories: Repositories,
+    event: DomainEvent & { readonly type: OperationalTriggerEventType },
+    recommendationCode: string,
+    run: AgentRunRecord,
+    evidence: ResolvedOperationalEvidence,
+  ): Promise<OperationalPiProcessResult> {
+    const outcome = await this.runModel(event, evidence);
+    return this.persistOutcome(
+      repositories,
+      event,
+      recommendationCode,
+      run,
+      evidence,
+      outcome,
+    );
+  }
+
+  /**
+   * Runs the model and returns its outcome. Touches no repositories, so the
+   * deferred path can call it with no transaction open and no pooled
+   * connection held across the provider round trip.
+   */
+  private async runModel(
+    event: DomainEvent & { readonly type: OperationalTriggerEventType },
+    evidence: ResolvedOperationalEvidence,
+  ): Promise<OperatorModelOutcome> {
+    const {
+      project,
+      services,
+      shot: hasShot,
+      attempt: hasAttempt,
+      revision: hasRevision,
+    } = evidence;
     const recommendationSpan = this.telemetry.startRootSpan
       ? this.telemetry.startRootSpan(
           'operator.recommend',
@@ -711,6 +1050,20 @@ export class OperationalPiAdapter {
       });
       recommendationSpan.end();
     }
+    return { runResult, runError, startedAt: runStartedAt };
+  }
+
+  /** Persists the run, the finding, and its event, inside one transaction. */
+  private async persistOutcome(
+    repositories: Repositories,
+    event: DomainEvent & { readonly type: OperationalTriggerEventType },
+    recommendationCode: string,
+    run: AgentRunRecord,
+    views: ResolvedOperationalViews,
+    outcome: OperatorModelOutcome,
+  ): Promise<OperationalPiProcessResult> {
+    const { attempt: hasAttempt, revision: hasRevision } = views;
+    const { runResult, runError, startedAt: runStartedAt } = outcome;
 
     const fallback = defaultOutput(
       event,
@@ -747,7 +1100,10 @@ export class OperationalPiAdapter {
     const recommendation: OperationalRecommendationRecord = {
       id: this.idGenerator.next(),
       tenantId: this.tenantId,
-      projectId: event.projectId,
+      // `event.projectId` was already checked truthy in
+      // `processEventInTransaction`, before this method (or the deferred
+      // path) was ever reached.
+      projectId: event.projectId as Uuid,
       ...(event.shotId ? { shotId: event.shotId } : {}),
       ...(event.attemptId ? { attemptId: event.attemptId } : {}),
       triggerEventId: event.id,
@@ -870,59 +1226,7 @@ export class OperationalPiAdapter {
     let toolsUsed = 0;
     let terminalStatus: 'ok' | 'error' = 'error';
     try {
-      if (this.provider !== 'faux') {
-        const error = Object.assign(
-          new Error('The operational faux provider is not enabled.'),
-          { code: 'PROVIDER_ERROR' },
-        );
-        throw error;
-      }
       const revisionId = evidence.revision?.id;
-      const output =
-        this.script?.output ??
-        defaultOutput(
-          event,
-          evidence.attempt !== undefined,
-          evidence.revision !== undefined,
-        );
-      const calls = toolCallsFor(event, revisionId).map((call, index) =>
-        fauxToolCall(call.name, call.arguments, {
-          id: `${event.id}-operator-tool-${index}`,
-        }),
-      );
-      const toolCalls = this.script?.duplicateToolCall
-        ? [
-            ...(calls[0] ? [calls[0]] : []),
-            ...(calls[0]
-              ? [
-                  fauxToolCall(calls[0].name, calls[0].arguments, {
-                    id: calls[0].id,
-                  }),
-                ]
-              : []),
-            ...calls.slice(1),
-          ]
-        : calls;
-      const faux = fauxProvider({
-        provider: this.provider,
-        models: [{ id: this.modelName, name: this.modelName }],
-      });
-      faux.setResponses([
-        ...(this.script?.providerError
-          ? [
-              fauxAssistantMessage('', {
-                stopReason: 'error',
-                errorMessage: this.script.providerError,
-              }),
-            ]
-          : [fauxAssistantMessage(toolCalls)]),
-        ...(this.script?.providerError
-          ? []
-          : [fauxAssistantMessage(JSON.stringify(output))]),
-      ]);
-      const models = createModels();
-      models.setProvider(faux.provider);
-      const model = faux.getModel() as Model<Api>;
       const toolContext: OperationalToolContext = {
         tenantId: this.tenantId,
         projectId: event.projectId as Uuid,
@@ -933,74 +1237,223 @@ export class OperationalPiAdapter {
         onPolicyDenial: (code, operation) =>
           rootSpan.addEvent('policy.denial', { code, operation }),
       };
-      const tools = createOperationalReadTools(toolContext);
       const piContext = piTelemetryContext(this.telemetry, rootSpan);
-      const streamFn: StreamFn = (streamModel, context, streamOptions) =>
-        models.streamSimple(streamModel, context, {
-          ...streamOptions,
-          telemetryContext: piContext,
-        });
-      const agent = new Agent({
-        sessionId: `pi-operator-${event.id}`,
-        streamFn,
-        toolExecution: 'sequential',
-        initialState: {
-          model,
-          systemPrompt:
-            'Use only the provided read-only evidence tools. Return one strict JSON operational recommendation. Never request or describe infrastructure access.',
-          tools,
-        },
-      });
-      agent.subscribe((agentEvent: AgentEvent) => {
+      const onToolStart = (toolName: string): void => {
         try {
-          if (agentEvent.type === 'tool_execution_start') {
-            toolsUsed += 1;
-            const span = this.telemetry.startSpan(
-              'agent.operator.tool',
-              { tool: agentEvent.toolName, outcome: 'started' },
-              rootSpan,
-            );
-            span.end();
-          }
+          toolsUsed += 1;
+          const span = this.telemetry.startSpan(
+            'agent.operator.tool',
+            { tool: toolName, outcome: 'started' },
+            rootSpan,
+          );
+          span.end();
         } catch {
           // Telemetry cannot affect recommendation generation.
         }
-      });
-      if (this.script?.abort) agent.abort();
-      const timeoutMs = Math.max(100, this.script?.timeoutMs ?? 10_000);
-      let timedOut = false;
-      const timeout = setTimeout(() => {
-        timedOut = true;
-        agent.abort();
-      }, timeoutMs);
-      try {
-        await agent.prompt(`Review durable event ${event.id}.`);
-        await agent.waitForIdle();
-      } finally {
-        clearTimeout(timeout);
-      }
-      if (timedOut) {
-        throw Object.assign(new Error('Operational Pi run timed out.'), {
-          code: 'TIMEOUT',
-        });
-      }
-      if (this.script?.abort) {
-        throw Object.assign(new Error('Operational Pi run was aborted.'), {
-          code: 'ABORTED',
-        });
-      }
-      const messages = assistantMessages(agent.state.messages);
-      const final = messages.at(-1);
-      if (!final || final.stopReason === 'error') {
-        throw Object.assign(
-          new Error('Operational Pi provider did not return a recommendation.'),
-          { code: 'PROVIDER_ERROR' },
+      };
+
+      let validated: OperationalRecommendationOutput;
+      let totals: ReturnType<typeof usageTotals>;
+
+      if (this.provider === 'faux') {
+        const output =
+          this.script?.output ??
+          defaultOutput(
+            event,
+            evidence.attempt !== undefined,
+            evidence.revision !== undefined,
+          );
+        const calls = toolCallsFor(event, revisionId).map((call, index) =>
+          fauxToolCall(call.name, call.arguments, {
+            id: `${event.id}-operator-tool-${index}`,
+          }),
         );
+        const toolCalls = this.script?.duplicateToolCall
+          ? [
+              ...(calls[0] ? [calls[0]] : []),
+              ...(calls[0]
+                ? [
+                    fauxToolCall(calls[0].name, calls[0].arguments, {
+                      id: calls[0].id,
+                    }),
+                  ]
+                : []),
+              ...calls.slice(1),
+            ]
+          : calls;
+        const faux = fauxProvider({
+          provider: this.provider,
+          models: [{ id: this.modelName, name: this.modelName }],
+        });
+        faux.setResponses([
+          ...(this.script?.providerError
+            ? [
+                fauxAssistantMessage('', {
+                  stopReason: 'error',
+                  errorMessage: this.script.providerError,
+                }),
+              ]
+            : [fauxAssistantMessage(toolCalls)]),
+          ...(this.script?.providerError
+            ? []
+            : [fauxAssistantMessage(JSON.stringify(output))]),
+        ]);
+        const models = createModels();
+        models.setProvider(faux.provider);
+        const model = faux.getModel() as Model<Api>;
+        const tools = createOperationalReadTools(toolContext);
+        const streamFn: StreamFn = (streamModel, context, streamOptions) =>
+          models.streamSimple(streamModel, context, {
+            ...streamOptions,
+            telemetryContext: piContext,
+          });
+        const agent = new Agent({
+          sessionId: `pi-operator-${event.id}`,
+          streamFn,
+          toolExecution: 'sequential',
+          initialState: {
+            model,
+            systemPrompt:
+              'Use only the provided read-only evidence tools. Return one strict JSON operational recommendation. Never request or describe infrastructure access.',
+            tools,
+          },
+        });
+        agent.subscribe((agentEvent: AgentEvent) => {
+          if (agentEvent.type === 'tool_execution_start') {
+            onToolStart(agentEvent.toolName);
+          }
+        });
+        if (this.script?.abort) agent.abort();
+        const timeoutMs = Math.max(100, this.script?.timeoutMs ?? 10_000);
+        let timedOut = false;
+        const timeout = setTimeout(() => {
+          timedOut = true;
+          agent.abort();
+        }, timeoutMs);
+        try {
+          await agent.prompt(`Review durable event ${event.id}.`);
+          await agent.waitForIdle();
+        } finally {
+          clearTimeout(timeout);
+        }
+        if (timedOut) {
+          throw Object.assign(new Error('Operational Pi run timed out.'), {
+            code: 'TIMEOUT',
+          });
+        }
+        if (this.script?.abort) {
+          throw Object.assign(new Error('Operational Pi run was aborted.'), {
+            code: 'ABORTED',
+          });
+        }
+        const messages = assistantMessages(agent.state.messages);
+        const final = messages.at(-1);
+        if (!final || final.stopReason === 'error') {
+          throw Object.assign(
+            new Error(
+              'Operational Pi provider did not return a recommendation.',
+            ),
+            { code: 'PROVIDER_ERROR' },
+          );
+        }
+        validated = validateOperationalRecommendation(
+          JSON.parse(assistantText(final)),
+        );
+        totals = usageTotals(messages);
+      } else {
+        // Non-faux: a real (or test-overridden) provider via a terminal
+        // `submit_recommendation` tool, three-tier degradation, and scoped
+        // identifiers in the prompt
+        // (75-PHASE-7E-OPERATIONAL-INTELLIGENCE.md step 3, "Output
+        // handling").
+        const { model, streamFn: baseStreamFn } = this.resolveHostedModel();
+        const readTools = createOperationalReadTools(toolContext);
+        const submissionTool = createOperationalSubmissionTool();
+        const streamFn: StreamFn = (streamModel, context, streamOptions) =>
+          baseStreamFn(streamModel, context, {
+            ...streamOptions,
+            ...(this.apiKey ? { apiKey: this.apiKey } : {}),
+            telemetryContext: piContext,
+          });
+        // Pi's loop already ends when the model stops calling tools
+        // (`dist/agent-loop.js:132`), the same condition Claude Code uses.
+        // What it has no bound for is a model that keeps calling them, so
+        // bound the spend rather than the turns.
+        let budgetExhausted = false;
+        const agent = new Agent({
+          sessionId: `pi-operator-${event.id}`,
+          streamFn,
+          toolExecution: 'sequential',
+          shouldStopAfterTurn: (turn) => {
+            const spent = usageTotals(assistantMessages(turn.context.messages));
+            const overCost =
+              this.maxRunCostMicrousd > 0 &&
+              spent.providerCostMicrousd >= this.maxRunCostMicrousd;
+            // Not redundant with the cost ceiling: a provider that reports no
+            // cost -- an unpriced or custom model -- would otherwise disable
+            // that ceiling silently, leaving the wall clock as the only bound.
+            const overTokens =
+              this.maxRunTokens > 0 && spent.totalTokens >= this.maxRunTokens;
+            if (!overCost && !overTokens) return false;
+            budgetExhausted = true;
+            // `outcome`/`value`/`max` rather than named keys: the telemetry
+            // attribute allowlist is deliberately generic, and any key
+            // containing "token" is rejected as credential-shaped by
+            // `SENSITIVE_ATTRIBUTE_KEY`.
+            rootSpan.addEvent('run.budget_exhausted', {
+              outcome: overCost ? 'cost_microusd' : 'tokens',
+              value: overCost ? spent.providerCostMicrousd : spent.totalTokens,
+              max: overCost ? this.maxRunCostMicrousd : this.maxRunTokens,
+            });
+            return true;
+          },
+          initialState: {
+            model,
+            systemPrompt: OPERATIONAL_SYSTEM_PROMPT,
+            tools: [...readTools, submissionTool],
+          },
+        });
+        agent.subscribe((agentEvent: AgentEvent) => {
+          if (agentEvent.type === 'tool_execution_start') {
+            onToolStart(agentEvent.toolName);
+          }
+        });
+        let timedOut = false;
+        const timeout = setTimeout(() => {
+          timedOut = true;
+          agent.abort();
+        }, this.timeoutMs);
+        try {
+          await agent.prompt(operationalPrompt(event, toolContext));
+          await agent.waitForIdle();
+        } finally {
+          clearTimeout(timeout);
+        }
+        if (timedOut) {
+          throw Object.assign(new Error('Operational Pi run timed out.'), {
+            code: 'TIMEOUT',
+          });
+        }
+        const messages = assistantMessages(agent.state.messages);
+        const final = messages.at(-1);
+        if (!final || final.stopReason === 'error') {
+          throw Object.assign(
+            new Error(
+              'Operational Pi provider did not return a recommendation.',
+            ),
+            { code: 'PROVIDER_ERROR' },
+          );
+        }
+        validated = extractOperationalOutput(
+          submissionArguments(final),
+          assistantText(final),
+        );
+        totals = usageTotals(messages);
+        if (budgetExhausted) {
+          rootSpan.setAttributes({ outcome: 'budget_exhausted' });
+        }
       }
-      const validated = validateOperationalRecommendation(
-        JSON.parse(assistantText(final)),
-      );
-      const totals = usageTotals(messages);
+
       terminalStatus = 'ok';
       rootSpan.setAttributes({
         status: 'succeeded',
@@ -1023,6 +1476,182 @@ export class OperationalPiAdapter {
         // Telemetry exporter failures cannot affect the operational run.
       }
     }
+  }
+
+  /**
+   * Resolves the model and stream function for a non-faux run.
+   * `streamFnOverride` (test-only) always wins over real provider
+   * construction, regardless of `this.provider`'s value -- see
+   * `OperationalPiAdapterOptions.streamFnOverride`.
+   */
+  private resolveHostedModel(): {
+    readonly model: Model<Api>;
+    readonly streamFn: StreamFn;
+  } {
+    if (this.streamFnOverride) {
+      const shape = fauxProvider({
+        provider: this.provider,
+        models: [{ id: this.modelName, name: this.modelName }],
+      }).getModel() as Model<Api>;
+      return { model: shape, streamFn: this.streamFnOverride };
+    }
+    if (this.provider === 'deepseek') {
+      const models = createModels();
+      models.setProvider(deepseekProvider());
+      const model = models.getModel('deepseek', this.modelName);
+      if (!model) {
+        throw Object.assign(
+          new Error(`Unknown DeepSeek model "${this.modelName}".`),
+          { code: 'PROVIDER_ERROR' },
+        );
+      }
+      return {
+        model,
+        streamFn: (streamModel, context, options) =>
+          models.streamSimple(streamModel, context, options),
+      };
+    }
+    throw Object.assign(
+      new Error(
+        `The operational provider "${this.provider}" is not supported.`,
+      ),
+      { code: 'PROVIDER_ERROR' },
+    );
+  }
+}
+
+const OPERATIONAL_SYSTEM_PROMPT =
+  'You are an operational monitor for a video-generation pipeline. Use ' +
+  'only the provided read-only evidence tools to investigate the incident ' +
+  'in your scope, then call submit_recommendation exactly once with your ' +
+  'conclusion: severity ("info" | "warning" | "critical"), ' +
+  'recommendationCode (a short SCREAMING_SNAKE_CASE code), title (at most ' +
+  '240 characters), detail (at most 2000 characters), and ' +
+  'proposedActionType (one of "retry_attempt", "open_workflow_revision", ' +
+  '"wait_for_executor", "request_human_review", "no_action"). Never ' +
+  'request or describe infrastructure access, and never propose an action ' +
+  'the evidence tools did not support.';
+
+/** Seeds the identifiers the adapter already knows, so the model stops guessing them. */
+function operationalPrompt(
+  event: DomainEvent & { readonly type: OperationalTriggerEventType },
+  context: OperationalToolContext,
+): string {
+  const scope = [`projectId=${context.projectId}`];
+  if (context.shotId) scope.push(`shotId=${context.shotId}`);
+  if (context.attemptId) scope.push(`attemptId=${context.attemptId}`);
+  if (context.workflowRevisionId) {
+    scope.push(`workflowRevisionId=${context.workflowRevisionId}`);
+  }
+  return (
+    `Review durable event ${event.id} (${event.type}) for this incident. ` +
+    `Scoped identifiers available to the evidence tools: ${scope.join(', ')}.`
+  );
+}
+
+/** Reads `submit_recommendation`'s arguments straight off the tool-call content block, if the model called it. */
+function submissionArguments(
+  message: AssistantMessage,
+): Record<string, unknown> | undefined {
+  for (const block of message.content) {
+    if (
+      block.type === 'toolCall' &&
+      block.name === OPERATIONAL_SUBMISSION_TOOL_NAME
+    ) {
+      return block.arguments;
+    }
+  }
+  return undefined;
+}
+
+function stripFencedCodeBlocks(text: string): string {
+  const fenced = /```(?:[a-zA-Z0-9_-]*)?\s*([\s\S]*?)```/g;
+  const blocks: string[] = [];
+  let match: RegExpExecArray | null = fenced.exec(text);
+  while (match) {
+    if (match[1] !== undefined) blocks.push(match[1]);
+    match = fenced.exec(text);
+  }
+  return blocks.length > 0 ? blocks.join('\n') : text;
+}
+
+/** Scans for the last top-level `{...}` span, ignoring braces inside string literals. */
+function lastBalancedJsonObject(text: string): string | undefined {
+  let depth = 0;
+  let start = -1;
+  let last: string | undefined;
+  let inString = false;
+  let escapeNext = false;
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    if (inString) {
+      if (escapeNext) {
+        escapeNext = false;
+      } else if (char === '\\') {
+        escapeNext = true;
+      } else if (char === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (char === '"') {
+      inString = true;
+    } else if (char === '{') {
+      if (depth === 0) start = index;
+      depth += 1;
+    } else if (char === '}' && depth > 0) {
+      depth -= 1;
+      if (depth === 0 && start !== -1) {
+        last = text.slice(start, index + 1);
+      }
+    }
+  }
+  return last;
+}
+
+/**
+ * Three-tier degradation, because Pi's `openai-completions` transport never
+ * sends `response_format` and `ToolChoice` has no `"required"` value, so
+ * neither API-level structured output nor a forced tool call is reachable
+ * (75-PHASE-7E-OPERATIONAL-INTELLIGENCE.md step 3, "Output handling"):
+ * 1. `submit_recommendation` tool-call arguments;
+ * 2. else tolerant text extraction (strip fenced code blocks, take the last
+ *    balanced JSON object);
+ * 3. else throw, so the caller falls back to `defaultOutput()`.
+ * `validateOperationalRecommendation` stays the sole authority at every
+ * tier -- the tool schema steers the model, it never gets to approve the
+ * result.
+ */
+function extractOperationalOutput(
+  submission: Record<string, unknown> | undefined,
+  text: string,
+): OperationalRecommendationOutput {
+  const invalidStructuredOutput = (cause: unknown): Error =>
+    Object.assign(
+      new Error('The operational Pi run returned invalid structured output.'),
+      { code: 'INVALID_STRUCTURED_OUTPUT', cause },
+    );
+  if (submission) {
+    try {
+      return validateOperationalRecommendation(submission);
+    } catch (error) {
+      throw invalidStructuredOutput(error);
+    }
+  }
+  const jsonText =
+    lastBalancedJsonObject(stripFencedCodeBlocks(text)) ??
+    lastBalancedJsonObject(text);
+  if (!jsonText) throw invalidStructuredOutput(undefined);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(jsonText);
+  } catch (error) {
+    throw invalidStructuredOutput(error);
+  }
+  try {
+    return validateOperationalRecommendation(parsed);
+  } catch (error) {
+    throw invalidStructuredOutput(error);
   }
 }
 
@@ -1183,6 +1812,11 @@ export class OperationalOutboxConsumer implements OutboxConsumer {
       return;
     }
     await this.adapter.processEvent(message.event);
+  }
+
+  /** Finishes a deferred non-faux run; a no-op for `faux` and non-trigger messages. */
+  async afterCommit(message: OutboxMessage): Promise<void> {
+    await this.adapter.completeDeferredRun(message.event);
   }
 }
 
