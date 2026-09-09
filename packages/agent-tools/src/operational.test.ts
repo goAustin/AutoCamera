@@ -4,6 +4,7 @@ import {
   OPERATIONAL_TOOL_NAMES,
   createOperationalReadTools,
   createOperationalSubmissionTool,
+  describeOperationalRecommendationIssues,
   type OperationalToolServices,
 } from './index.js';
 
@@ -181,20 +182,114 @@ describe('operational Pi read-only tools', () => {
   });
 });
 
-describe('operational Pi submission tool', () => {
-  it('is a terminal tool whose parameters are the recommendation schema', async () => {
-    const tool = createOperationalSubmissionTool();
-    expect(tool.name).toBe(OPERATIONAL_SUBMISSION_TOOL_NAME);
+const submissionArgs = {
+  severity: 'critical',
+  recommendationCode: 'EXECUTOR_UNAVAILABLE',
+  title: 'Wait for the executor to recover',
+  detail: 'The execution service is unavailable.',
+  proposedActionType: 'wait_for_executor',
+};
 
-    const args = {
-      severity: 'critical',
+/** Runs one `submit_recommendation` call the way pi's loop does: prepare, then execute. */
+async function callSubmission(
+  submission: ReturnType<typeof createOperationalSubmissionTool>,
+  args: unknown,
+): Promise<{ readonly terminate?: boolean } | Error> {
+  const { tool } = submission;
+  let prepared: unknown;
+  try {
+    prepared = tool.prepareArguments?.(args) ?? args;
+  } catch (error) {
+    return error as Error;
+  }
+  return tool.execute('call-1', prepared);
+}
+
+describe('operational Pi submission tool', () => {
+  it('is a terminal tool that captures the accepted submission at execution', async () => {
+    const submission = createOperationalSubmissionTool();
+    expect(submission.tool.name).toBe(OPERATIONAL_SUBMISSION_TOOL_NAME);
+    expect(submission.accepted()).toBeUndefined();
+
+    const result = await callSubmission(submission, submissionArgs);
+    expect(result).not.toBeInstanceOf(Error);
+    expect((result as { readonly terminate?: boolean }).terminate).toBe(true);
+    expect(submission.accepted()).toEqual(submissionArgs);
+    expect(submission.attempts()).toBe(1);
+    expect(submission.rejections()).toBe(0);
+  });
+
+  it('normalizes only what is cosmetic, and lets a later submission win', async () => {
+    const submission = createOperationalSubmissionTool();
+    await callSubmission(submission, submissionArgs);
+    await callSubmission(submission, {
+      ...submissionArgs,
+      // N3: extra key dropped, whitespace trimmed, code upper-cased.
+      reasoning: 'the model volunteering a field',
+      recommendationCode: '  executor_unavailable  ',
+      title: '  A later conclusion  ',
+    });
+
+    expect(submission.accepted()).toEqual({
+      ...submissionArgs,
       recommendationCode: 'EXECUTOR_UNAVAILABLE',
-      title: 'Wait for the executor to recover',
-      detail: 'The execution service is unavailable.',
-      proposedActionType: 'wait_for_executor',
-    };
-    const result = await tool.execute('call-1', args);
-    expect(result.terminate).toBe(true);
-    expect(result.details).toMatchObject({ ok: true, code: 'OK', data: args });
+      title: 'A later conclusion',
+    });
+    expect(submission.attempts()).toBe(2);
+    expect(submission.rejections()).toBe(0);
+  });
+
+  it('bounces meaning-changing input with a field-by-field message, and counts it', async () => {
+    const submission = createOperationalSubmissionTool();
+    const detail = 'x'.repeat(2_280);
+    const error = await callSubmission(submission, {
+      ...submissionArgs,
+      severity: 'urgent',
+      detail,
+    });
+
+    expect(error).toBeInstanceOf(Error);
+    const message = (error as Error).message;
+    expect(message).toContain(
+      `${OPERATIONAL_SUBMISSION_TOOL_NAME} was not accepted.`,
+    );
+    expect(message).toContain(
+      'severity must be one of "info", "warning", "critical" (received "urgent").',
+    );
+    expect(message).toContain(
+      'detail is 2280 characters; the maximum is 2000. Shorten it.',
+    );
+    // The over-long detail is named, never echoed back at the model.
+    expect(message).not.toContain(detail);
+    expect(submission.accepted()).toBeUndefined();
+    expect(submission.attempts()).toBe(1);
+    expect(submission.rejections()).toBe(1);
+  });
+
+  it('refuses to repair an identifier, and names what each other field needs', () => {
+    // A code is what says which finding this is; rewriting one would change
+    // the finding, so it bounces rather than being cleaned up (N3).
+    expect(
+      describeOperationalRecommendationIssues({
+        ...submissionArgs,
+        recommendationCode: 'BAD CODE!',
+      }),
+    ).toContain('recommendationCode must match ^[A-Z0-9][A-Z0-9_.-]{0,63}$');
+
+    expect(describeOperationalRecommendationIssues({})).toContain(
+      'title is required.',
+    );
+    expect(
+      describeOperationalRecommendationIssues({
+        ...submissionArgs,
+        title: '   ',
+      }),
+    ).toContain('title must not be empty.');
+    expect(describeOperationalRecommendationIssues('not an object')).toContain(
+      'the arguments must be a JSON object',
+    );
+    expect(
+      describeOperationalRecommendationIssues(submissionArgs),
+    ).toBeUndefined();
   });
 });

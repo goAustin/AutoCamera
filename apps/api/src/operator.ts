@@ -19,7 +19,6 @@ import {
   createOperationalReadTools,
   createOperationalSubmissionTool,
   validateOperationalRecommendation,
-  OPERATIONAL_SUBMISSION_TOOL_NAME,
   type OperationalAttemptToolView,
   type OperationalExecutorToolView,
   type OperationalIncidentToolView,
@@ -75,6 +74,14 @@ export type OperationalTriggerEventType =
   (typeof OPERATIONAL_TRIGGER_EVENT_TYPES)[number];
 
 const operationalTriggerSet = new Set<string>(OPERATIONAL_TRIGGER_EVENT_TYPES);
+
+/**
+ * Consecutive `submit_recommendation` calls the model may have bounced back
+ * to it for repair before a non-faux run gives up and falls to
+ * `defaultOutput()`. Claude Code's `MAX_STRUCTURED_OUTPUT_RETRIES` default
+ * (75-PHASE-7E step 3 follow-up, N4).
+ */
+export const OPERATIONAL_SUBMISSION_MAX_REJECTIONS = 5;
 
 const RECOVERABLE_ATTEMPT_CODES = new Set([
   'COMFY_UNAVAILABLE',
@@ -1368,7 +1375,9 @@ export class OperationalPiAdapter {
         // handling").
         const { model, streamFn: baseStreamFn } = this.resolveHostedModel();
         const readTools = createOperationalReadTools(toolContext);
-        const submissionTool = createOperationalSubmissionTool();
+        // W1/N1: the conclusion comes off this handle, which `execute`
+        // fills. Nothing below reads the transcript for it.
+        const submission = createOperationalSubmissionTool();
         const streamFn: StreamFn = (streamModel, context, streamOptions) =>
           baseStreamFn(streamModel, context, {
             ...streamOptions,
@@ -1385,6 +1394,19 @@ export class OperationalPiAdapter {
           streamFn,
           toolExecution: 'sequential',
           shouldStopAfterTurn: (turn) => {
+            // N4: a model that keeps re-sending a submission we keep
+            // bouncing is a runaway loop like any other, so it gets a bound
+            // of its own. Same hook as the budget bound -- `AgentOptions`
+            // takes one.
+            if (
+              submission.rejections() >= OPERATIONAL_SUBMISSION_MAX_REJECTIONS
+            ) {
+              rootSpan.addEvent('run.submission_rejected', {
+                count: submission.rejections(),
+                max: OPERATIONAL_SUBMISSION_MAX_REJECTIONS,
+              });
+              return true;
+            }
             const spent = usageTotals(assistantMessages(turn.context.messages));
             const overCost =
               this.maxRunCostMicrousd > 0 &&
@@ -1410,7 +1432,7 @@ export class OperationalPiAdapter {
           initialState: {
             model,
             systemPrompt: OPERATIONAL_SYSTEM_PROMPT,
-            tools: [...readTools, submissionTool],
+            tools: [...readTools, submission.tool],
           },
         });
         agent.subscribe((agentEvent: AgentEvent) => {
@@ -1444,10 +1466,20 @@ export class OperationalPiAdapter {
             { code: 'PROVIDER_ERROR' },
           );
         }
-        validated = extractOperationalOutput(
-          submissionArguments(final),
-          assistantText(final),
-        );
+        const captured = submission.accepted();
+        const rejectedOut =
+          submission.rejections() >= OPERATIONAL_SUBMISSION_MAX_REJECTIONS;
+        // Which tier produced the finding, on the generic allowlisted
+        // `result` key -- `outcome` already carries how the run *ended*.
+        try {
+          validated = extractOperationalOutput(captured, assistantText(final));
+        } catch (error) {
+          rootSpan.setAttributes({
+            result: rejectedOut ? 'rejected_cap' : 'none',
+          });
+          throw error;
+        }
+        rootSpan.setAttributes({ result: captured ? 'submitted' : 'text' });
         totals = usageTotals(messages);
         if (budgetExhausted) {
           rootSpan.setAttributes({ outcome: 'budget_exhausted' });
@@ -1523,12 +1555,14 @@ export class OperationalPiAdapter {
 const OPERATIONAL_SYSTEM_PROMPT =
   'You are an operational monitor for a video-generation pipeline. Use ' +
   'only the provided read-only evidence tools to investigate the incident ' +
-  'in your scope, then call submit_recommendation exactly once with your ' +
-  'conclusion: severity ("info" | "warning" | "critical"), ' +
+  'in your scope, then call submit_recommendation with your conclusion: ' +
+  'severity ("info" | "warning" | "critical"), ' +
   'recommendationCode (a short SCREAMING_SNAKE_CASE code), title (at most ' +
   '240 characters), detail (at most 2000 characters), and ' +
   'proposedActionType (one of "retry_attempt", "open_workflow_revision", ' +
-  '"wait_for_executor", "request_human_review", "no_action"). Never ' +
+  '"wait_for_executor", "request_human_review", "no_action"). If that call ' +
+  'comes back listing what to fix, correct exactly those points and call ' +
+  'it again -- the run has no conclusion until one is accepted. Never ' +
   'request or describe infrastructure access, and never propose an action ' +
   'the evidence tools did not support.';
 
@@ -1547,21 +1581,6 @@ function operationalPrompt(
     `Review durable event ${event.id} (${event.type}) for this incident. ` +
     `Scoped identifiers available to the evidence tools: ${scope.join(', ')}.`
   );
-}
-
-/** Reads `submit_recommendation`'s arguments straight off the tool-call content block, if the model called it. */
-function submissionArguments(
-  message: AssistantMessage,
-): Record<string, unknown> | undefined {
-  for (const block of message.content) {
-    if (
-      block.type === 'toolCall' &&
-      block.name === OPERATIONAL_SUBMISSION_TOOL_NAME
-    ) {
-      return block.arguments;
-    }
-  }
-  return undefined;
 }
 
 function stripFencedCodeBlocks(text: string): string {
@@ -1614,30 +1633,24 @@ function lastBalancedJsonObject(text: string): string | undefined {
  * sends `response_format` and `ToolChoice` has no `"required"` value, so
  * neither API-level structured output nor a forced tool call is reachable
  * (75-PHASE-7E-OPERATIONAL-INTELLIGENCE.md step 3, "Output handling"):
- * 1. `submit_recommendation` tool-call arguments;
+ * 1. whatever `submit_recommendation`'s `execute` captured;
  * 2. else tolerant text extraction (strip fenced code blocks, take the last
  *    balanced JSON object);
  * 3. else throw, so the caller falls back to `defaultOutput()`.
- * `validateOperationalRecommendation` stays the sole authority at every
- * tier -- the tool schema steers the model, it never gets to approve the
- * result.
+ * `operationalRecommendationSchema` is the sole authority at every tier;
+ * tier 1 has already been through it, inside the tool's `prepareArguments`,
+ * so it is taken as-is here rather than parsed a second time.
  */
 function extractOperationalOutput(
-  submission: Record<string, unknown> | undefined,
+  submitted: OperationalRecommendationOutput | undefined,
   text: string,
 ): OperationalRecommendationOutput {
+  if (submitted) return submitted;
   const invalidStructuredOutput = (cause: unknown): Error =>
     Object.assign(
       new Error('The operational Pi run returned invalid structured output.'),
       { code: 'INVALID_STRUCTURED_OUTPUT', cause },
     );
-  if (submission) {
-    try {
-      return validateOperationalRecommendation(submission);
-    } catch (error) {
-      throw invalidStructuredOutput(error);
-    }
-  }
   const jsonText =
     lastBalancedJsonObject(stripFencedCodeBlocks(text)) ??
     lastBalancedJsonObject(text);

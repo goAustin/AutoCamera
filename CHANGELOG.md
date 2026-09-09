@@ -1,5 +1,69 @@
 # Changelog
 
+## Phase 7E step 3 follow-up — Tool-use redesign for the operator (W1, W2, W8)
+
+Evidence level: Offline fake. No provider call was made; every test runs
+against `faux` or an injected `streamFnOverride` stub. Delivers W1, W2 and W8
+of `docs/75-PHASE-7E-STEP-3-FOLLOWUP-TOOL-USE.md`; W4, W5's remaining half,
+W6 and W7 stay recorded there, not built.
+
+Step 3's output path only worked when the model emitted its conclusion alone,
+in the last assistant message. On either of two ordinary behaviours the
+model's finding was discarded, silently replaced by the `faux` lookup table,
+and the run recorded as `failed` — indistinguishable from the state before a
+provider was wired in at all.
+
+- **The conclusion is captured where the tool runs, not by message position
+  (W1/N1).** `submissionArguments` inspected only the last assistant message,
+  which was sound only if `terminate: true` reliably stopped the loop. It does
+  not: pi terminates a batch only when *every* finalized call in it terminates
+  (`agent-loop.js:376`), so a model that emitted `get_project_status` and
+  `submit_recommendation` in one message — ordinary parallel tool calling —
+  took another turn and left its submission behind. `createOperationalSubmissionTool()`
+  now returns an `OperationalSubmission` handle whose `execute` records the
+  validated params; `operator.ts` reads `submission.accepted()` as tier 1 and
+  `submissionArguments` is gone. `terminate: true` stays, as a turn-saving
+  optimisation nothing depends on.
+- **`prepareArguments` is the sole validator, and a rejection is a retryable
+  bounce (W2/N2/N3).** A schema-perfect conclusion was being thrown away over
+  a repairable detail: one volunteered extra key, or a `detail` past the 2,000
+  cap that `completeRun` was about to truncate anyway. Pi runs
+  `prepareArguments` before its own argument check (`agent-loop.js:401-402`)
+  and turns a throw there into the call's error result with our wording
+  (`:446`), so the tool now normalizes what is cosmetic — unknown keys
+  stripped, whitespace trimmed, `recommendationCode` upper-cased — and hands
+  anything that would change what the finding *says* back to the model as a
+  field-by-field list naming the received value and the actual overage
+  (`describeOperationalRecommendationIssues`). Lengths bounce rather than
+  clamp: a `detail` cut mid-sentence reads as authoritative and is worse to
+  hand an operator than a canned one. The advertised TypeBox schema stays
+  maximally precise — it is what steers the model, and it now costs nothing.
+- **Bounded retries with a distinct outcome (W2/N4).**
+  `OPERATIONAL_SUBMISSION_MAX_REJECTIONS` (5, Claude Code's
+  `MAX_STRUCTURED_OUTPUT_RETRIES` default) stops the run through the same
+  `shouldStopAfterTurn` hook the budget bound uses — `AgentOptions` takes one.
+  The run span now records which tier produced the finding on the allowlisted
+  `result` key (`submitted`, `rejected_cap`, `text`, absent when the run
+  failed before looking), so "the model never submitted" and "we kept bouncing
+  it" are no longer the same observation. `outcome` still carries how the run
+  *ended*.
+- `operationalRecommendationSchema` drops `.strict()`; unknown keys are
+  stripped before it, which also makes tier 2 consistent with tier 1. The
+  system prompt no longer says "exactly once" — a model told that will not
+  take the corrective retry the bounce is asking for — and the field limits
+  now sit in the tool `description` as well as the schema.
+- **Behaviour matrix (W8).** The five tier-1/tier-2 tests in
+  `operator.test.ts` are replaced by one table over 11 model behaviours, each
+  asserting the persisted finding, the run status, the failure code and the
+  span's tier. Rows 2, 3 and 4 are the regression tests for the two defects
+  and were confirmed to fail against `9e94d0d` with every pre-existing test
+  still passing there (6 rows fail at baseline: 2, 3, 4, and 5, 7, 8 — the
+  same two defects in other shapes). The fixture the model "authors" now
+  differs from `defaultOutput()` in severity, title and action, so a row can
+  tell them apart; step 3's fixture was identical to the fallback.
+- 9 new tests, unit suite 217 to 226 across 25 files (no new file);
+  integration unchanged at 18 across 10 files, unmodified.
+
 ## Phase 7E step 3 review follow-up — deferred-run isolation, bounds, and signal
 
 Evidence level: Offline fake. No provider call was made; every test runs

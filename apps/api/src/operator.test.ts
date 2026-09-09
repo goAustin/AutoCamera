@@ -32,6 +32,7 @@ import { buildApiApp } from './app.js';
 import {
   createOperationalToolServices,
   OperationalPiAdapter,
+  OPERATIONAL_SUBMISSION_MAX_REJECTIONS,
   OPERATIONAL_TRIGGER_EVENT_TYPES,
   type FauxOperationalScript,
 } from './operator.js';
@@ -138,6 +139,24 @@ function hostedStreamFn(
     onCall?.(model, context, options);
     return faux.provider.streamSimple(model, context, options);
   };
+}
+
+/**
+ * The text a transcript actually puts in front of the model -- prompt and
+ * tool-result blocks alike. Asserting on this rather than on
+ * `JSON.stringify(messages)` keeps a needle containing quotes readable.
+ */
+function transcriptText(messages: readonly unknown[]): string {
+  return messages
+    .flatMap((message) => {
+      const content = (message as { readonly content?: unknown }).content;
+      return Array.isArray(content) ? (content as unknown[]) : [];
+    })
+    .flatMap((block) => {
+      const text = (block as { readonly text?: unknown }).text;
+      return typeof text === 'string' ? [text] : [];
+    })
+    .join('\n');
 }
 
 /**
@@ -745,181 +764,271 @@ const validRecommendationArgs = {
 };
 
 describe('Phase 7E step 3: a non-faux provider via submit_recommendation', () => {
-  it('produces a finding straight from submit_recommendation arguments, carrying the resolved apiKey, with no text parsing', async () => {
-    const calls: Array<{ readonly apiKey: string | undefined }> = [];
-    const { app, store, dispatcher } = await setupHosted(
-      hostedStreamFn(
-        [
-          fauxAssistantMessage([
-            fauxToolCall('submit_recommendation', validRecommendationArgs),
-          ]),
-        ],
-        (_model, _context, options) => calls.push({ apiKey: options?.apiKey }),
-      ),
-      { apiKey: 'test-deepseek-key' },
+  /**
+   * 75-PHASE-7E-STEP-3-FOLLOWUP-TOOL-USE.md, W8. One table over how models
+   * actually emit tool calls, rather than the single sequential shape step 3
+   * assumed. Rows 2, 3 and 4 are the regression tests for D1 (a submission
+   * batched with another call never terminates, so it left the last
+   * assistant message) and D2 (a schema-perfect conclusion discarded over a
+   * repairable detail); they fail against `9e94d0d`.
+   *
+   * Every expectation discriminates the model's own conclusion from
+   * `defaultOutput()`'s for `executor.unavailable`, which differs from it in
+   * severity, title and action. `recommendationCode` is deliberately not a
+   * discriminator: `completeRun` always takes it from the event
+   * (`recommendationCodeFor`), never from the model.
+   */
+  const modelFinding = {
+    severity: 'info',
+    recommendationCode: 'MODEL_AUTHORED_CODE',
+    title: 'Model authored title',
+    detail: 'The model reached this conclusion from the evidence tools.',
+    proposedActionType: 'no_action',
+  };
+  const modelPersisted = {
+    severity: 'info',
+    title: 'Model authored title',
+    proposedActionType: 'no_action',
+    recommendationCode: 'EXECUTOR_UNAVAILABLE',
+  };
+  const fallbackPersisted = {
+    severity: 'critical',
+    title: 'Wait for the executor to recover',
+    proposedActionType: 'wait_for_executor',
+    recommendationCode: 'EXECUTOR_UNAVAILABLE',
+  };
+  type ToolArgs = Record<string, unknown>;
+  /**
+   * One assistant message: the submission, plus a `get_project_status` call
+   * per extra argument object. The read call is what makes the batch
+   * non-terminating -- pi terminates only when *every* finalized call in a
+   * batch does (`agent-loop.js:376`).
+   */
+  const submits = (args: ToolArgs, ...reads: ToolArgs[]) =>
+    fauxAssistantMessage([
+      fauxToolCall('submit_recommendation', args),
+      ...reads.map((read) => fauxToolCall('get_project_status', read)),
+    ]);
+  const fenced = (args: ToolArgs) =>
+    fauxAssistantMessage(
+      'Here is my conclusion:\n```json\n' +
+        JSON.stringify(args) +
+        '\n```\nThat is my final answer.',
     );
-    const projectId = await createProject(app, 'hosted-tier1');
-    await drain(dispatcher);
-    const event = await appendEvent(store, {
-      projectId,
-      type: 'executor.unavailable',
-    });
 
-    expect(await dispatcher.pollOnce()).toBe(true);
-    const recommendation = (await recommendations(store, projectId))[0];
-    if (!recommendation) {
-      throw new Error('Expected a persisted recommendation.');
-    }
-    expect(recommendation).toMatchObject({
-      triggerEventId: event.id,
-      recommendationCode: 'EXECUTOR_UNAVAILABLE',
-      proposedActionType: 'wait_for_executor',
-      severity: 'critical',
-      status: 'pending',
-    });
-    const runs = await store.withTransaction((repositories) =>
-      repositories.agentRuns.listByProject(DEV_TENANT_ID, projectId),
-    );
-    expect(runs).toHaveLength(1);
-    expect(runs[0]).toMatchObject({
+  const behaviours: ReadonlyArray<{
+    readonly row: number;
+    readonly name: string;
+    readonly responses: readonly FauxResponseStep[];
+    readonly persisted: Record<string, unknown>;
+    readonly status: 'succeeded' | 'failed';
+    readonly failureCode?: string;
+    /**
+     * Which tier the run span must report the finding came from (W2), or
+     * absent when the run never got as far as looking for one.
+     */
+    readonly result?: 'submitted' | 'rejected_cap' | 'text' | 'none';
+    /** Text the bounce must have put in front of the model on its next turn. */
+    readonly retriedWith?: string;
+  }> = [
+    {
+      row: 1,
+      name: 'submits alone',
+      responses: [submits(modelFinding)],
+      persisted: modelPersisted,
       status: 'succeeded',
-      provider: 'deepseek',
-      model: 'deepseek-v4-flash',
-    });
-    expect(calls.length).toBeGreaterThan(0);
-    expect(calls.every((call) => call.apiKey === 'test-deepseek-key')).toBe(
-      true,
-    );
-  });
-
-  it('yields a finding from prose wrapped around a fenced JSON block (tier 2)', async () => {
-    const { app, store, dispatcher } = await setupHosted(
-      hostedStreamFn([
-        fauxAssistantMessage(
-          'Let me review the evidence.\n\nHere is my conclusion:\n```json\n' +
-            JSON.stringify(validRecommendationArgs) +
-            '\n```\nThat is my final answer.',
+      result: 'submitted',
+    },
+    {
+      row: 2,
+      name: 'submits batched with a read call (D1)',
+      responses: [submits(modelFinding, {}), fauxAssistantMessage('Done.')],
+      persisted: modelPersisted,
+      status: 'succeeded',
+      result: 'submitted',
+    },
+    {
+      row: 3,
+      name: 'submits with an extra key (D2)',
+      responses: [
+        submits({ ...modelFinding, reasoning: 'a field it volunteered' }),
+      ],
+      persisted: modelPersisted,
+      status: 'succeeded',
+      result: 'submitted',
+    },
+    {
+      row: 4,
+      name: 'submits an over-long detail, then corrects it (D2)',
+      responses: [
+        submits({ ...modelFinding, detail: 'x'.repeat(2_280) }),
+        submits(modelFinding),
+      ],
+      persisted: modelPersisted,
+      status: 'succeeded',
+      result: 'submitted',
+      retriedWith:
+        'detail is 2280 characters; the maximum is 2000. Shorten it.',
+    },
+    {
+      row: 5,
+      name: 'submits a bad enum, then corrects it',
+      responses: [
+        submits({ ...modelFinding, severity: 'urgent' }),
+        submits(modelFinding),
+      ],
+      persisted: modelPersisted,
+      status: 'succeeded',
+      result: 'submitted',
+      retriedWith:
+        'severity must be one of "info", "warning", "critical" (received "urgent").',
+    },
+    {
+      row: 6,
+      name: 'submits twice with different content: the later one wins',
+      responses: [
+        submits(
+          {
+            ...modelFinding,
+            severity: 'warning',
+            title: 'An earlier conclusion',
+            proposedActionType: 'wait_for_executor',
+          },
+          {},
         ),
-      ]),
-    );
-    const projectId = await createProject(app, 'hosted-tier2');
-    await drain(dispatcher);
-    const event = await appendEvent(store, {
-      projectId,
-      type: 'executor.unavailable',
-    });
-
-    expect(await dispatcher.pollOnce()).toBe(true);
-    const recommendation = (await recommendations(store, projectId))[0];
-    if (!recommendation) {
-      throw new Error('Expected a persisted recommendation.');
-    }
-    expect(recommendation).toMatchObject({
-      triggerEventId: event.id,
-      recommendationCode: 'EXECUTOR_UNAVAILABLE',
-      proposedActionType: 'wait_for_executor',
-      severity: 'critical',
-    });
-    const runs = await store.withTransaction((repositories) =>
-      repositories.agentRuns.listByProject(DEV_TENANT_ID, projectId),
-    );
-    expect(runs[0]?.status).toBe('succeeded');
-  });
-
-  it('falls back to defaultOutput() on unparseable prose, with the INVALID_STRUCTURED_OUTPUT failure code', async () => {
-    const { app, store, dispatcher } = await setupHosted(
-      hostedStreamFn([
-        fauxAssistantMessage('I am not going to return anything structured.'),
-      ]),
-    );
-    const projectId = await createProject(app, 'hosted-unparseable');
-    await drain(dispatcher);
-    await appendEvent(store, { projectId, type: 'executor.unavailable' });
-
-    expect(await dispatcher.pollOnce()).toBe(true);
-    const recommendation = (await recommendations(store, projectId))[0];
-    if (!recommendation) {
-      throw new Error('Expected the defaultOutput() fallback recommendation.');
-    }
-    // The default (faux-equivalent) content for `executor.unavailable`, not
-    // anything derived from the model's prose.
-    expect(recommendation.title).toBe('Wait for the executor to recover');
-    expect(recommendation.proposedActionType).toBe('wait_for_executor');
-    const runs = await store.withTransaction((repositories) =>
-      repositories.agentRuns.listByProject(DEV_TENANT_ID, projectId),
-    );
-    expect(runs[0]).toMatchObject({
+        submits(modelFinding),
+      ],
+      persisted: modelPersisted,
+      status: 'succeeded',
+      result: 'submitted',
+    },
+    {
+      row: 7,
+      name: 'submits, then keeps talking: tier 1 still beats the prose',
+      responses: [
+        submits(modelFinding, {}),
+        // Parseable, and a *different* finding -- tier 2 would take it if
+        // tier 1 had been lost.
+        fenced({
+          ...modelFinding,
+          severity: 'critical',
+          title: 'Prose afterthought',
+          proposedActionType: 'wait_for_executor',
+        }),
+      ],
+      persisted: modelPersisted,
+      status: 'succeeded',
+      result: 'submitted',
+    },
+    {
+      row: 8,
+      name: 'exhausts the rejection cap',
+      responses: Array.from(
+        { length: OPERATIONAL_SUBMISSION_MAX_REJECTIONS },
+        () => submits({ ...modelFinding, severity: 'urgent' }),
+      ),
+      persisted: fallbackPersisted,
       status: 'failed',
+      result: 'rejected_cap',
       failureCode: 'INVALID_STRUCTURED_OUTPUT',
-    });
-  });
-
-  it('falls back to defaultOutput() when submit_recommendation arguments violate the schema, never persisting the invalid proposal', async () => {
-    const { app, store, dispatcher } = await setupHosted(
-      hostedStreamFn([
-        fauxAssistantMessage([
-          fauxToolCall('submit_recommendation', {
-            ...validRecommendationArgs,
-            severity: 'not-a-real-severity',
-          }),
-        ]),
-      ]),
-    );
-    const projectId = await createProject(app, 'hosted-invalid-schema');
-    await drain(dispatcher);
-    await appendEvent(store, { projectId, type: 'executor.unavailable' });
-
-    expect(await dispatcher.pollOnce()).toBe(true);
-    const recommendation = (await recommendations(store, projectId))[0];
-    if (!recommendation) {
-      throw new Error('Expected the defaultOutput() fallback recommendation.');
-    }
-    expect(recommendation.title).toBe('Wait for the executor to recover');
-    // defaultOutput()'s own severity for this event, not the model's
-    // rejected value -- the invalid proposal never reaches this record.
-    expect(recommendation.severity).toBe('critical');
-    const runs = await store.withTransaction((repositories) =>
-      repositories.agentRuns.listByProject(DEV_TENANT_ID, projectId),
-    );
-    // Pi itself may reject a tool call whose arguments fail the tool's own
-    // TypeBox schema before `execute()` ever runs (surfacing as a stream
-    // error, PROVIDER_ERROR); if it lets the call through,
-    // `validateOperationalRecommendation`'s stricter Zod parse rejects it
-    // instead (INVALID_STRUCTURED_OUTPUT). Either is the correct outcome --
-    // what matters, and what every assertion above already proved, is that
-    // the invalid proposal never reaches `operational_recommendations`.
-    expect(['PROVIDER_ERROR', 'INVALID_STRUCTURED_OUTPUT']).toContain(
-      runs[0]?.failureCode,
-    );
-  });
-
-  it('falls back to defaultOutput() on a genuine provider error, with the PROVIDER_ERROR failure code', async () => {
-    const { app, store, dispatcher } = await setupHosted(
-      hostedStreamFn([
+    },
+    {
+      row: 9,
+      name: 'never submits, JSON in fenced prose (tier 2)',
+      responses: [fenced(modelFinding)],
+      persisted: modelPersisted,
+      status: 'succeeded',
+      result: 'text',
+    },
+    {
+      row: 10,
+      name: 'never submits, unparseable prose',
+      responses: [
+        fauxAssistantMessage('I am not going to return anything structured.'),
+      ],
+      persisted: fallbackPersisted,
+      status: 'failed',
+      result: 'none',
+      failureCode: 'INVALID_STRUCTURED_OUTPUT',
+    },
+    {
+      row: 11,
+      name: 'provider error',
+      responses: [
         fauxAssistantMessage('', {
           stopReason: 'error',
           errorMessage: 'simulated provider failure',
         }),
-      ]),
-    );
-    const projectId = await createProject(app, 'hosted-provider-error');
-    await drain(dispatcher);
-    await appendEvent(store, { projectId, type: 'executor.unavailable' });
-
-    expect(await dispatcher.pollOnce()).toBe(true);
-    const recommendation = (await recommendations(store, projectId))[0];
-    if (!recommendation) {
-      throw new Error('Expected the defaultOutput() fallback recommendation.');
-    }
-    expect(recommendation.title).toBe('Wait for the executor to recover');
-    const runs = await store.withTransaction((repositories) =>
-      repositories.agentRuns.listByProject(DEV_TENANT_ID, projectId),
-    );
-    expect(runs[0]).toMatchObject({
+      ],
+      persisted: fallbackPersisted,
       status: 'failed',
       failureCode: 'PROVIDER_ERROR',
+    },
+  ];
+
+  for (const behaviour of behaviours) {
+    it(`row ${behaviour.row}: ${behaviour.name}`, async () => {
+      const calls: Array<{
+        readonly apiKey: string | undefined;
+        readonly transcript: string;
+      }> = [];
+      const { app, store, dispatcher, telemetry } = await setupHosted(
+        hostedStreamFn(behaviour.responses, (_model, context, options) =>
+          calls.push({
+            apiKey: options?.apiKey,
+            transcript: transcriptText(context.messages),
+          }),
+        ),
+        { apiKey: 'test-deepseek-key' },
+      );
+      const projectId = await createProject(app, `matrix-${behaviour.row}`);
+      await drain(dispatcher);
+      const event = await appendEvent(store, {
+        projectId,
+        type: 'executor.unavailable',
+      });
+
+      expect(await dispatcher.pollOnce()).toBe(true);
+      const recommendation = (await recommendations(store, projectId))[0];
+      if (!recommendation) {
+        throw new Error('Expected exactly one persisted recommendation.');
+      }
+      expect(recommendation).toMatchObject({
+        ...behaviour.persisted,
+        triggerEventId: event.id,
+        status: 'pending',
+      });
+      const runs = await store.withTransaction((repositories) =>
+        repositories.agentRuns.listByProject(DEV_TENANT_ID, projectId),
+      );
+      expect(runs).toHaveLength(1);
+      expect(runs[0]).toMatchObject({
+        status: behaviour.status,
+        provider: 'deepseek',
+        model: 'deepseek-v4-flash',
+        ...(behaviour.failureCode
+          ? { failureCode: behaviour.failureCode }
+          : {}),
+      });
+      // Step 3's guarantee, asserted on every row rather than one: the
+      // resolved key reaches every stream call, and none of them is paid.
+      expect(calls.length).toBeGreaterThan(0);
+      expect(calls.every((call) => call.apiKey === 'test-deepseek-key')).toBe(
+        true,
+      );
+      if (behaviour.retriedWith) {
+        // The bounce is only worth its retry if the model can read it.
+        expect(calls[1]?.transcript).toContain(behaviour.retriedWith);
+      }
+      // W2: which tier produced the finding is reported, not assumed --
+      // `undefined` for a run that failed before it looked for one.
+      const runSpans = telemetry
+        .getSpans()
+        .filter((span) => span.name === 'agent.operator.run');
+      expect(runSpans).toHaveLength(1);
+      expect(runSpans[0]?.attributes.result).toBe(behaviour.result);
     });
-  });
+  }
 
   it('seeds the scoped identifiers into the prompt, and still denies an out-of-scope identifier the model supplies', async () => {
     const calls: Array<{ readonly promptText: string }> = [];

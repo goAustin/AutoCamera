@@ -740,75 +740,235 @@ export function createOperationalReadTools(
  */
 export const OPERATIONAL_SUBMISSION_TOOL_NAME = 'submit_recommendation';
 
+const RECOMMENDATION_CODE_PATTERN = /^[A-Z0-9][A-Z0-9_.-]{0,63}$/;
+const RECOMMENDATION_TITLE_MAX = 240;
+const RECOMMENDATION_DETAIL_MAX = 2_000;
+const RECOMMENDATION_SEVERITIES = ['info', 'warning', 'critical'] as const;
+const RECOMMENDATION_ACTION_TYPES = [
+  'retry_attempt',
+  'open_workflow_revision',
+  'wait_for_executor',
+  'request_human_review',
+  'no_action',
+] as const;
+
+/**
+ * Kept maximally precise -- enums, `maxLength`, `pattern`,
+ * `additionalProperties: false` -- because this is what the provider shows
+ * the model, and under N2 it costs nothing: `prepareArguments` below returns
+ * only values that already satisfy it, so pi's own check
+ * (`agent-loop.js:402`) can no longer reject a call.
+ */
 const submitRecommendationParams = typeBoxObject({
-  severity: Type.Union([
-    Type.Literal('info'),
-    Type.Literal('warning'),
-    Type.Literal('critical'),
-  ]),
+  severity: Type.Union(RECOMMENDATION_SEVERITIES.map((s) => Type.Literal(s))),
   recommendationCode: Type.String({
-    pattern: '^[A-Z0-9][A-Z0-9_.-]{0,63}$',
+    pattern: RECOMMENDATION_CODE_PATTERN.source,
   }),
-  title: Type.String({ maxLength: 240 }),
-  detail: Type.String({ maxLength: 2_000 }),
-  proposedActionType: Type.Union([
-    Type.Literal('retry_attempt'),
-    Type.Literal('open_workflow_revision'),
-    Type.Literal('wait_for_executor'),
-    Type.Literal('request_human_review'),
-    Type.Literal('no_action'),
-  ]),
+  title: Type.String({ maxLength: RECOMMENDATION_TITLE_MAX }),
+  detail: Type.String({ maxLength: RECOMMENDATION_DETAIL_MAX }),
+  proposedActionType: Type.Union(
+    RECOMMENDATION_ACTION_TYPES.map((a) => Type.Literal(a)),
+  ),
 });
 
-/** Builds the one terminal, argument-only submission tool. No evidence access. */
-export function createOperationalSubmissionTool(): AgentTool {
-  return {
-    name: OPERATIONAL_SUBMISSION_TOOL_NAME,
-    label: 'Submit operational recommendation',
-    description:
-      'Submit the one bounded operational recommendation for this incident. Call this exactly once, after gathering evidence, with your final conclusion.',
-    parameters: submitRecommendationParams,
-    execute: async (_toolCallId, params) => ({
-      ...textResult({ ok: true, code: 'OK', data: params }),
-      // The caller (operator.ts) reads arguments straight off the tool-call
-      // content block, not this result -- but stopping the agent loop here,
-      // rather than after the read tools, is this field's job.
-      terminate: true,
-    }),
-  };
-}
-
-export const operationalRecommendationSchema = z
-  .object({
-    severity: z.enum(['info', 'warning', 'critical']),
-    recommendationCode: z
-      .string()
-      .trim()
-      .regex(/^[A-Z0-9][A-Z0-9_.-]{0,63}$/),
-    title: boundedText(240),
-    detail: boundedText(2_000),
-    proposedActionType: z.enum([
-      'retry_attempt',
-      'open_workflow_revision',
-      'wait_for_executor',
-      'request_human_review',
-      'no_action',
-    ]),
-  })
-  .strict();
+export const operationalRecommendationSchema = z.object({
+  severity: z.enum(RECOMMENDATION_SEVERITIES),
+  recommendationCode: z.string().trim().regex(RECOMMENDATION_CODE_PATTERN),
+  title: boundedText(RECOMMENDATION_TITLE_MAX),
+  detail: boundedText(RECOMMENDATION_DETAIL_MAX),
+  proposedActionType: z.enum(RECOMMENDATION_ACTION_TYPES),
+});
 
 export type OperationalRecommendationOutput = z.infer<
   typeof operationalRecommendationSchema
 >;
 
+type OperationalIssue = z.ZodError['issues'][number];
+
+/**
+ * N3: repair only what is cosmetic. Unknown keys need no work here -- the
+ * schema above is no longer `.strict()`, so zod strips them -- and
+ * `.trim()` inside the field schemas handles surrounding whitespace. Casing
+ * is the one repair zod cannot express before its own `regex` runs.
+ * Anything that changes what the finding *says* is left alone, so the parse
+ * bounces it back to the model.
+ */
+function normalizeOperationalSubmission(candidate: unknown): unknown {
+  if (
+    typeof candidate !== 'object' ||
+    candidate === null ||
+    Array.isArray(candidate)
+  ) {
+    return candidate;
+  }
+  const record = candidate as Record<string, unknown>;
+  const code = record.recommendationCode;
+  if (typeof code !== 'string') return record;
+  return { ...record, recommendationCode: code.trim().toUpperCase() };
+}
+
+/** Quotes a received value for a bounce line without echoing a long payload back at the model. */
+function receivedValueText(value: unknown): string {
+  if (value === undefined) return 'nothing';
+  if (value === null) return 'null';
+  if (typeof value === 'string') {
+    return value.length > 60 ? `"${value.slice(0, 60)}..."` : `"${value}"`;
+  }
+  if (Array.isArray(value)) return 'an array';
+  if (typeof value === 'object') return 'an object';
+  return String(value);
+}
+
+/**
+ * One imperative line per issue, naming the field, the value received and --
+ * for a length overrun -- the actual overage, so a single retry is usually
+ * enough. Modelled on Claude Code's `formatZodValidationError`
+ * (`toolErrors.ts:66`): tell the model what to fix, not that it failed.
+ */
+function operationalIssueLine(
+  issue: OperationalIssue,
+  candidate: unknown,
+): string {
+  const field = issue.path[0];
+  if (typeof field !== 'string') {
+    return `the arguments must be a JSON object with the five recommendation fields (received ${receivedValueText(candidate)}).`;
+  }
+  const received =
+    typeof candidate === 'object' && candidate !== null
+      ? (candidate as Record<string, unknown>)[field]
+      : undefined;
+  switch (issue.code) {
+    case 'too_big':
+      return typeof received === 'string'
+        ? `${field} is ${received.trim().length} characters; the maximum is ${String(issue.maximum)}. Shorten it.`
+        : `${field} is too long; the maximum is ${String(issue.maximum)} characters. Shorten it.`;
+    case 'too_small':
+      return `${field} must not be empty.`;
+    case 'invalid_value':
+      return `${field} must be one of ${issue.values.map((value) => JSON.stringify(value)).join(', ')} (received ${receivedValueText(received)}).`;
+    // `recommendationCode` is the only field carrying a format, so naming its
+    // pattern here needs no dispatch on which one failed.
+    case 'invalid_format':
+      return `${field} must match ${RECOMMENDATION_CODE_PATTERN.source} -- an uppercase letter or digit, then uppercase letters, digits, "_", "." or "-" (received ${receivedValueText(received)}). It names the finding, so rewrite it rather than expecting a repair.`;
+    case 'invalid_type':
+      return received === undefined
+        ? `${field} is required.`
+        : `${field} must be a string (received ${receivedValueText(received)}).`;
+    default:
+      return `${field} was not accepted (received ${receivedValueText(received)}): ${issue.message}`;
+  }
+}
+
+type OperationalRecommendationParse =
+  | { readonly ok: true; readonly value: OperationalRecommendationOutput }
+  | { readonly ok: false; readonly issues: string };
+
+function parseOperationalRecommendation(
+  candidate: unknown,
+): OperationalRecommendationParse {
+  const result = operationalRecommendationSchema.safeParse(candidate);
+  if (result.success) return { ok: true, value: result.data };
+  const lines = result.error.issues
+    .slice(0, 8)
+    .map((issue) => `- ${operationalIssueLine(issue, candidate)}`);
+  return {
+    ok: false,
+    issues: `${OPERATIONAL_SUBMISSION_TOOL_NAME} was not accepted. Fix these and call it again:\n${lines.join('\n')}`,
+  };
+}
+
+/**
+ * The field-by-field text handed back to the model on a bounce, or
+ * `undefined` when `candidate` is already a valid recommendation.
+ */
+export function describeOperationalRecommendationIssues(
+  candidate: unknown,
+): string | undefined {
+  const parsed = parseOperationalRecommendation(candidate);
+  return parsed.ok ? undefined : parsed.issues;
+}
+
+/**
+ * Tier 2's validator: same schema, but a generic message, because prose the
+ * model already stopped narrating cannot be handed back for a retry.
+ */
 export function validateOperationalRecommendation(
   candidate: unknown,
 ): OperationalRecommendationOutput {
-  const result = operationalRecommendationSchema.safeParse(candidate);
-  if (!result.success) {
+  const parsed = parseOperationalRecommendation(candidate);
+  if (!parsed.ok) {
     throw new Error(
       'The operational Pi run returned invalid structured output.',
     );
   }
-  return result.data;
+  return parsed.value;
+}
+
+/** A submission tool plus the run-scoped state its `execute` accumulates. */
+export interface OperationalSubmission {
+  readonly tool: AgentTool;
+  /** The last accepted submission, if any. */
+  readonly accepted: () => OperationalRecommendationOutput | undefined;
+  /** submit_recommendation calls the model was asked to fix. */
+  readonly rejections: () => number;
+  /** submit_recommendation calls seen, accepted or not. */
+  readonly attempts: () => number;
+}
+
+/** Builds the one terminal, argument-only submission tool. No evidence access. */
+export function createOperationalSubmissionTool(): OperationalSubmission {
+  let accepted: OperationalRecommendationOutput | undefined;
+  let attempts = 0;
+  let rejections = 0;
+  const tool: AgentTool = {
+    name: OPERATIONAL_SUBMISSION_TOOL_NAME,
+    label: 'Submit operational recommendation',
+    description:
+      'Submit the one bounded operational recommendation for this incident. ' +
+      'Call this after gathering evidence, with your final conclusion. ' +
+      'severity is "info", "warning" or "critical"; recommendationCode is a ' +
+      'SCREAMING_SNAKE_CASE identifier of at most 64 characters; title is at ' +
+      `most ${RECOMMENDATION_TITLE_MAX} characters; detail is at most ` +
+      `${RECOMMENDATION_DETAIL_MAX} characters; proposedActionType is one of ` +
+      '"retry_attempt", "open_workflow_revision", "wait_for_executor", ' +
+      '"request_human_review", "no_action".',
+    parameters: submitRecommendationParams,
+    // N2: pi runs this before its own argument check
+    // (`agent-loop.js:401-402`) and turns a throw here into the call's error
+    // result with our wording (`:446`), which is what makes this the sole
+    // validation site -- and what lets a rejection be a retryable bounce
+    // rather than a silent fall to the lookup table.
+    prepareArguments: (args) => {
+      attempts += 1;
+      const parsed = parseOperationalRecommendation(
+        normalizeOperationalSubmission(args),
+      );
+      if (!parsed.ok) {
+        rejections += 1;
+        throw new Error(parsed.issues);
+      }
+      return parsed.value;
+    },
+    execute: async (_toolCallId, params) => {
+      // N1: the conclusion is captured where the tool runs, never by reading
+      // a message's position in the transcript. `prepareArguments` above is
+      // the only path into `execute`, so `params` is exactly the object it
+      // returned -- already parsed by `operationalRecommendationSchema`.
+      accepted = params as OperationalRecommendationOutput;
+      return {
+        ...textResult({ ok: true, code: 'OK', data: params }),
+        // Now only a turn-saving optimisation: pi terminates a batch just
+        // when every finalized call in it terminates
+        // (`agent-loop.js:376`), so a submission batched with a read call
+        // runs on -- and nothing above depends on this stopping the loop.
+        terminate: true,
+      };
+    },
+  };
+  return {
+    tool,
+    accepted: () => accepted,
+    rejections: () => rejections,
+    attempts: () => attempts,
+  };
 }
