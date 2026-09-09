@@ -1,5 +1,49 @@
 # Changelog
 
+## Phase 7E step 3 follow-up — Stop the sanitizer garbling the model's own prose
+
+Evidence level: Offline fake. No provider call was made. Fixes review finding
+1 against `ad93d57`: a defect in `safeRecommendationText` that W1/W2 made
+reachable rather than introduced.
+
+- `safeRecommendationText` (`operator.ts`) matched **any** `/` as a filesystem
+  path and the **bare word** "prompt" as prompt content. That was harmless for
+  as long as tier 1 rarely worked, because every finding came from
+  `defaultOutput()`'s fixed strings, which contain no slashes and never say
+  "prompt". Once W1/W2 made the model's own conclusion the normal path, real
+  prose started arriving here and being mangled in place:
+
+  | Written by the model | Persisted before this change |
+  |---|---|
+  | `failed 3/5 times` | `failed 3[path redacted] times` |
+  | `Retry and/or escalate` | `Retry and[path redacted] escalate` |
+  | `Queue depth was N/A` | `Queue depth was N[path redacted]` |
+  | `at 12/05 14:03 UTC` | `at 12[path redacted] 14:03 UTC` |
+  | `2 frames/second` | `2 frames[path redacted]` |
+  | `The prompt was rejected by the validator.` | `The [prompt redacted].` |
+
+- Each rule now demands evidence it is looking at the real thing. A path has
+  to start at a token boundary (`/var/lib/x`, `~/.config`, `C:\Users\x`), so a
+  slash *inside* a token stays prose; a relative path is no longer redacted,
+  which is the deliberate trade for those false positives. Prompt content has
+  to sit behind an assignment (`prompt: …`, `raw prompt = …`, `"prompt": …`)
+  rather than following the bare word. A URL rule was added ahead of the path
+  rule so a signed URL goes whole instead of surrendering its query string to
+  a rule that only understood slashes.
+- Redaction strength is unchanged, and asserted in both directions: absolute,
+  home and Windows paths, signed and non-http URLs, prompt assignments,
+  `api_key:`/`Bearer` credentials all still go, and the fallback still applies
+  when nothing survives. The five redaction cases pass against `ad93d57` too;
+  only the seven prose cases fail there.
+- This function also sanitizes the webhook body (`notify.ts:50`), so the same
+  fix reaches an operator reading alerts rather than the panel.
+- `redactFailureMessage` (`generation.ts:234`) carries the same path pattern
+  and an even broader prompt rule. Left alone: it sanitizes executor failure
+  messages, not model prose, and was not part of this finding.
+- 14 new tests, unit suite 230 to 244 across 25 files; integration unchanged
+  at 18 across 10 files. The seven prose cases were confirmed to fail against
+  `ad93d57`.
+
 ## Phase 7E step 3 follow-up — Never discard a captured conclusion; measure the tier (W4, W5)
 
 Evidence level: Offline fake. No provider call was made; every test runs

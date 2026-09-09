@@ -32,6 +32,7 @@ import { buildApiApp } from './app.js';
 import {
   createOperationalToolServices,
   OperationalPiAdapter,
+  safeRecommendationText,
   OPERATIONAL_SUBMISSION_MAX_REJECTIONS,
   OPERATIONAL_TRIGGER_EVENT_TYPES,
   type FauxOperationalScript,
@@ -1547,5 +1548,64 @@ describe('Phase 7E step 3 follow-up: W4 -- a captured conclusion survives the bo
         .find((entry) => entry.name === 'video_operator_output_tier_total')
         ?.labels.tier,
     ).toBe('error');
+  });
+});
+
+describe('safeRecommendationText', () => {
+  /**
+   * These are the sentences a real model writes. Every one of them was
+   * mangled before the rules demanded evidence of the real thing -- which
+   * went unnoticed for as long as tier 1 rarely worked, because
+   * `defaultOutput()`'s fixed strings contain no slashes and never say
+   * "prompt".
+   */
+  it.each([
+    'The attempt failed 3/5 times before the executor became unavailable.',
+    'Retry and/or escalate to a human reviewer.',
+    'Queue depth was N/A at the time of the failure.',
+    'The executor reported COMFY_UNAVAILABLE at 12/05 14:03 UTC.',
+    'Throughput dropped to 2 frames/second during the run.',
+    'The prompt was rejected by the validator.',
+    'Check the input/output ratio, then decide.',
+  ])('leaves ordinary prose alone: %s', (prose) => {
+    expect(safeRecommendationText(prose, 'fallback')).toBe(prose);
+  });
+
+  it.each([
+    ['an absolute path', 'Wrote /private/tmp/h3/out.mp4 then failed.'],
+    ['a home path', 'Config at ~/.config/h3/settings.json is stale.'],
+    ['a Windows path', String.raw`Wrote C:\Users\op\out.mp4 then failed.`],
+    [
+      'a signed URL',
+      'Fetched https://example.com/a.mp4?sig=abc123 and failed.',
+    ],
+    ['a non-http scheme', 'Object s3://bucket/key.mp4 is missing.'],
+  ])('still redacts %s', (_label, text) => {
+    const sanitized = safeRecommendationText(text, 'fallback');
+    expect(sanitized).toMatch(/\[(?:path|url) redacted\]/);
+    // Nothing of the location survives.
+    expect(sanitized).not.toMatch(/mp4|settings\.json|sig=|bucket/);
+  });
+
+  it('redacts prompt content behind an assignment, in either shape', () => {
+    expect(
+      safeRecommendationText('prompt: a cinematic shot of a cat', 'fallback'),
+    ).toBe('[prompt redacted]');
+    expect(
+      safeRecommendationText('raw prompt = a cinematic shot', 'fallback'),
+    ).toBe('[prompt redacted]');
+    expect(
+      safeRecommendationText('{"prompt": "a cinematic shot"}', 'fallback'),
+    ).not.toContain('cinematic');
+  });
+
+  it('redacts credentials, and falls back when nothing survives', () => {
+    expect(safeRecommendationText('api_key: sk-abc123', 'fallback')).toBe(
+      '[credential redacted]',
+    );
+    expect(
+      safeRecommendationText('Authorized with Bearer abc.def-123', 'fallback'),
+    ).toBe('Authorized with Bearer [redacted]');
+    expect(safeRecommendationText('   ', 'fallback')).toBe('fallback');
   });
 });
