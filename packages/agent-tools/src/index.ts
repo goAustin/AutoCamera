@@ -449,30 +449,30 @@ function operationalDenied(
   });
 }
 
+/**
+ * Both scope checks are pure: they answer whether an identifier is in scope
+ * and nothing else. Reporting is `operationalDenied`'s alone, so one denied
+ * call is one `policy.denial` event carrying the code the caller actually
+ * returns. Emitting from here as well used to put two events on the span for
+ * a single denial -- `PROJECT_SCOPE_DENIED` then `SHOT_SCOPE_DENIED` -- which
+ * doubled any denial-rate metric and disagreed with the code the model saw.
+ */
 function operationalProject(
   context: OperationalToolContext,
   requestedProjectId: string | undefined,
-  operation: OperationalToolName,
 ): Uuid | undefined {
-  if (
-    requestedProjectId !== undefined &&
-    requestedProjectId !== context.projectId
-  ) {
-    context.onPolicyDenial?.('PROJECT_SCOPE_DENIED', operation);
-    return undefined;
-  }
-  return context.projectId;
+  return requestedProjectId === undefined ||
+    requestedProjectId === context.projectId
+    ? context.projectId
+    : undefined;
 }
 
 function operationalResource(
-  context: OperationalToolContext,
   requested: string,
   expected: Uuid | undefined,
-  operation: OperationalToolName,
 ): Uuid | undefined {
   const resourceId = operationalUuid(requested);
   if (!resourceId || (expected !== undefined && resourceId !== expected)) {
-    context.onPolicyDenial?.('RESOURCE_SCOPE_DENIED', operation);
     return undefined;
   }
   return resourceId;
@@ -520,11 +520,7 @@ export function createOperationalReadTools(
             'get_project_status',
           );
         }
-        const projectId = operationalProject(
-          context,
-          parsed.data.projectId,
-          'get_project_status',
-        );
+        const projectId = operationalProject(context, parsed.data.projectId);
         if (!projectId) {
           return operationalDenied(
             context,
@@ -575,18 +571,20 @@ export function createOperationalReadTools(
             'get_shot_status',
           );
         }
-        const projectId = operationalProject(
-          context,
-          parsed.data.projectId,
-          'get_shot_status',
-        );
-        const shotId = operationalResource(
-          context,
-          parsed.data.shotId,
-          context.shotId,
-          'get_shot_status',
-        );
-        if (!projectId || !shotId) {
+        const projectId = operationalProject(context, parsed.data.projectId);
+        // Reported separately: collapsing both into SHOT_SCOPE_DENIED told a
+        // model that got projectId wrong to "call it with shotId=<the id it
+        // just sent>", which is unactionable -- it resends the same call
+        // until the run's budget bound stops it.
+        if (!projectId) {
+          return operationalDenied(
+            context,
+            'PROJECT_SCOPE_DENIED',
+            'get_shot_status',
+          );
+        }
+        const shotId = operationalResource(parsed.data.shotId, context.shotId);
+        if (!shotId) {
           return operationalDenied(
             context,
             'SHOT_SCOPE_DENIED',
@@ -637,24 +635,29 @@ export function createOperationalReadTools(
             'get_workflow_revision_validation',
           );
         }
-        const projectId = operationalProject(
-          context,
-          parsed.data.projectId,
-          'get_workflow_revision_validation',
-        );
-        const shotId = operationalResource(
-          context,
-          parsed.data.shotId,
-          context.shotId,
-          'get_workflow_revision_validation',
-        );
+        const projectId = operationalProject(context, parsed.data.projectId);
+        if (!projectId) {
+          return operationalDenied(
+            context,
+            'PROJECT_SCOPE_DENIED',
+            'get_workflow_revision_validation',
+          );
+        }
+        const shotId = operationalResource(parsed.data.shotId, context.shotId);
+        if (!shotId) {
+          return operationalDenied(
+            context,
+            'SHOT_SCOPE_DENIED',
+            'get_workflow_revision_validation',
+          );
+        }
+        // Now reached only when the revision itself is out of scope, so
+        // WORKFLOW_SCOPE_DENIED's message can name revisionId and mean it.
         const revisionId = operationalResource(
-          context,
           parsed.data.revisionId,
           context.workflowRevisionId,
-          'get_workflow_revision_validation',
         );
-        if (!projectId || !shotId || !revisionId) {
+        if (!revisionId) {
           return operationalDenied(
             context,
             'WORKFLOW_SCOPE_DENIED',
@@ -711,18 +714,19 @@ export function createOperationalReadTools(
             'get_attempt_status',
           );
         }
-        const projectId = operationalProject(
-          context,
-          parsed.data.projectId,
-          'get_attempt_status',
-        );
+        const projectId = operationalProject(context, parsed.data.projectId);
+        if (!projectId) {
+          return operationalDenied(
+            context,
+            'PROJECT_SCOPE_DENIED',
+            'get_attempt_status',
+          );
+        }
         const attemptId = operationalResource(
-          context,
           parsed.data.attemptId,
           context.attemptId,
-          'get_attempt_status',
         );
-        if (!projectId || !attemptId) {
+        if (!attemptId) {
           return operationalDenied(
             context,
             'ATTEMPT_SCOPE_DENIED',
@@ -777,11 +781,7 @@ export function createOperationalReadTools(
             'get_recent_incidents',
           );
         }
-        const projectId = operationalProject(
-          context,
-          parsed.data.projectId,
-          'get_recent_incidents',
-        );
+        const projectId = operationalProject(context, parsed.data.projectId);
         if (!projectId) {
           return operationalDenied(
             context,

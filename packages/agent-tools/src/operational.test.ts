@@ -215,6 +215,66 @@ describe('operational Pi read-only tools', () => {
     });
   });
 
+  it('reports the scope rule that actually failed, not the tool it failed in', async () => {
+    // Collapsing both checks into one code told a model that got projectId
+    // wrong to "call it with shotId=<the id it just sent>" -- unactionable, so
+    // it resends the same call until the run's budget bound stops it.
+    const denials: string[] = [];
+    const scoped = createOperationalReadTools({
+      tenantId,
+      projectId,
+      shotId,
+      attemptId,
+      workflowRevisionId: revisionId,
+      services: services(),
+      onPolicyDenial: (code, operation) => denials.push(`${code}/${operation}`),
+    });
+    const shot = scoped.find(
+      (candidate) => candidate.name === 'get_shot_status',
+    );
+    if (!shot) throw new Error('Missing tool get_shot_status.');
+
+    const wrongProject = await shot.execute('call-1', {
+      projectId: otherProjectId,
+      shotId,
+    });
+    expect(wrongProject.details).toEqual({
+      ok: false,
+      code: 'PROJECT_SCOPE_DENIED',
+      message:
+        'get_shot_status is scoped to this incident: call it with ' +
+        `projectId=${projectId}, or omit projectId.`,
+    });
+
+    // The revision tool separates all three, so WORKFLOW_SCOPE_DENIED now
+    // means the revision itself and its message can name revisionId.
+    const revision = scoped.find(
+      (candidate) => candidate.name === 'get_workflow_revision_validation',
+    );
+    if (!revision) throw new Error('Missing tool.');
+    expect(
+      (await revision.execute('call-2', { shotId: otherShotId, revisionId }))
+        .details,
+    ).toMatchObject({ code: 'SHOT_SCOPE_DENIED' });
+    expect(
+      (await revision.execute('call-3', { shotId, revisionId: otherShotId }))
+        .details,
+    ).toMatchObject({
+      code: 'WORKFLOW_SCOPE_DENIED',
+      message:
+        'get_workflow_revision_validation is scoped to this incident: call ' +
+        `it with shotId=${shotId} and revisionId=${revisionId}.`,
+    });
+
+    // One denied call is one span event, carrying the code the model saw.
+    // The scope helpers used to emit one of their own as well.
+    expect(denials).toEqual([
+      'PROJECT_SCOPE_DENIED/get_shot_status',
+      'SHOT_SCOPE_DENIED/get_workflow_revision_validation',
+      'WORKFLOW_SCOPE_DENIED/get_workflow_revision_validation',
+    ]);
+  });
+
   it('names the parameter a tool takes, not the key the context stores it under', async () => {
     // The revision is `workflowRevisionId` in the event payload and the tool
     // context, and `revisionId` on `get_workflow_revision_validation`. A

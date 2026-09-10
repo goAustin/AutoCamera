@@ -71,8 +71,19 @@ last two slices of `docs/75-PHASE-7E-STEP-3-FOLLOWUP-TOOL-USE.md`.
   file in the repo casting an identifier that way; every other `as never` is a
   deliberate wrong-type injection for an error path, and the rest of the suite
   builds a fixture id with `createUuidV7` or `as Uuid`.
-- 5 new tests, unit suite 254 to 259, files unchanged at 26; integration
-  unchanged at 18 across 10 files.
+- **A denial now reports the rule that failed, not the tool it failed in.**
+  `get_shot_status` collapsed its project check and its shot check into
+  `SHOT_SCOPE_DENIED`, so a model that got `projectId` wrong and `shotId`
+  right was told to "call it with `shotId=<the id it just sent>`" -- no
+  corrective information, and it resends the same call until the run's budget
+  bound stops it. The three multi-check tools report each check separately.
+  This also settles a double-count: `operationalProject` and
+  `operationalResource` each emitted a `policy.denial` of their own before the
+  caller emitted the code it actually returned, putting two events on the span
+  for one denial and inflating any denial-rate metric. Both are pure now and
+  `operationalDenied` is the only emitter.
+- 5 new tests, unit suite 254 to 259, files unchanged at 26, then 1 more for
+  the finding above, 259 to 260; integration unchanged at 18 across 10 files.
 
 ## One redactor, two callers
 
