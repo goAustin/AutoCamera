@@ -33,7 +33,7 @@ last two slices of `docs/75-PHASE-7E-STEP-3-FOLLOWUP-TOOL-USE.md`.
   | scope denied, resource in scope | `get_shot_status is scoped to this incident: call it with shotId=<id>.` |
   | scope denied, none in scope | `... names no shot, so there is no other one to try -- conclude from the evidence you do have.` |
   | not found / unavailable | `The executor readiness for this incident is not readable. Retrying ... will not change that ...` |
-  | invalid arguments | `get_attempt_status could not read its arguments. It takes attemptId, and optionally projectId.` |
+  | invalid arguments | `get_attempt_status was not accepted. Fix these and call it again:` + a line per field + `It takes attemptId, and optionally projectId.` |
 
 - **No scope rule changed.** The codes are the same codes, the
   `policy.denial` span event is unchanged, and `createOperationalReadTools`
@@ -82,8 +82,26 @@ last two slices of `docs/75-PHASE-7E-STEP-3-FOLLOWUP-TOOL-USE.md`.
   caller emitted the code it actually returned, putting two events on the span
   for one denial and inflating any denial-rate metric. Both are pure now and
   `operationalDenied` is the only emitter.
-- 5 new tests, unit suite 254 to 259, files unchanged at 26, then 1 more for
-  the finding above, 259 to 260; integration unchanged at 18 across 10 files.
+- **Argument guidance now reaches the model at all.** W7's sentence naming
+  what a tool takes was delivered on the one occasion it did not fit and never
+  on the occasions it did. pi validates a call against the advertised TypeBox
+  parameters *before* `execute` (`agent-loop.js:401-402`), so a wrong, missing
+  or extra parameter was rejected by pi with its own generic `Validation
+  failed for tool ...` and the guidance inside `execute` was unreachable. The
+  single input that did reach `execute` was the reverse case -- TypeBox's
+  `format: "uuid"` is laxer than zod's, so a UUID-shaped value with a bad
+  version or variant nibble got through -- and it was answered with a sentence
+  about parameter names the model had already got right, so the model resent
+  the same call. The read tools now carry `prepareArguments`, for the same
+  reason `submit_recommendation` does (N2): it runs ahead of pi's check, its
+  throw becomes the call's error result with our wording, and returning parsed
+  values makes pi's check a no-op. The six now-dead `safeParse` guards inside
+  `execute` are gone, and a UUID bounce says to copy a scoped identifier
+  rather than to compose a better-formed one.
+- 5 new tests, unit suite 254 to 259, files unchanged at 26, then 3 more for
+  the three findings above, 259 to 262; integration unchanged at 18 across 10
+  files. Each of the 3 fails against the source it fixes and passes after,
+  with every pre-existing test still passing.
 
 ## One redactor, two callers
 

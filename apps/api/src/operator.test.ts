@@ -1196,6 +1196,64 @@ describe('Phase 7E step 3: a non-faux provider via submit_recommendation', () =>
     expect(run?.status).toBe('succeeded');
   });
 
+  it('hands a bad tool call our own wording, not pi argument validation text', async () => {
+    // pi checks arguments against the advertised TypeBox parameters before
+    // `execute` (`agent-loop.js:401-402`), so the read tools' guidance used
+    // to be unreachable: the model saw pi's generic "Validation failed for
+    // tool ..." and never the sentence naming what the tool takes.
+    // `prepareArguments` runs ahead of that check, so this asserts on what
+    // actually lands in the next request's transcript.
+    const calls: string[] = [];
+    const { app, store, dispatcher } = await setupHosted(
+      hostedStreamFn(
+        [
+          // Consumed by the drained workflow.revision.invalid trigger.
+          fauxAssistantMessage([
+            fauxToolCall('submit_recommendation', validRecommendationArgs),
+          ]),
+          // `shot` is not a parameter, and `shotId` is missing entirely.
+          fauxAssistantMessage([fauxToolCall('get_shot_status', { shot: 1 })]),
+          fauxAssistantMessage([
+            fauxToolCall('submit_recommendation', validRecommendationArgs),
+          ]),
+        ],
+        (_model, context) => calls.push(transcriptText(context.messages)),
+      ),
+    );
+    const { projectId, shotId } = await createApprovedShot(app, 'hosted-args');
+    await drain(dispatcher);
+    await appendEvent(store, {
+      projectId,
+      shotId,
+      type: 'executor.unavailable',
+    });
+    expect(await dispatcher.pollOnce()).toBe(true);
+
+    const bounced = calls[2] ?? '';
+    expect(bounced).toContain(
+      'get_shot_status was not accepted. Fix these and call it again:',
+    );
+    expect(bounced).toContain('shotId is required.');
+    expect(bounced).toContain(
+      '"shot" is not a parameter of get_shot_status. Drop it.',
+    );
+    expect(bounced).toContain('It takes shotId, and optionally projectId.');
+    // The wording pi would have supplied on its own if the check ran first.
+    expect(bounced).not.toContain('Validation failed for tool');
+
+    // The bounce is a retryable turn, not a failed run.
+    const recommendation = (await recommendations(store, projectId)).find(
+      (candidate) => candidate.recommendationCode === 'EXECUTOR_UNAVAILABLE',
+    );
+    const runs = await store.withTransaction((repositories) =>
+      repositories.agentRuns.listByProject(DEV_TENANT_ID, projectId),
+    );
+    expect(
+      runs.find((candidate) => candidate.id === recommendation?.piAgentRunId)
+        ?.status,
+    ).toBe('succeeded');
+  });
+
   it('splits the claim from the model call: phase 1 commits a running run with no recommendation yet', async () => {
     const { app, store, adapter } = await setupHosted(
       hostedStreamFn([

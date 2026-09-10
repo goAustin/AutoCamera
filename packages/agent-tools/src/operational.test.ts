@@ -201,18 +201,59 @@ describe('operational Pi read-only tools', () => {
           'your conclusion from the evidence you do have.',
       },
     });
+  });
 
-    // Bad arguments name what the tool takes.
-    const badArguments = await tool('get_attempt_status').execute('call-3', {
-      attempt: attemptId,
-    });
-    expect(badArguments.details).toEqual({
-      ok: false,
-      code: 'INVALID_ARGUMENTS',
-      message:
-        'get_attempt_status could not read its arguments. It takes ' +
-        'attemptId, and optionally projectId.',
-    });
+  it('bounces bad arguments from prepareArguments, which is where pi can still be told', async () => {
+    // pi checks a call against the advertised TypeBox parameters before
+    // `execute` (`agent-loop.js:401-402`), so a guard inside `execute` never
+    // saw a wrong, missing or extra parameter -- the model got pi's generic
+    // "Validation failed for tool ..." instead of a sentence naming what the
+    // tool takes. These assertions run the path pi actually takes.
+    const attempt = tool('get_attempt_status');
+    const bounce = (args: unknown): string => {
+      try {
+        attempt.prepareArguments?.(args);
+      } catch (error) {
+        return error instanceof Error ? error.message : String(error);
+      }
+      throw new Error('Expected the arguments to be rejected.');
+    };
+
+    expect(bounce({ attempt: attemptId })).toBe(
+      'get_attempt_status was not accepted. Fix these and call it again:\n' +
+        '- attemptId is required.\n' +
+        '- "attempt" is not a parameter of get_attempt_status. Drop it.\n' +
+        'It takes attemptId, and optionally projectId.',
+    );
+
+    // The one case that did reach `execute` before: TypeBox's `format: "uuid"`
+    // admits a UUID-shaped value that zod's stricter check rejects. It used to
+    // be answered with a sentence about parameter names the model had already
+    // got right, so the model resent the same call.
+    expect(bounce({ attemptId: '00000000-0000-0000-8000-000000000006' })).toBe(
+      'get_attempt_status was not accepted. Fix these and call it again:\n' +
+        '- attemptId is not a UUID (received ' +
+        '"00000000-0000-0000-8000-000000000006"). Copy one of the scoped ' +
+        'identifiers from the prompt exactly rather than composing one.\n' +
+        'It takes attemptId, and optionally projectId.',
+    );
+
+    // A denial the operator can still count, even though the result is a
+    // throw rather than a `details` payload.
+    const denials: string[] = [];
+    const counted = createOperationalReadTools({
+      tenantId,
+      projectId,
+      services: services(),
+      onPolicyDenial: (code, operation) => denials.push(`${code}/${operation}`),
+    }).find((candidate) => candidate.name === 'get_recent_incidents');
+    expect(() => counted?.prepareArguments?.({ projectId: 12 })).toThrow();
+    expect(denials).toEqual(['INVALID_ARGUMENTS/get_recent_incidents']);
+
+    // A no-argument tool accepts an absent argument object as well as `{}`.
+    expect(
+      tool('get_executor_readiness').prepareArguments?.(undefined),
+    ).toEqual({});
   });
 
   it('reports the scope rule that actually failed, not the tool it failed in', async () => {

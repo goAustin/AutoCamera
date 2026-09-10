@@ -478,14 +478,88 @@ function operationalResource(
   return resourceId;
 }
 
-function operationalTool(input: {
+/** One imperative line per rejected argument, naming the field and the value received. */
+function operationalArgumentLine(
+  issue: OperationalIssue,
+  candidate: unknown,
+  operation: OperationalToolName,
+): string {
+  // `.strict()` reports an unknown key against the object, not a field, so
+  // this case has to come before the path lookup below.
+  if (issue.code === 'unrecognized_keys') {
+    const keys = issue.keys.map((key) => JSON.stringify(key)).join(', ');
+    return `${keys} ${issue.keys.length === 1 ? 'is not a parameter' : 'are not parameters'} of ${operation}. Drop it.`;
+  }
+  const field = issue.path[0];
+  if (typeof field !== 'string') {
+    return 'the arguments must be a JSON object.';
+  }
+  const received =
+    typeof candidate === 'object' && candidate !== null
+      ? (candidate as Record<string, unknown>)[field]
+      : undefined;
+  switch (issue.code) {
+    case 'invalid_type':
+      return received === undefined
+        ? `${field} is required.`
+        : `${field} must be a string (received ${receivedValueText(received)}).`;
+    // The only format any read tool carries. Saying "not a UUID" alone would
+    // send the model off to invent a better-formed one; what it has to do
+    // instead is copy an identifier it was already given.
+    case 'invalid_format':
+      return `${field} is not a UUID (received ${receivedValueText(received)}). Copy one of the scoped identifiers from the prompt exactly rather than composing one.`;
+    default:
+      return `${field} was not accepted (received ${receivedValueText(received)}): ${issue.message}`;
+  }
+}
+
+/**
+ * The read tools' sole argument validator, for the same reason
+ * `submit_recommendation` has one (N2): pi checks a call against the
+ * advertised TypeBox parameters *before* `execute`
+ * (`agent-loop.js:401-402`), so a wrong, missing or extra parameter never
+ * reached the zod guard inside `execute` -- the model got pi's generic
+ * "Validation failed for tool ..." instead of a sentence naming what the
+ * tool takes. The one input that did get through was the reverse case:
+ * TypeBox's `format: "uuid"` is laxer than zod's, so a UUID-shaped value
+ * with a bad version or variant nibble reached `execute` and was answered
+ * with a sentence about parameter names the model had already got right.
+ *
+ * Running here inverts both: the throw becomes the call's error result with
+ * our wording (`:446`), and returning parsed values makes pi's own check a
+ * no-op that always passes, so the advertised schema stays maximally precise
+ * as pure steering.
+ */
+function operationalArguments<T>(
+  context: OperationalToolContext,
+  operation: OperationalToolName,
+  schema: z.ZodType<T>,
+): (args: unknown) => T {
+  return (args) => {
+    // A no-argument call reaches us as `{}` from every provider seen so far,
+    // but `undefined` would otherwise bounce a correct call over nothing.
+    const parsed = schema.safeParse(args ?? {});
+    if (parsed.success) return parsed.data;
+    context.onPolicyDenial?.('INVALID_ARGUMENTS', operation);
+    const lines = parsed.error.issues
+      .slice(0, 6)
+      .map((issue) => `- ${operationalArgumentLine(issue, args, operation)}`);
+    throw new Error(
+      `${operation} was not accepted. Fix these and call it again:\n${lines.join('\n')}\n${OPERATIONAL_TOOL_ARGUMENTS[operation]}`,
+    );
+  };
+}
+
+function operationalTool<T>(input: {
   readonly name: OperationalToolName;
   readonly label: string;
   readonly description: string;
   readonly parameters: TSchema;
+  readonly context: OperationalToolContext;
+  readonly schema: z.ZodType<T>;
   readonly execute: (
     toolCallId: string,
-    params: unknown,
+    params: T,
     signal?: AbortSignal,
   ) => Promise<AgentToolResult<OperationalToolDetails>>;
 }): AgentTool {
@@ -494,8 +568,15 @@ function operationalTool(input: {
     label: input.label,
     description: input.description,
     parameters: input.parameters,
+    prepareArguments: operationalArguments(
+      input.context,
+      input.name,
+      input.schema,
+    ),
+    // `prepareArguments` is the only path into `execute` under pi, so `params`
+    // is exactly what it returned -- already parsed by `input.schema`.
     execute: async (toolCallId, params, signal) =>
-      input.execute(toolCallId, params, signal),
+      input.execute(toolCallId, params as T, signal),
   };
 }
 
@@ -511,16 +592,10 @@ export function createOperationalReadTools(
       label: 'Get project status',
       description: 'Read the scoped project status and remaining budget.',
       parameters: operationalProjectParams,
-      execute: async (_toolCallId, raw) => {
-        const parsed = operationalProjectInputSchema.safeParse(raw);
-        if (!parsed.success) {
-          return operationalDenied(
-            context,
-            'INVALID_ARGUMENTS',
-            'get_project_status',
-          );
-        }
-        const projectId = operationalProject(context, parsed.data.projectId);
+      context,
+      schema: operationalProjectInputSchema,
+      execute: async (_toolCallId, params) => {
+        const projectId = operationalProject(context, params.projectId);
         if (!projectId) {
           return operationalDenied(
             context,
@@ -562,16 +637,10 @@ export function createOperationalReadTools(
       label: 'Get shot status',
       description: 'Read the scoped shot status and acceptance criteria.',
       parameters: operationalShotParams,
-      execute: async (_toolCallId, raw) => {
-        const parsed = operationalShotInputSchema.safeParse(raw);
-        if (!parsed.success) {
-          return operationalDenied(
-            context,
-            'INVALID_ARGUMENTS',
-            'get_shot_status',
-          );
-        }
-        const projectId = operationalProject(context, parsed.data.projectId);
+      context,
+      schema: operationalShotInputSchema,
+      execute: async (_toolCallId, params) => {
+        const projectId = operationalProject(context, params.projectId);
         // Reported separately: collapsing both into SHOT_SCOPE_DENIED told a
         // model that got projectId wrong to "call it with shotId=<the id it
         // just sent>", which is unactionable -- it resends the same call
@@ -583,7 +652,7 @@ export function createOperationalReadTools(
             'get_shot_status',
           );
         }
-        const shotId = operationalResource(parsed.data.shotId, context.shotId);
+        const shotId = operationalResource(params.shotId, context.shotId);
         if (!shotId) {
           return operationalDenied(
             context,
@@ -626,16 +695,10 @@ export function createOperationalReadTools(
       label: 'Get workflow validation',
       description: 'Read only the scoped workflow revision validation summary.',
       parameters: operationalRevisionParams,
-      execute: async (_toolCallId, raw) => {
-        const parsed = operationalRevisionInputSchema.safeParse(raw);
-        if (!parsed.success) {
-          return operationalDenied(
-            context,
-            'INVALID_ARGUMENTS',
-            'get_workflow_revision_validation',
-          );
-        }
-        const projectId = operationalProject(context, parsed.data.projectId);
+      context,
+      schema: operationalRevisionInputSchema,
+      execute: async (_toolCallId, params) => {
+        const projectId = operationalProject(context, params.projectId);
         if (!projectId) {
           return operationalDenied(
             context,
@@ -643,7 +706,7 @@ export function createOperationalReadTools(
             'get_workflow_revision_validation',
           );
         }
-        const shotId = operationalResource(parsed.data.shotId, context.shotId);
+        const shotId = operationalResource(params.shotId, context.shotId);
         if (!shotId) {
           return operationalDenied(
             context,
@@ -654,7 +717,7 @@ export function createOperationalReadTools(
         // Now reached only when the revision itself is out of scope, so
         // WORKFLOW_SCOPE_DENIED's message can name revisionId and mean it.
         const revisionId = operationalResource(
-          parsed.data.revisionId,
+          params.revisionId,
           context.workflowRevisionId,
         );
         if (!revisionId) {
@@ -705,16 +768,10 @@ export function createOperationalReadTools(
       label: 'Get attempt status',
       description: 'Read the scoped attempt status and failure code only.',
       parameters: operationalAttemptParams,
-      execute: async (_toolCallId, raw) => {
-        const parsed = operationalAttemptInputSchema.safeParse(raw);
-        if (!parsed.success) {
-          return operationalDenied(
-            context,
-            'INVALID_ARGUMENTS',
-            'get_attempt_status',
-          );
-        }
-        const projectId = operationalProject(context, parsed.data.projectId);
+      context,
+      schema: operationalAttemptInputSchema,
+      execute: async (_toolCallId, params) => {
+        const projectId = operationalProject(context, params.projectId);
         if (!projectId) {
           return operationalDenied(
             context,
@@ -723,7 +780,7 @@ export function createOperationalReadTools(
           );
         }
         const attemptId = operationalResource(
-          parsed.data.attemptId,
+          params.attemptId,
           context.attemptId,
         );
         if (!attemptId) {
@@ -772,16 +829,10 @@ export function createOperationalReadTools(
       label: 'Get recent incidents',
       description: 'Read bounded sanitized incident summaries for the project.',
       parameters: operationalProjectParams,
-      execute: async (_toolCallId, raw) => {
-        const parsed = operationalProjectInputSchema.safeParse(raw);
-        if (!parsed.success) {
-          return operationalDenied(
-            context,
-            'INVALID_ARGUMENTS',
-            'get_recent_incidents',
-          );
-        }
-        const projectId = operationalProject(context, parsed.data.projectId);
+      context,
+      schema: operationalProjectInputSchema,
+      execute: async (_toolCallId, params) => {
+        const projectId = operationalProject(context, params.projectId);
         if (!projectId) {
           return operationalDenied(
             context,
@@ -831,15 +882,9 @@ export function createOperationalReadTools(
       description:
         'Read safe executor readiness and capability fingerprint data.',
       parameters: operationalEmptyParams,
-      execute: async (_toolCallId, raw) => {
-        const parsed = operationalEmptyInputSchema.safeParse(raw);
-        if (!parsed.success) {
-          return operationalDenied(
-            context,
-            'INVALID_ARGUMENTS',
-            'get_executor_readiness',
-          );
-        }
+      context,
+      schema: operationalEmptyInputSchema,
+      execute: async () => {
         try {
           const readiness = await context.services.getExecutorReadiness();
           return textResult({
