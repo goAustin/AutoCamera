@@ -64,6 +64,13 @@ last two slices of `docs/75-PHASE-7E-STEP-3-FOLLOWUP-TOOL-USE.md`.
   are the same shape. A typed `required()` helper keeps the runtime check and
   restores the static one -- swapping the shot row into the project slot is now
   a compile error.
+- **Fixture identifiers are `as Uuid`, not `as never`.** The same blind spot
+  as the shape test above, in the seven constants at the top of
+  `operational.test.ts` -- `never` is assignable to every parameter, so they
+  type-checked against any signature the tools might grow. This was the only
+  file in the repo casting an identifier that way; every other `as never` is a
+  deliberate wrong-type injection for an error path, and the rest of the suite
+  builds a fixture id with `createUuidV7` or `as Uuid`.
 - 5 new tests, unit suite 254 to 259, files unchanged at 26; integration
   unchanged at 18 across 10 files.
 

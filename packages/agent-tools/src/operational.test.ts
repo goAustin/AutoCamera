@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import type { Uuid } from '@h3/domain';
 import {
   OPERATIONAL_SUBMISSION_TOOL_NAME,
   OPERATIONAL_TOOL_NAMES,
@@ -11,13 +12,17 @@ import {
   type OperationalToolServices,
 } from './index.js';
 
-const projectId = '00000000-0000-7000-8000-000000000001' as never;
-const otherProjectId = '00000000-0000-7000-8000-000000000002' as never;
-const shotId = '00000000-0000-7000-8000-000000000003' as never;
-const otherShotId = '00000000-0000-7000-8000-000000000004' as never;
-const revisionId = '00000000-0000-7000-8000-000000000005' as never;
-const attemptId = '00000000-0000-7000-8000-000000000006' as never;
-const tenantId = '00000000-0000-7000-8000-000000000007' as never;
+// `as Uuid`, not `as never`: `never` is assignable to every parameter, so
+// these constants used to type-check against any signature the tools might
+// grow. This is the convention the rest of the suite already uses for a
+// fixture identifier (`operator.test.ts`, `control-plane.test.ts`).
+const projectId = '00000000-0000-7000-8000-000000000001' as Uuid;
+const otherProjectId = '00000000-0000-7000-8000-000000000002' as Uuid;
+const shotId = '00000000-0000-7000-8000-000000000003' as Uuid;
+const otherShotId = '00000000-0000-7000-8000-000000000004' as Uuid;
+const revisionId = '00000000-0000-7000-8000-000000000005' as Uuid;
+const attemptId = '00000000-0000-7000-8000-000000000006' as Uuid;
+const tenantId = '00000000-0000-7000-8000-000000000007' as Uuid;
 
 function services(): OperationalToolServices {
   return {
