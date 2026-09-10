@@ -1735,6 +1735,8 @@ function baseRouteSchemas() {
         spentUsd: { type: 'string' },
         remainingMicrousd: { anyOf: [{ type: 'integer' }, { type: 'null' }] },
         remainingUsd: { anyOf: [{ type: 'string' }, { type: 'null' }] },
+        inferenceCostMicrousd: { type: 'integer' },
+        inferenceCostUsd: { type: 'string' },
       },
     },
     attemptResponse: {
@@ -3495,6 +3497,8 @@ export function buildApiApp(options: ApiAppOptions = {}): FastifyInstance {
           spentUsd: formatMicrousdToUsd(cost.spentMicrousd),
           remainingMicrousd: cost.remainingMicrousd,
           remainingUsd: formatMicrousdToUsd(cost.remainingMicrousd),
+          inferenceCostMicrousd: cost.inferenceCostMicrousd,
+          inferenceCostUsd: formatMicrousdToUsd(cost.inferenceCostMicrousd),
         };
       },
     );

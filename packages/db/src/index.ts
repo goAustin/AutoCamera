@@ -282,6 +282,7 @@ export interface AgentRunRepository {
     projectId: Uuid,
   ): Promise<readonly AgentRunRecord[]>;
   update(run: AgentRunRecord, expectedVersion: number): Promise<AgentRunRecord>;
+  sumProviderCostMicrousd(tenantId: Uuid, projectId: Uuid): Promise<number>;
 }
 
 export interface WorkflowVersionRecord {
@@ -784,6 +785,10 @@ interface AgentRunRow extends QueryResultRow {
   failure_code: string | null;
   version: number;
   updated_at: DatabaseTimestamp;
+}
+
+interface AgentRunCostRow extends QueryResultRow {
+  total: string | number;
 }
 
 interface WorkflowVersionRow extends QueryResultRow {
@@ -2752,6 +2757,19 @@ class PostgresAgentRunRepository implements AgentRunRepository {
     }
     return mapAgentRun(row);
   }
+
+  async sumProviderCostMicrousd(
+    tenantId: Uuid,
+    projectId: Uuid,
+  ): Promise<number> {
+    const result = await this.executor.query<AgentRunCostRow>(
+      `SELECT COALESCE(SUM(provider_cost_microusd), 0) AS total
+       FROM agent_runs
+       WHERE tenant_id = $1 AND project_id = $2`,
+      [tenantId, projectId],
+    );
+    return databaseNumber(result.rows[0]?.total ?? 0);
+  }
 }
 
 class PostgresWorkflowVersionRepository implements WorkflowVersionRepository {
@@ -4339,6 +4357,12 @@ class MemoryRepositories implements Repositories {
         this.state.agentRuns.set(run.id, { ...run });
         return { ...run };
       },
+      sumProviderCostMicrousd: async (tenantId, projectId) =>
+        [...this.state.agentRuns.values()]
+          .filter(
+            (run) => run.tenantId === tenantId && run.projectId === projectId,
+          )
+          .reduce((sum, run) => sum + run.providerCostMicrousd, 0),
     };
     this.workflowVersions = {
       findByHash: async (workflowHash) => {

@@ -1,5 +1,52 @@
 # Changelog
 
+## Two figures where there was one: what monitoring the incident cost
+
+Evidence level: Offline. No provider call was made -- every fixture in the
+new tests seeds `agent_runs` rows directly through the repository inside a
+transaction, the same way `control-plane.test.ts` and
+`domain-api.integration.test.ts` already seed other fixture rows. Closes
+step 5 of `docs/75-PHASE-7E-OPERATIONAL-INTELLIGENCE.md`.
+
+- **`GET /v1/projects/:projectId/cost` now reports `inferenceCostMicrousd` /
+  `inferenceCostUsd`** alongside the existing budget/spent/remaining triple
+  (schema at `app.ts:1738`, route at `:3477`) -- what the per-incident
+  operator's own provider calls cost, summed across every `agent_runs` row
+  for the project. It is a fourth, independent figure, never folded into
+  `spentMicrousd` or a new "total": attempt cost is what the GPU rental
+  bought, inference cost is what monitoring it cost, and the budget breaker
+  in `infra/gpu-executor/README.md` section 8.5 only ever reads the former.
+  `generation.ts`'s three `BUDGET_EXCEEDED` paths (`:676`, `:849`, `:1665`)
+  are untouched -- they still read only `project.spentMicrousd` /
+  `project.budgetMicrousd`, never `agent_runs`.
+- **New repository method, not a reuse of `listByProject`.**
+  `AgentRunRepository.sumProviderCostMicrousd(tenantId, projectId)`
+  (`packages/db/src/index.ts:285`) is a `SELECT
+  COALESCE(SUM(provider_cost_microusd), 0)` in Postgres, scoped by the
+  existing `agent_runs_project_started_idx` index, and a `.reduce` over the
+  in-memory store's map. `listByProject` returns every column of every row
+  -- ids, timestamps, status -- to answer a question that needs one summed
+  column, and a project accumulates one `agent_runs` row per operator
+  trigger or digest for its whole lifetime, while `GET /cost` is a plain
+  read a dashboard can poll. The `COALESCE` matters: a bare `SUM` over zero
+  matching rows is `NULL` in Postgres, and the in-memory store's `.reduce`
+  needs the same zero seed -- both must return a plain `0`, which is
+  asserted against a real database in `domain-api.integration.test.ts`,
+  since that particular divergence is invisible to a unit test running only
+  the in-memory store.
+- **No metric added.** The spec allows reusing
+  `video_operator_recommendations_total` if a new counter can be justified;
+  `GET /cost` is a pure read and none of its existing three fields emit a
+  metric on read, so there was no event here to attach one to.
+- Five new tests: three unit (`domain-api.test.ts`) covering zero agent
+  runs, several runs summed, and the isolation guarantee -- an inference
+  cost five times a project's whole budget must leave `spentMicrousd` and
+  `remainingMicrousd` untouched, which a wrong implementation would either
+  throw `NEGATIVE_MONEY` out of `subtractMicrousd` or silently corrupt; two
+  integration (`domain-api.integration.test.ts`) proving the zero- and
+  several-row cases against real PostgreSQL. 265 unit (26 files, was 262)
+  and 20 integration (10 files, was 18).
+
 ## The evidence arrives with the prompt, and a denial says what to do
 
 Evidence level: Offline fake. No provider call was made. Closes W6 and W7, the

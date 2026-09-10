@@ -2,6 +2,7 @@ import {
   createDomainEvent,
   createShot,
   createVideoProject,
+  assertMicrousd,
   assertUuid,
   subtractMicrousd,
   systemClock,
@@ -73,6 +74,7 @@ export interface ProjectCost {
   readonly budgetMicrousd: MicroUsd | null;
   readonly spentMicrousd: MicroUsd;
   readonly remainingMicrousd: MicroUsd | null;
+  readonly inferenceCostMicrousd: MicroUsd;
 }
 
 export class ProjectApplicationService {
@@ -237,6 +239,12 @@ export class ProjectApplicationService {
   async getCost(projectId: Uuid): Promise<ProjectCost> {
     return this.store.withTransaction(async (repositories) => {
       const project = await this.requireProject(repositories, projectId);
+      const inferenceCostMicrousd = assertMicrousd(
+        await repositories.agentRuns.sumProviderCostMicrousd(
+          this.tenantId,
+          projectId,
+        ),
+      );
       return {
         budgetMicrousd: project.budgetMicrousd,
         spentMicrousd: project.spentMicrousd,
@@ -244,6 +252,7 @@ export class ProjectApplicationService {
           project.budgetMicrousd,
           project.spentMicrousd,
         ),
+        inferenceCostMicrousd,
       };
     });
   }

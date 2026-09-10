@@ -7,6 +7,7 @@ import {
   createDatabasePool,
   createPostgresStore,
   runMigrations,
+  type AgentRunRecord,
 } from '@h3/db';
 import { createDomainEvent, createUuidV7, type Uuid } from '@h3/domain';
 import { loadMinimaxH3Fixtures } from '@h3/workflow-compiler';
@@ -38,6 +39,35 @@ function authHeaders(key?: string): Record<string, string> {
 
 function uniqueKey(prefix: string): string {
   return `${prefix}-${randomUUID()}`;
+}
+
+function agentRunFixture(
+  projectId: Uuid,
+  runId: string,
+  providerCostMicrousd: number,
+): AgentRunRecord {
+  const startedAt = new Date().toISOString();
+  return {
+    id: createUuidV7(),
+    tenantId: DEV_TENANT_ID,
+    projectId,
+    runId,
+    sessionId: `session-${runId}`,
+    objective: 'Recommend a bounded operational action from durable evidence.',
+    provider: 'faux',
+    model: 'faux-model',
+    status: 'succeeded',
+    toolCalls: 1,
+    inputTokens: 100,
+    outputTokens: 50,
+    totalTokens: 150,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    providerCostMicrousd,
+    startedAt,
+    version: 1,
+    updatedAt: startedAt,
+  };
 }
 
 beforeAll(async () => {
@@ -373,5 +403,77 @@ describe('Phase 7E operational event durability', () => {
       [projectId],
     );
     expect(persistedRecommendations.rows).toEqual([{ id: recommendation.id }]);
+  });
+});
+
+describe('Phase 7E step 5 — inference cost against real PostgreSQL', () => {
+  it('returns 0, not null, for a project with no agent runs', async () => {
+    // A bare `SUM(provider_cost_microusd)` over zero matching rows is NULL
+    // in PostgreSQL; the repository query must COALESCE it. This is the one
+    // divergence from the in-memory store that a unit test cannot catch.
+    const create = await app.inject({
+      method: 'POST',
+      url: '/v1/projects',
+      headers: authHeaders(uniqueKey('pg-cost-zero-runs')),
+      payload: {
+        title: 'PostgreSQL project with no agent runs',
+        brief: 'Confirms SUM is coalesced to zero.',
+        targetDurationSeconds: 4,
+      },
+    });
+    expect(create.statusCode).toBe(201);
+    const projectId = create.json().project.id as Uuid;
+
+    const cost = await app.inject({
+      method: 'GET',
+      url: `/v1/projects/${projectId}/cost`,
+      headers: authHeaders(),
+    });
+    expect(cost.statusCode).toBe(200);
+    expect(cost.json().inferenceCostMicrousd).toBe(0);
+  });
+
+  it('sums provider cost across several agent runs through a real BIGINT round trip', async () => {
+    const create = await app.inject({
+      method: 'POST',
+      url: '/v1/projects',
+      headers: authHeaders(uniqueKey('pg-cost-several-runs')),
+      payload: {
+        title: 'PostgreSQL project with several agent runs',
+        brief: 'Confirms SUM aggregates across rows.',
+        targetDurationSeconds: 4,
+      },
+    });
+    expect(create.statusCode).toBe(201);
+    const projectId = create.json().project.id as Uuid;
+
+    const runCosts = [1_250_000, 2_000_000, 500_000];
+    await store.withTransaction(async (repositories) => {
+      for (const [index, providerCostMicrousd] of runCosts.entries()) {
+        await repositories.agentRuns.create(
+          agentRunFixture(
+            projectId,
+            uniqueKey(`pg-run-${index}`),
+            providerCostMicrousd,
+          ),
+        );
+      }
+    });
+    const totalMicrousd = runCosts.reduce((sum, value) => sum + value, 0);
+
+    const cost = await app.inject({
+      method: 'GET',
+      url: `/v1/projects/${projectId}/cost`,
+      headers: authHeaders(),
+    });
+    expect(cost.statusCode).toBe(200);
+    expect(cost.json().inferenceCostMicrousd).toBe(totalMicrousd);
+
+    const persistedSum = await pool.query<{ total: string }>(
+      `SELECT COALESCE(SUM(provider_cost_microusd), 0)::text AS total
+       FROM agent_runs WHERE project_id = $1`,
+      [projectId],
+    );
+    expect(Number(persistedSum.rows[0]?.total)).toBe(totalMicrousd);
   });
 });
