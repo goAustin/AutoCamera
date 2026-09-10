@@ -1655,11 +1655,14 @@ function operationalPrompt(
   context: OperationalToolContext,
   evidence: ResolvedOperationalViews,
 ): string {
+  // Every entry is named as the tool's own parameter, so a model can copy one
+  // straight into a call. The revision is the one place those differ: the
+  // event payload calls it `workflowRevisionId`, the tool takes `revisionId`.
   const scope = [`projectId=${context.projectId}`];
   if (context.shotId) scope.push(`shotId=${context.shotId}`);
   if (context.attemptId) scope.push(`attemptId=${context.attemptId}`);
   if (context.workflowRevisionId) {
-    scope.push(`workflowRevisionId=${context.workflowRevisionId}`);
+    scope.push(`revisionId=${context.workflowRevisionId}`);
   }
   return (
     `Review durable event ${event.id} (${event.type}) for this incident. ` +

@@ -1085,6 +1085,11 @@ describe('Phase 7E step 3: a non-faux provider via submit_recommendation', () =>
     // have spent a call on.
     expect(prompts[0]).toContain(`- get_workflow_revision_validation: {"id":"`);
     expect(prompts[0]).toContain('"validationStatus":"invalid"');
+    // The scope line above the block names identifiers by the parameter the
+    // tool takes: the payload's `workflowRevisionId` is `revisionId` there,
+    // and the block sits directly beneath it.
+    expect(prompts[0]).toContain('revisionId=');
+    expect(prompts[0]).not.toContain('workflowRevisionId=');
 
     await appendEvent(store, {
       projectId,

@@ -47,7 +47,24 @@ last two slices of `docs/75-PHASE-7E-STEP-3-FOLLOWUP-TOOL-USE.md`.
   exported `OperationalEvidenceViews` the renderer takes, and `runPi`'s
   evidence parameter is `ResolvedOperationalEvidence` rather than a fifth
   inline copy of the same five fields.
-- 4 new tests, unit suite 254 to 258, files unchanged at 26; integration
+- **Review, two findings, both fixed here.** The scope denial named the
+  *context key* rather than the tool's parameter, which diverge in exactly one
+  place: the revision is `workflowRevisionId` in the event payload and
+  `revisionId` on `get_workflow_revision_validation`. So a denial could send
+  the model back with a parameter no tool takes -- W7 inverted. The two names
+  now live in one table (`OPERATIONAL_SCOPED_PARAMETERS`) that the message
+  reads, and the ad-hoc two-identifier branch is gone. `operationalPrompt`'s
+  scope line had the same mismatch, pre-existing since step 3 and made likelier
+  to be copied by putting the evidence block directly under it; it now says
+  `revisionId=` too, asserted in both the tool test and the adapter test.
+- **The W6 shape test now type-checks the shape it asserts.** It cast each
+  resolved row `as never` to strip `| null`, which also erased the type: a
+  service returning something else would still have compiled and still passed,
+  in the one test whose whole point is that the seeded row and the tool result
+  are the same shape. A typed `required()` helper keeps the runtime check and
+  restores the static one -- swapping the shot row into the project slot is now
+  a compile error.
+- 5 new tests, unit suite 254 to 259, files unchanged at 26; integration
   unchanged at 18 across 10 files.
 
 ## One redactor, two callers

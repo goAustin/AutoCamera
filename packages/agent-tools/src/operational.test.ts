@@ -7,6 +7,7 @@ import {
   describeOperationalEvidence,
   validateOperationalRecommendation,
   describeOperationalRecommendationIssues,
+  type OperationalEvidenceViews,
   type OperationalToolServices,
 } from './index.js';
 
@@ -84,6 +85,12 @@ function services(): OperationalToolServices {
       runningCount: 1,
     }),
   };
+}
+
+/** Keeps a resolved row's own type while asserting the fixture actually returned it. */
+function required<T>(value: T | null, what: string): T {
+  if (!value) throw new Error(`Expected the ${what} fixture to resolve.`);
+  return value;
 }
 
 function tool(name: string, servicesOverride?: OperationalToolServices) {
@@ -203,29 +210,84 @@ describe('operational Pi read-only tools', () => {
     });
   });
 
+  it('names the parameter a tool takes, not the key the context stores it under', async () => {
+    // The revision is `workflowRevisionId` in the event payload and the tool
+    // context, and `revisionId` on `get_workflow_revision_validation`. A
+    // denial that echoed the context key would send the model back with a
+    // parameter no tool accepts.
+    const denied = await tool('get_workflow_revision_validation').execute(
+      'call-1',
+      { projectId, shotId, revisionId: otherShotId },
+    );
+    expect(denied.details).toEqual({
+      ok: false,
+      code: 'WORKFLOW_SCOPE_DENIED',
+      message:
+        'get_workflow_revision_validation is scoped to this incident: call ' +
+        `it with shotId=${shotId} and revisionId=${revisionId}.`,
+    });
+
+    // `createOperationalReadTools` is exported, and its context permits a shot
+    // with no revision -- the adapter never builds that, but the message has
+    // to name `revisionId` there too.
+    const revisionless = createOperationalReadTools({
+      tenantId,
+      projectId,
+      shotId,
+      services: services(),
+    }).find(
+      (candidate) => candidate.name === 'get_workflow_revision_validation',
+    );
+    if (!revisionless) throw new Error('Missing the revision tool.');
+    expect(
+      await revisionless.execute('call-2', {
+        projectId,
+        shotId,
+        revisionId: '00000000-0000-4000-8000-000000000009',
+      }),
+    ).toMatchObject({
+      details: {
+        code: 'WORKFLOW_SCOPE_DENIED',
+        message:
+          'get_workflow_revision_validation did not accept that revisionId. ' +
+          `This incident is scoped to projectId=${projectId} and names no ` +
+          'workflow revision, so there is no other one to try -- conclude ' +
+          'from the evidence you do have.',
+      },
+    });
+  });
+
   it('seeds the resolved evidence in the exact shape the tools return it', async () => {
     // W6: the prompt block and the tool result are one sanitizer, so a model
     // that re-reads a seeded row gets the same bytes back and has nothing to
     // reconcile.
     const resolved = services();
-    const evidence = {
-      project: (await resolved.getProjectStatus(tenantId, projectId)) as never,
-      shot: (await resolved.getShotStatus(
-        tenantId,
-        projectId,
-        shotId,
-      )) as never,
-      attempt: (await resolved.getAttemptStatus(
-        tenantId,
-        projectId,
-        attemptId,
-      )) as never,
-      revision: (await resolved.getWorkflowRevisionValidation(
-        tenantId,
-        projectId,
-        shotId,
-        revisionId,
-      )) as never,
+    // Typed, not cast: this test exists to prove the seeded row and the tool
+    // result are the same shape, and `as never` would have thrown away the
+    // compile-time half of that -- a service returning something else would
+    // still have compiled.
+    const evidence: OperationalEvidenceViews = {
+      project: required(
+        await resolved.getProjectStatus(tenantId, projectId),
+        'project',
+      ),
+      shot: required(
+        await resolved.getShotStatus(tenantId, projectId, shotId),
+        'shot',
+      ),
+      attempt: required(
+        await resolved.getAttemptStatus(tenantId, projectId, attemptId),
+        'attempt',
+      ),
+      revision: required(
+        await resolved.getWorkflowRevisionValidation(
+          tenantId,
+          projectId,
+          shotId,
+          revisionId,
+        ),
+        'workflow revision',
+      ),
     };
     const seeded = describeOperationalEvidence(evidence);
 

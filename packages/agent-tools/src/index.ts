@@ -343,7 +343,7 @@ type OperationalToolDetails =
       readonly message: string;
     };
 
-/** What each tool accepts, for the one denial the model can fix by re-reading this. */
+/** What each tool accepts, named in every argument bounce `prepareArguments` throws. */
 const OPERATIONAL_TOOL_ARGUMENTS: Record<OperationalToolName, string> = {
   get_project_status: 'It takes an optional projectId and nothing else.',
   get_shot_status: 'It takes shotId, and optionally projectId.',
@@ -352,6 +352,24 @@ const OPERATIONAL_TOOL_ARGUMENTS: Record<OperationalToolName, string> = {
   get_attempt_status: 'It takes attemptId, and optionally projectId.',
   get_recent_incidents: 'It takes an optional projectId and nothing else.',
   get_executor_readiness: 'It takes no arguments.',
+};
+
+type OperationalScopedKey = 'shotId' | 'attemptId' | 'workflowRevisionId';
+
+/**
+ * The parameter each scoped identifier is *called* by, which is not the
+ * context key for the revision: the payload and the tool context call it
+ * `workflowRevisionId`, `operationalRevisionParams` calls it `revisionId`. A
+ * denial that named the context key would tell the model to send a parameter
+ * no tool takes -- the opposite of W7's point.
+ */
+const OPERATIONAL_SCOPED_PARAMETERS: Record<
+  OperationalScopedKey,
+  { readonly parameter: string; readonly noun: string }
+> = {
+  shotId: { parameter: 'shotId', noun: 'shot' },
+  attemptId: { parameter: 'attemptId', noun: 'attempt' },
+  workflowRevisionId: { parameter: 'revisionId', noun: 'workflow revision' },
 };
 
 /**
@@ -367,14 +385,26 @@ function operationalDenialMessage(
   code: string,
   operation: OperationalToolName,
 ): string {
+  /**
+   * Names every identifier the call needs, or -- when one of them is not in
+   * this run's scope at all -- says so about the first that is missing, since
+   * there is no value to offer for it.
+   */
   const scoped = (
-    label: 'shotId' | 'attemptId' | 'workflowRevisionId',
-    noun: string,
+    ...keys: readonly [OperationalScopedKey, ...OperationalScopedKey[]]
   ): string => {
-    const value = context[label];
-    return value
-      ? `${operation} is scoped to this incident: call it with ${label}=${value}.`
-      : `${operation} did not accept that ${label}. This incident is scoped to projectId=${context.projectId} and names no ${noun}, so there is no other one to try -- conclude from the evidence you do have.`;
+    const missing = keys.find((key) => context[key] === undefined);
+    if (!missing) {
+      const args = keys
+        .map(
+          (key) =>
+            `${OPERATIONAL_SCOPED_PARAMETERS[key].parameter}=${context[key]}`,
+        )
+        .join(' and ');
+      return `${operation} is scoped to this incident: call it with ${args}.`;
+    }
+    const { parameter, noun } = OPERATIONAL_SCOPED_PARAMETERS[missing];
+    return `${operation} did not accept that ${parameter}. This incident is scoped to projectId=${context.projectId} and names no ${noun}, so there is no other one to try -- conclude from the evidence you do have.`;
   };
   const unavailable = (noun: string): string =>
     `The ${noun} for this incident is not readable. Retrying ${operation} will not change that -- reach your conclusion from the evidence you do have.`;
@@ -382,13 +412,11 @@ function operationalDenialMessage(
     case 'PROJECT_SCOPE_DENIED':
       return `${operation} is scoped to this incident: call it with projectId=${context.projectId}, or omit projectId.`;
     case 'SHOT_SCOPE_DENIED':
-      return scoped('shotId', 'shot');
+      return scoped('shotId');
     case 'ATTEMPT_SCOPE_DENIED':
-      return scoped('attemptId', 'attempt');
+      return scoped('attemptId');
     case 'WORKFLOW_SCOPE_DENIED':
-      return context.shotId && context.workflowRevisionId
-        ? `${operation} is scoped to this incident: call it with shotId=${context.shotId} and revisionId=${context.workflowRevisionId}.`
-        : scoped('workflowRevisionId', 'workflow revision');
+      return scoped('shotId', 'workflowRevisionId');
     case 'INVALID_ARGUMENTS':
       return `${operation} could not read its arguments. ${OPERATIONAL_TOOL_ARGUMENTS[operation]}`;
     case 'PROJECT_NOT_FOUND':
