@@ -1035,13 +1035,26 @@ function receivedValueText(value: unknown): string {
  * enough. Modelled on Claude Code's `formatZodValidationError`
  * (`toolErrors.ts:66`): tell the model what to fix, not that it failed.
  */
+interface OperationalIssueHints {
+  /** What a caller that sent something other than an object should send instead. */
+  readonly shape: string;
+  /** What the one format-carrying field in this schema must look like. */
+  readonly format: string;
+}
+
+const RECOMMENDATION_ISSUE_HINTS: OperationalIssueHints = {
+  shape: 'a JSON object with the five recommendation fields',
+  format: `must match ${RECOMMENDATION_CODE_PATTERN.source} -- an uppercase letter or digit, then uppercase letters, digits, "_", "." or "-"`,
+};
+
 function operationalIssueLine(
   issue: OperationalIssue,
   candidate: unknown,
+  hints: OperationalIssueHints = RECOMMENDATION_ISSUE_HINTS,
 ): string {
   const field = issue.path[0];
   if (typeof field !== 'string') {
-    return `the arguments must be a JSON object with the five recommendation fields (received ${receivedValueText(candidate)}).`;
+    return `the arguments must be ${hints.shape} (received ${receivedValueText(candidate)}).`;
   }
   const received =
     typeof candidate === 'object' && candidate !== null
@@ -1056,10 +1069,10 @@ function operationalIssueLine(
       return `${field} must not be empty.`;
     case 'invalid_value':
       return `${field} must be one of ${issue.values.map((value) => JSON.stringify(value)).join(', ')} (received ${receivedValueText(received)}).`;
-    // `recommendationCode` is the only field carrying a format, so naming its
-    // pattern here needs no dispatch on which one failed.
+    // Each schema carries a format on exactly one field, so naming that
+    // field's rule here needs no dispatch on which one failed.
     case 'invalid_format':
-      return `${field} must match ${RECOMMENDATION_CODE_PATTERN.source} -- an uppercase letter or digit, then uppercase letters, digits, "_", "." or "-" (received ${receivedValueText(received)}). It names the finding, so rewrite it rather than expecting a repair.`;
+      return `${field} ${hints.format} (received ${receivedValueText(received)}). Rewrite it rather than expecting a repair.`;
     case 'invalid_type':
       return received === undefined
         ? `${field} is required.`
@@ -1180,6 +1193,142 @@ export function createOperationalSubmissionTool(): OperationalSubmission {
         // when every finalized call in it terminates
         // (`agent-loop.js:376`), so a submission batched with a read call
         // runs on -- and nothing above depends on this stopping the loop.
+        terminate: true,
+      };
+    },
+  };
+  return {
+    tool,
+    accepted: () => accepted,
+    rejections: () => rejections,
+    attempts: () => attempts,
+  };
+}
+
+export const OPERATIONAL_DIGEST_TOOL_NAME = 'submit_digest';
+
+const DIGEST_TITLE_MAX = 240;
+const DIGEST_DETAIL_MAX = 2_000;
+/**
+ * Bounds what the model may cite, not what the window may contain: the
+ * service intersects these against the runs the window actually holds, so a
+ * longer list would only be a longer list to deny.
+ */
+const DIGEST_MAX_REFERENCED_RUNS = 20;
+
+const submitDigestParams = typeBoxObject({
+  severity: Type.Union(RECOMMENDATION_SEVERITIES.map((s) => Type.Literal(s))),
+  title: Type.String({ maxLength: DIGEST_TITLE_MAX }),
+  detail: Type.String({ maxLength: DIGEST_DETAIL_MAX }),
+  referencedRunIds: Type.Array(Type.String({ format: 'uuid' }), {
+    maxItems: DIGEST_MAX_REFERENCED_RUNS,
+  }),
+});
+
+/**
+ * The session digest's output contract, held to the same discipline as
+ * `operationalRecommendationSchema`: bounded severity, bounded prose, and --
+ * in place of a proposed action the digest never makes -- the runs it read
+ * (`docs/75-PHASE-7E-OPERATIONAL-INTELLIGENCE.md` step 4).
+ */
+export const operationalDigestSchema = z.object({
+  severity: z.enum(RECOMMENDATION_SEVERITIES),
+  title: boundedText(DIGEST_TITLE_MAX),
+  detail: boundedText(DIGEST_DETAIL_MAX),
+  referencedRunIds: z
+    .array(z.string().trim().regex(uuidPattern))
+    .max(DIGEST_MAX_REFERENCED_RUNS),
+});
+
+export type OperationalDigestOutput = z.infer<typeof operationalDigestSchema>;
+
+const DIGEST_ISSUE_HINTS: OperationalIssueHints = {
+  shape: 'a JSON object with severity, title, detail and referencedRunIds',
+  format: 'must be a UUID naming a run from this window',
+};
+
+type OperationalDigestParse =
+  | { readonly ok: true; readonly value: OperationalDigestOutput }
+  | { readonly ok: false; readonly issues: string };
+
+/** The one place a candidate becomes a digest, for the tool and for text extraction alike. */
+function parseOperationalDigest(raw: unknown): OperationalDigestParse {
+  const result = operationalDigestSchema.safeParse(raw);
+  if (result.success) return { ok: true, value: result.data };
+  const lines = result.error.issues
+    .slice(0, 8)
+    .map(
+      (issue) => `- ${operationalIssueLine(issue, raw, DIGEST_ISSUE_HINTS)}`,
+    );
+  return {
+    ok: false,
+    issues: `${OPERATIONAL_DIGEST_TOOL_NAME} was not accepted. Fix these and call it again:\n${lines.join('\n')}`,
+  };
+}
+
+/** The field-by-field text the digest tool hands back on a bounce, or `undefined` when it would accept. */
+export function describeOperationalDigestIssues(
+  candidate: unknown,
+): string | undefined {
+  const parsed = parseOperationalDigest(candidate);
+  return parsed.ok ? undefined : parsed.issues;
+}
+
+export function validateOperationalDigest(
+  candidate: unknown,
+): OperationalDigestOutput {
+  const parsed = parseOperationalDigest(candidate);
+  if (!parsed.ok) {
+    throw new Error(
+      'The session digest run returned invalid structured output.',
+    );
+  }
+  return parsed.value;
+}
+
+/** A digest submission tool plus the run-scoped state its `execute` accumulates. */
+export interface OperationalDigestSubmission {
+  readonly tool: AgentTool;
+  readonly accepted: () => OperationalDigestOutput | undefined;
+  readonly rejections: () => number;
+  readonly attempts: () => number;
+}
+
+/**
+ * The digest's terminal, argument-only submission tool. Like
+ * `createOperationalSubmissionTool` it reads nothing and writes nothing --
+ * it is the output path, not a seventh evidence tool, and
+ * `createOperationalReadTools` still returns exactly six.
+ */
+export function createOperationalDigestTool(): OperationalDigestSubmission {
+  let accepted: OperationalDigestOutput | undefined;
+  let attempts = 0;
+  let rejections = 0;
+  const tool: AgentTool = {
+    name: OPERATIONAL_DIGEST_TOOL_NAME,
+    label: 'Submit session digest',
+    description:
+      'Submit the one bounded digest for this session window. Call this ' +
+      'after gathering evidence, with your final summary. severity is ' +
+      '"info", "warning" or "critical"; title is at most ' +
+      `${DIGEST_TITLE_MAX} characters; detail is at most ` +
+      `${DIGEST_DETAIL_MAX} characters; referencedRunIds lists at most ` +
+      `${DIGEST_MAX_REFERENCED_RUNS} run UUIDs you actually read, and may ` +
+      'be empty. Propose no action -- a digest narrates, it does not act.',
+    parameters: submitDigestParams,
+    prepareArguments: (args) => {
+      attempts += 1;
+      const parsed = parseOperationalDigest(args);
+      if (!parsed.ok) {
+        rejections += 1;
+        throw new Error(parsed.issues);
+      }
+      return parsed.value;
+    },
+    execute: async (_toolCallId, params) => {
+      accepted = params as OperationalDigestOutput;
+      return {
+        ...textResult({ ok: true, code: 'OK', data: params }),
         terminate: true,
       };
     },

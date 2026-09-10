@@ -1,5 +1,68 @@
 # Changelog
 
+## Four hours of a rented GPU, in one bounded paragraph
+
+Evidence level: Offline. No provider call was made -- every test runs against
+the faux provider or an injected stub, and the faux provider prices its own
+usage at zero (`providers/faux.js`: `cost: { total: 0 }`), so **the measured
+cost of a digest in this checkpoint is 0 microusd and the token counts are the
+faux provider's own estimates, not a real model's**. Closes step 4 of
+`docs/75-PHASE-7E-OPERATIONAL-INTELLIGENCE.md`, and with it the last open item
+in that checkpoint's acceptance gate.
+
+- **`POST /v1/projects/:projectId/digest`** (`app.ts:3651`) runs one agent over
+  a time window instead of one event, and returns a bounded, Zod-validated,
+  sanitized struct: severity, title, detail, the run ids it actually read, the
+  window, and the id of its own `agent_runs` row. Body is
+  `{ sinceIso, untilIso? }`; `untilIso` defaults to now, so "digest the session
+  I just finished" is one field. A window that ends before it starts is a 422.
+- **The route is scoped, not `POST /v1/digest` as the spec wrote it.**
+  `agent_runs.project_id` is `NOT NULL`, so a project-less digest cannot record
+  the run row step 4 requires -- and would be invisible to the
+  `inferenceCostMicrousd` figure step 5 added. Path scoping is also this API's
+  own rule: every project-mandatory surface is nested, and `POST /v1/runs`
+  carries a body `projectId` only because there the project is optional. The
+  correction is recorded in the phase doc's step 4.
+- **The window is applied to the services, not to the tools.**
+  `createOperationalReadTools` is called exactly as the per-incident operator
+  calls it and still returns six reads; `OperationalDigestService` wraps the
+  services those tools read through, so `get_recent_incidents` -- the only
+  time-varying one of the six -- sees only the window. Verified by mutation:
+  deleting the window filter fails "bounds the evidence to the window rather
+  than the project" and nothing else.
+- **A run id the window does not contain is denied, not repeated.** The digest
+  may cite only attempt ids that appear in the window's own incident rows;
+  anything else the model supplies is dropped, on the same rule step 3 applied
+  to out-of-scope tool arguments. Verified by mutation: disabling the
+  intersection fails "denies a run id the window does not contain" and nothing
+  else.
+- **Three phases, so a retry cannot buy a second inference call.**
+  `executeIdempotentDeferred` (`app.ts:1444`) reserves the `Idempotency-Key`
+  and commits, runs the provider round trip with no transaction open and no
+  pooled connection held, then commits the response -- step 3's discipline,
+  applied to a route rather than to the outbox. A caller racing the same key
+  reads the committed reservation and gets `409 IDEMPOTENCY_IN_PROGRESS`
+  instead of a second paid run; a replay returns the first digest verbatim. If
+  the work throws, the reservation is released, so a failure does not wedge the
+  key. Verified by mutation against real PostgreSQL: swapping in the
+  single-transaction `executeIdempotent` fails the race test, because the
+  reservation is then never visible to another connection while the model runs.
+- **Provider failure degrades rather than fails**, as the per-incident operator
+  does: the run persists with its failure code and the caller still gets the
+  lookup-table digest, which narrates only what the incident rows already say
+  -- counts and event types -- because a fallback that guessed would be worse
+  than one that summarises.
+- **No new metric label.** A digest counts as `run_type: 'operator'` on the
+  existing `pi_agent_runs_total`; it is the operator reasoning over a window
+  instead of an event, and changing the metric label allowlist is an explicit
+  non-goal of this checkpoint.
+- **One implementation, two callers**, on the `redact.ts` precedent: the Pi-run
+  bookkeeping both paths need -- transcript reading, usage totalling,
+  telemetry adaptation, failure naming, and hosted-model resolution -- moved to
+  `apps/api/src/pi-run.ts` unchanged, so adding a provider stays one edit.
+  `operator.ts` behaviour is untouched; its suite proves it.
+- 278 unit (27 files, was 266) and 22 integration (11 files, was 20).
+
 ## Monitoring spend cannot deny a generation, and a test that would notice
 
 Evidence level: Offline. No provider call was made -- the new test seeds one

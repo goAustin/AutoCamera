@@ -2,8 +2,6 @@ import {
   Agent,
   type AgentEvent,
   type StreamFn,
-  type TelemetryContext,
-  type TelemetrySpan,
 } from '@earendil-works/pi-agent-core';
 import {
   createModels,
@@ -11,10 +9,8 @@ import {
   fauxProvider,
   fauxToolCall,
   type Api,
-  type AssistantMessage,
   type Model,
 } from '@earendil-works/pi-ai';
-import { deepseekProvider } from '@earendil-works/pi-ai/providers/deepseek';
 import {
   createOperationalReadTools,
   createOperationalSubmissionTool,
@@ -33,6 +29,15 @@ import {
 } from '@h3/agent-tools';
 import { safeRecommendationText } from './redact.js';
 import {
+  asAgentRunStatus,
+  assistantMessages,
+  assistantText,
+  failureCodeFor,
+  piTelemetryContext,
+  resolveHostedModel,
+  usageTotals,
+} from './pi-run.js';
+import {
   createDomainEvent,
   isUuidV7,
   subtractMicrousd,
@@ -44,9 +49,7 @@ import {
 } from '@h3/domain';
 import type {
   OutboxDispatcher,
-  AgentRunFailureCode,
   AgentRunRecord,
-  AgentRunStatus,
   OperationalRecommendationRecord,
   RecommendationActionType,
   RecommendationSeverity,
@@ -60,7 +63,6 @@ import {
   InMemoryTelemetry,
   type MetricsRegistry,
   type TraceId,
-  type TelemetryAttributes,
   type TelemetrySpanHandle,
 } from '@h3/telemetry';
 
@@ -342,129 +344,6 @@ function recommendationEvidence(
     evidence.push({ type: 'workflow_revision', resourceId: revisionId });
   }
   return evidence;
-}
-
-function assistantMessages(messages: readonly unknown[]): AssistantMessage[] {
-  return messages.filter(
-    (message): message is AssistantMessage =>
-      typeof message === 'object' &&
-      message !== null &&
-      'role' in message &&
-      message.role === 'assistant',
-  );
-}
-
-function assistantText(message: AssistantMessage): string {
-  return message.content
-    .filter((block) => block.type === 'text')
-    .map((block) => block.text)
-    .join('');
-}
-
-function usageTotals(messages: readonly AssistantMessage[]) {
-  return messages.reduce(
-    (totals, message) => ({
-      inputTokens: totals.inputTokens + message.usage.input,
-      outputTokens: totals.outputTokens + message.usage.output,
-      totalTokens: totals.totalTokens + message.usage.totalTokens,
-      cacheReadTokens: totals.cacheReadTokens + message.usage.cacheRead,
-      cacheWriteTokens: totals.cacheWriteTokens + message.usage.cacheWrite,
-      providerCostMicrousd:
-        totals.providerCostMicrousd +
-        Math.round(message.usage.cost.total * 1_000_000),
-    }),
-    {
-      inputTokens: 0,
-      outputTokens: 0,
-      totalTokens: 0,
-      cacheReadTokens: 0,
-      cacheWriteTokens: 0,
-      providerCostMicrousd: 0,
-    },
-  );
-}
-
-function telemetryAttributes(
-  attributes: Readonly<Record<string, unknown>> | undefined,
-): TelemetryAttributes {
-  if (!attributes) return {};
-  const result: Record<string, string | number | boolean> = {};
-  for (const [key, value] of Object.entries(attributes)) {
-    if (
-      typeof value === 'string' ||
-      typeof value === 'number' ||
-      typeof value === 'boolean'
-    ) {
-      result[key] = value;
-    }
-  }
-  return result;
-}
-
-function piTelemetryContext(
-  telemetry: AgentTelemetry,
-  parent: TelemetrySpanHandle,
-): TelemetryContext {
-  type AdaptedPiSpan = TelemetrySpan & { close: () => void };
-  const createSpan = (
-    options: { name: string; attributes?: Readonly<Record<string, unknown>> },
-    parentSpan: TelemetrySpanHandle,
-  ): AdaptedPiSpan => {
-    const span = telemetry.startSpan(
-      options.name,
-      telemetryAttributes(options.attributes),
-      parentSpan,
-    );
-    return {
-      addEvent: (name, attributes) =>
-        span.addEvent(name, telemetryAttributes(attributes)),
-      setAttributes: (attributes) =>
-        span.setAttributes(telemetryAttributes(attributes)),
-      setStatus: (status) =>
-        span.setStatus(status.status === 'ok' ? 'ok' : 'error'),
-      close: () => span.end(),
-      startSpan: async (childOptions, callback) => {
-        const child = createSpan(childOptions, span);
-        try {
-          return await callback(child);
-        } finally {
-          child.close();
-        }
-      },
-    };
-  };
-  return {
-    startSpan: async (options, callback) => {
-      const span = createSpan(options, parent);
-      try {
-        return await callback(span);
-      } finally {
-        span.close();
-      }
-    },
-  };
-}
-
-function failureCodeFor(error: unknown): AgentRunFailureCode {
-  if (
-    typeof error === 'object' &&
-    error !== null &&
-    'code' in error &&
-    (error.code === 'PROVIDER_ERROR' ||
-      error.code === 'ABORTED' ||
-      error.code === 'TIMEOUT' ||
-      error.code === 'INVALID_STRUCTURED_OUTPUT' ||
-      error.code === 'POLICY_DENIED' ||
-      error.code === 'APPLICATION_ERROR')
-  ) {
-    return error.code;
-  }
-  return 'APPLICATION_ERROR';
-}
-
-function asAgentRunStatus(success: boolean, error: unknown): AgentRunStatus {
-  if (success) return 'succeeded';
-  return failureCodeFor(error) === 'ABORTED' ? 'aborted' : 'failed';
 }
 
 function toolCallsFor(
@@ -1428,7 +1307,11 @@ export class OperationalPiAdapter {
         // identifiers in the prompt
         // (75-PHASE-7E-OPERATIONAL-INTELLIGENCE.md step 3, "Output
         // handling").
-        const { model, streamFn: baseStreamFn } = this.resolveHostedModel();
+        const { model, streamFn: baseStreamFn } = resolveHostedModel({
+          provider: this.provider,
+          model: this.modelName,
+          streamFnOverride: this.streamFnOverride,
+        });
         const readTools = createOperationalReadTools(toolContext);
         // W1/N1: the conclusion comes off this handle, which `execute`
         // fills. Nothing below reads the transcript for it.
@@ -1584,47 +1467,6 @@ export class OperationalPiAdapter {
         // Telemetry exporter failures cannot affect the operational run.
       }
     }
-  }
-
-  /**
-   * Resolves the model and stream function for a non-faux run.
-   * `streamFnOverride` (test-only) always wins over real provider
-   * construction, regardless of `this.provider`'s value -- see
-   * `OperationalPiAdapterOptions.streamFnOverride`.
-   */
-  private resolveHostedModel(): {
-    readonly model: Model<Api>;
-    readonly streamFn: StreamFn;
-  } {
-    if (this.streamFnOverride) {
-      const shape = fauxProvider({
-        provider: this.provider,
-        models: [{ id: this.modelName, name: this.modelName }],
-      }).getModel() as Model<Api>;
-      return { model: shape, streamFn: this.streamFnOverride };
-    }
-    if (this.provider === 'deepseek') {
-      const models = createModels();
-      models.setProvider(deepseekProvider());
-      const model = models.getModel('deepseek', this.modelName);
-      if (!model) {
-        throw Object.assign(
-          new Error(`Unknown DeepSeek model "${this.modelName}".`),
-          { code: 'PROVIDER_ERROR' },
-        );
-      }
-      return {
-        model,
-        streamFn: (streamModel, context, options) =>
-          models.streamSimple(streamModel, context, options),
-      };
-    }
-    throw Object.assign(
-      new Error(
-        `The operational provider "${this.provider}" is not supported.`,
-      ),
-      { code: 'PROVIDER_ERROR' },
-    );
   }
 }
 

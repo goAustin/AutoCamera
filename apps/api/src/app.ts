@@ -88,6 +88,7 @@ import {
   OperationalOutboxWorker,
   OperationalPiAdapter,
 } from './operator.js';
+import { OperationalDigestService } from './digest.js';
 import {
   NotifyingOutboxConsumer,
   WebhookNotificationDelivery,
@@ -131,6 +132,7 @@ export interface ApiAppOptions {
   readonly generationWorker?: GenerationWorker;
   readonly startGenerationWorker?: boolean;
   readonly operationalAdapter?: OperationalPiAdapter;
+  readonly digestService?: OperationalDigestService;
   readonly operationalDispatcher?: OutboxDispatcher;
   readonly startOperationalWorker?: boolean;
   /** Test injection point for the notify webhook's HTTP client. */
@@ -242,12 +244,24 @@ const runReviewBodySchema = z
   })
   .strict();
 
+/**
+ * `untilIso` defaults to now at the route, so the common case -- "digest the
+ * session I just finished" -- is one field.
+ */
+const digestBodySchema = z
+  .object({
+    sinceIso: z.string().datetime(),
+    untilIso: z.string().datetime().optional(),
+  })
+  .strict();
+
 type CreateAttemptBody = z.infer<typeof createAttemptBodySchema>;
 type RejectAttemptBody = z.infer<typeof rejectAttemptBodySchema>;
 type RetryAttemptBody = z.infer<typeof retryAttemptBodySchema>;
 type RecommendationActionBody = z.infer<typeof recommendationActionBodySchema>;
 type RunBody = z.infer<typeof runBodySchema>;
 type RunReviewBody = z.infer<typeof runReviewBodySchema>;
+type DigestBody = z.infer<typeof digestBodySchema>;
 
 type CreateProjectBody = z.infer<typeof createProjectBodySchema>;
 export interface WorkflowRunMetadata {
@@ -1414,6 +1428,84 @@ async function executeIdempotent(
   });
 }
 
+/**
+ * `executeIdempotent` for work that must **not** run inside a transaction --
+ * today, the session digest's provider round trip
+ * (`docs/75-PHASE-7E-OPERATIONAL-INTELLIGENCE.md` step 4, on step 3's
+ * discipline). Three phases: reserve the key and commit, do the work with no
+ * transaction open and no pooled connection held, then commit the response.
+ *
+ * A concurrent duplicate therefore reads a committed reservation and is told
+ * the request is in progress, rather than buying a second inference call. If
+ * the work throws, the reservation is released on the same best-effort terms
+ * as `releaseResourceMutation` in `@h3/db`, so a failure does not wedge the
+ * key -- the caller can retry it.
+ */
+async function executeIdempotentDeferred(
+  request: FastifyRequest,
+  service: ProjectApplicationService,
+  operation: string,
+  body: unknown,
+  work: () => Promise<IdempotentResponse>,
+): Promise<IdempotentResponse> {
+  const key = idempotencyKey(request);
+  const hash = requestHash(operation, body);
+  const replay = await service.withTransaction(async (repositories) => {
+    const reservation = await repositories.idempotency.reserve(
+      service.tenantId,
+      key,
+      operation,
+      hash,
+      toIsoUtc(service.clock.now()),
+    );
+    if (reservation.kind === 'conflict') {
+      throw new HttpProblemError(
+        'IDEMPOTENCY_KEY_REUSED',
+        'The Idempotency-Key was already used for a different request.',
+        409,
+        false,
+      );
+    }
+    if (reservation.kind === 'in_progress') {
+      throw new HttpProblemError(
+        'IDEMPOTENCY_IN_PROGRESS',
+        'The original request is still being processed.',
+        409,
+        true,
+      );
+    }
+    return reservation.kind === 'replay'
+      ? { status: reservation.status, body: reservation.body }
+      : undefined;
+  });
+  if (replay) return replay;
+
+  let response: IdempotentResponse;
+  try {
+    response = await work();
+  } catch (error) {
+    try {
+      await service.withTransaction((repositories) =>
+        repositories.idempotency.release(service.tenantId, key),
+      );
+    } catch {
+      // Preserve the original failure; a stranded reservation is recoverable
+      // by the operator, a swallowed error is not.
+    }
+    throw error;
+  }
+  await service.withTransaction((repositories) =>
+    repositories.idempotency.complete(
+      service.tenantId,
+      key,
+      response.status,
+      response.body,
+      toIsoUtc(service.clock.now()),
+    ),
+  );
+  return response;
+}
+
 function queryValue(request: FastifyRequest, name: string): string | undefined {
   const query = request.query as Record<string, unknown> | undefined;
   const value = query?.[name];
@@ -1536,6 +1628,9 @@ function requestOperationName(request: FastifyRequest): string {
     return 'operator.action.apply';
   }
   if (path.endsWith('/operator/recommendations')) return 'operator.recommend';
+  if (request.method === 'POST' && path.endsWith('/digest')) {
+    return 'digest.create';
+  }
   if (path === '/metrics') return 'metrics.scrape';
   return 'http.request';
 }
@@ -1739,6 +1834,36 @@ function baseRouteSchemas() {
         inferenceCostUsd: { type: 'string' },
       },
     },
+    digestResponse: {
+      type: 'object',
+      required: ['digest'],
+      properties: {
+        digest: {
+          type: 'object',
+          required: [
+            'severity',
+            'title',
+            'detail',
+            'referencedRunIds',
+            'sinceIso',
+            'untilIso',
+            'agentRunId',
+          ],
+          properties: {
+            severity: { type: 'string', enum: ['info', 'warning', 'critical'] },
+            title: { type: 'string' },
+            detail: { type: 'string' },
+            referencedRunIds: {
+              type: 'array',
+              items: { type: 'string', format: 'uuid' },
+            },
+            sinceIso: { type: 'string' },
+            untilIso: { type: 'string' },
+            agentRunId: { type: 'string', format: 'uuid' },
+          },
+        },
+      },
+    },
     attemptResponse: {
       type: 'object',
       required: ['attempt'],
@@ -1890,6 +2015,54 @@ export function buildApiApp(options: ApiAppOptions = {}): FastifyInstance {
       // and an operator can opt into a real provider -- DeepSeek is the
       // supported one -- by setting PI_PROVIDER/PI_MODEL/PI_API_KEY (or
       // DEEPSEEK_API_KEY) in the environment.
+      provider: config.piProvider,
+      model: config.piModel,
+      ...(config.piApiKey ? { apiKey: config.piApiKey } : {}),
+      telemetry,
+      metrics,
+      services: (repositories) =>
+        createOperationalToolServices(repositories, DEV_TENANT_ID, {
+          mode: config.comfyMode,
+          getExecutorReadiness:
+            async (): Promise<OperationalExecutorToolView> => {
+              const checkedAt = toIsoUtc(clock.now());
+              try {
+                const readiness =
+                  await generationService.comfyClient.checkReady();
+                return {
+                  mode: config.comfyMode,
+                  ready: readiness.ready,
+                  checkedAt: readiness.checkedAt,
+                  ...(readiness.capabilityFingerprint
+                    ? {
+                        capabilityFingerprint: readiness.capabilityFingerprint,
+                      }
+                    : {}),
+                  ...(readiness.errorCode
+                    ? { errorCode: readiness.errorCode }
+                    : {}),
+                };
+              } catch {
+                return {
+                  mode: config.comfyMode,
+                  ready: false,
+                  checkedAt,
+                  errorCode: 'EXECUTOR_UNAVAILABLE',
+                };
+              }
+            },
+        }),
+    });
+  const digestService =
+    options.digestService ??
+    new OperationalDigestService({
+      store,
+      tenantId: DEV_TENANT_ID,
+      clock,
+      idGenerator,
+      // The same provider resolution as the per-incident operator: `faux`
+      // unless PI_PROVIDER/PI_MODEL/PI_API_KEY say otherwise, so a digest is
+      // free and offline by default and paid only on purpose.
       provider: config.piProvider,
       model: config.piModel,
       ...(config.piApiKey ? { apiKey: config.piApiKey } : {}),
@@ -3468,6 +3641,67 @@ export function buildApiApp(options: ApiAppOptions = {}): FastifyInstance {
               status: 200,
               body: { recommendation: recommendationResponse(updated) },
             };
+          },
+        );
+        return reply.code(response.status as 200).send(response.body);
+      },
+    );
+
+    routes.post(
+      '/v1/projects/:projectId/digest',
+      {
+        schema: {
+          tags: ['projects'],
+          summary: 'Summarize one session window for the project',
+          params: {
+            type: 'object',
+            required: ['projectId'],
+            properties: { projectId: { type: 'string', format: 'uuid' } },
+          },
+          body: {
+            type: 'object',
+            required: ['sinceIso'],
+            properties: {
+              sinceIso: { type: 'string' },
+              untilIso: { type: 'string' },
+            },
+            additionalProperties: true,
+          },
+          response: { 200: schemas.digestResponse },
+        },
+      },
+      async (request, reply) => {
+        const projectId = parseProjectId(request);
+        const body = parseBody(digestBodySchema, request.body) as DigestBody;
+        const untilIso = body.untilIso ?? toIsoUtc(clock.now());
+        if (Date.parse(body.sinceIso) > Date.parse(untilIso)) {
+          throw new HttpProblemError(
+            'INVALID_REQUEST',
+            'The digest window ends before it starts.',
+            422,
+            false,
+          );
+        }
+        const window = { sinceIso: body.sinceIso, untilIso };
+        // Deferred rather than transactional: the provider round trip below
+        // must not hold a transaction open, and the reservation is what
+        // stops a retry buying a second inference call.
+        const response = await executeIdempotentDeferred(
+          request,
+          service,
+          `project.digest:${projectId}`,
+          window,
+          async () => {
+            const outcome = await digestService.createDigest(projectId, window);
+            if (!outcome.ok) {
+              throw new HttpProblemError(
+                'PROJECT_NOT_FOUND',
+                'The project was not found.',
+                404,
+                false,
+              );
+            }
+            return { status: 200, body: { digest: outcome.digest } };
           },
         );
         return reply.code(response.status as 200).send(response.body);
