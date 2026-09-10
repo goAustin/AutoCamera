@@ -1,5 +1,46 @@
 # Changelog
 
+## One redactor, two callers
+
+Evidence level: Offline fake. No provider call was made. Removes the divergent
+second copy of the redaction rules that the `51ee0c4` fix left behind.
+
+- `safeRecommendationText` (`operator.ts`) and `redactFailureMessage`
+  (`generation.ts`) were near-identical copies of the same rules, and had
+  already drifted: the first gained a credential rule and a URL rule the
+  second never got, and `51ee0c4` fixed the shared path pattern in one of
+  them. Both now call `redactText` in the new `apps/api/src/redact.ts`,
+  parameterised by cap and fallback -- 2,000 with a fallback for a
+  recommendation, 500 with none for a failure message. The two old homes lose
+  50 lines between them.
+- What that changes for `redactFailureMessage`, whose inputs include two the
+  codebase does not author -- ComfyUI's `exception_message`
+  (`generation.ts:427`) and a human reviewer's rejection reason
+  (`generation.ts:1240`):
+
+  | Input | Before | After |
+  |---|---|---|
+  | `malformed in frames 3/5 and 4/5` | `frames 3[path redacted] and 4[path redacted]` | unchanged |
+  | `Bad output and/or wrong ratio` | `and[path redacted] wrong ratio` | unchanged |
+  | `the prompt was fine, the checkpoint was wrong` | `the prompt [redacted], the checkpoint…` | unchanged |
+  | `collapsed at 1.2it/s` | `1.2it[path redacted]` | unchanged |
+  | `api_key: sk-live-abc123` | **passed through** | `[credential redacted]` |
+
+- Redaction strength is unchanged, and asserted as such: an absolute path from
+  the GPU host, a `Bearer` token, and the API's own fixed sentences all
+  produce byte-identical output before and after. The pre-existing assertion
+  in `generation.test.ts` pins that and needed no edit.
+- The sanitizer tests move to `apps/api/src/redact.test.ts` and gain the
+  failure-message side: executor and reviewer text stays readable, a pasted
+  credential is caught, a GPU-host path and a model URL still go, the 500-cap
+  holds, and the two wrappers are shown to differ only in cap and fallback.
+- Not a security fix. `attempt.failed` is not in `NOTIFIABLE_EVENT_TYPES`, so
+  none of this leaves the machine, and the credential case requires a person
+  to type a key into a rejection reason. The reason to do it is that two
+  copies of one rule is how the next fix goes to only one of them again.
+- 9 new tests, unit suite 245 to 254, across 25 files to 26 (the new
+  `redact.test.ts`); integration unchanged at 18 across 10 files.
+
 ## Phase 7E step 3 follow-up — Review findings 2-4
 
 Evidence level: Offline fake. No provider call was made. Closes the three

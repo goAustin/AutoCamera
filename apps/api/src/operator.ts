@@ -29,6 +29,7 @@ import {
   type OperationalToolServices,
   type OperationalWorkflowRevisionToolView,
 } from '@h3/agent-tools';
+import { safeRecommendationText } from './redact.js';
 import {
   createDomainEvent,
   isUuidV7,
@@ -283,46 +284,6 @@ function defaultOutput(
     detail: details[event.type],
     proposedActionType: action,
   };
-}
-
-/**
- * Second line of defence for text that reaches a persisted finding or a
- * webhook. The evidence tools already refuse to hand the model a prompt, a
- * graph, or an artifact (`packages/agent-tools/src/operational.test.ts`), so
- * these rules catch what a future tool might leak rather than being the only
- * thing between a secret and the record.
- *
- * Each rule therefore demands evidence it is looking at the real thing. The
- * earlier version matched any `/` and the bare word "prompt", which was
- * harmless while every finding came from `defaultOutput()`'s fixed strings
- * and started mangling ordinary sentences as soon as a real model's prose
- * began reaching here -- "failed 3/5 times", "and/or", "N/A",
- * "frames/second", "The prompt was rejected by the validator."
- */
-export function safeRecommendationText(
-  value: string,
-  fallback: string,
-): string {
-  const sanitized = value
-    // An assignment -- `prompt: <text>`, `raw prompt = <text>`,
-    // `"prompt": "<text>"` -- not every sentence that says the word.
-    .replace(/(?:raw\s+)?prompt"?\s*[:=]\s*[^.;\n]*/gi, '[prompt redacted]')
-    .replace(
-      /\b(?:api[_ -]?key|secret|password|token)\s*[:=]\s*[^\s,;.]+/gi,
-      '[credential redacted]',
-    )
-    .replace(/Bearer\s+[A-Za-z0-9._~-]+/gi, 'Bearer [redacted]')
-    // Any scheme, and the whole thing, so a signed URL cannot leave its query
-    // string behind. Runs before the path rule, whose replacement has no `/`.
-    .replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s'"`]+/gi, '[url redacted]')
-    .replace(/[A-Za-z]:\\[^\s'"`]*/g, '[path redacted]')
-    // A path starts at a token boundary: `/var/lib/x`, `~/.config`. A slash
-    // *inside* a token is prose -- `3/5`, `and/or`, `N/A`, `frames/second` --
-    // and a relative path is not worth those false positives.
-    .replace(/(?<![\w.~-])~?\/[^\s'"`]*/g, '[path redacted]')
-    .replace(/\s+/g, ' ')
-    .trim();
-  return (sanitized || fallback).slice(0, 2_000);
 }
 
 function safeSeverity(value: RecommendationSeverity): RecommendationSeverity {

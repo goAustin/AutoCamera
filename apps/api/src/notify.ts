@@ -6,7 +6,7 @@ import type {
   TransactionalStore,
 } from '@h3/db';
 import { InMemoryTelemetry, type AgentTelemetry } from '@h3/telemetry';
-import { safeRecommendationText } from './operator.js';
+import { safeRecommendationText } from './redact.js';
 
 /**
  * `recommendation.created` carries the finding itself. The other two are

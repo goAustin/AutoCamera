@@ -46,6 +46,7 @@ import {
   validateMinimaxH3T2vaPreview,
 } from '@h3/workflow-compiler';
 import { createLocalArtifactStore, type ArtifactStore } from '@h3/object-store';
+import { redactFailureMessage } from './redact.js';
 import {
   InMemoryTelemetry,
   type MetricsRegistry,
@@ -229,16 +230,6 @@ function evaluationFailureCode(result: EvaluationResult): AttemptFailureCode {
     failures.find(([name]) => checks[name]?.status === 'failed')?.[1] ??
     'MEDIA_DECODE_FAILED'
   );
-}
-
-export function redactFailureMessage(message: string): string {
-  return message
-    .replace(/Bearer\s+[A-Za-z0-9._~-]+/gi, 'Bearer [redacted]')
-    .replace(/(?:\/|[A-Za-z]:\\)[^\s'"`]+/g, '[path redacted]')
-    .replace(/prompt[^,;:.]*/gi, 'prompt [redacted]')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, 500);
 }
 
 function hashSeed(attemptId: Uuid): number {
