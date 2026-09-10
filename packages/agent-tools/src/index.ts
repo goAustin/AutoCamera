@@ -5,11 +5,9 @@ import type { GenerationAttempt, Shot, Uuid, VideoProject } from '@h3/domain';
 
 const boundedText = (maximum: number) => z.string().trim().min(1).max(maximum);
 
-type ToolDetails =
-  | { readonly ok: true; readonly code: 'OK'; readonly data?: unknown }
-  | { readonly ok: false; readonly code: string };
-
-function textResult<T extends ToolDetails>(details: T): AgentToolResult<T> {
+function textResult<T extends OperationalToolDetails>(
+  details: T,
+): AgentToolResult<T> {
   return {
     content: [{ type: 'text', text: JSON.stringify(details) }],
     details,
@@ -217,23 +215,216 @@ function operationalErrors(
   });
 }
 
+/**
+ * One sanitizer per view, shared by the tool that returns it and by the
+ * evidence W6 seeds into the prompt: same truncation, same fallbacks, same
+ * field order. A second copy is how a seeded row would come to disagree with
+ * the tool the model can re-read it with.
+ */
+function operationalProjectView(
+  project: OperationalProjectToolView,
+): OperationalProjectToolView {
+  return {
+    id: project.id,
+    status: project.status,
+    budgetMicrousd: project.budgetMicrousd,
+    spentMicrousd: project.spentMicrousd,
+    remainingMicrousd: project.remainingMicrousd,
+  };
+}
+
+function operationalShotView(
+  shot: OperationalShotToolView,
+): OperationalShotToolView {
+  return {
+    id: shot.id,
+    projectId: shot.projectId,
+    status: shot.status,
+    acceptanceCriteria: Array.isArray(shot.acceptanceCriteria)
+      ? shot.acceptanceCriteria
+          .filter(
+            (criterion): criterion is string =>
+              typeof criterion === 'string' && criterion.trim().length > 0,
+          )
+          .slice(0, 8)
+          .map((criterion) => criterion.trim().slice(0, 280))
+      : [],
+  };
+}
+
+function operationalRevisionView(
+  revision: OperationalWorkflowRevisionToolView,
+): OperationalWorkflowRevisionToolView {
+  return {
+    id: revision.id,
+    projectId: revision.projectId,
+    shotId: revision.shotId,
+    profileId: operationalText(revision.profileId, 128, 'unknown-profile'),
+    profileVersion: operationalText(
+      revision.profileVersion,
+      64,
+      'unknown-version',
+    ),
+    validationStatus: revision.validationStatus,
+    validationErrors: operationalErrors(revision.validationErrors),
+    ...(revision.executorFingerprint
+      ? {
+          executorFingerprint: operationalText(
+            revision.executorFingerprint,
+            256,
+            'unknown',
+          ),
+        }
+      : {}),
+  };
+}
+
+function operationalAttemptView(
+  attempt: OperationalAttemptToolView,
+): OperationalAttemptToolView {
+  return {
+    id: attempt.id,
+    projectId: attempt.projectId,
+    shotId: attempt.shotId,
+    status: attempt.status,
+    ...(attempt.failureCode ? { failureCode: attempt.failureCode } : {}),
+  };
+}
+
+/** The evidence the adapter has already resolved for one incident. */
+export interface OperationalEvidenceViews {
+  readonly project: OperationalProjectToolView;
+  readonly shot?: OperationalShotToolView;
+  readonly attempt?: OperationalAttemptToolView;
+  readonly revision?: OperationalWorkflowRevisionToolView;
+}
+
+/**
+ * W6: the rows the adapter resolved before the run, rendered for the prompt
+ * through the same sanitizers the tools use -- so a model that re-reads one
+ * gets byte-identical JSON back, and a model that trusts what it was given
+ * spends its turns on the two views nobody resolved for it instead.
+ */
+export function describeOperationalEvidence(
+  evidence: OperationalEvidenceViews,
+): string {
+  const row = (tool: OperationalToolName, data: unknown): string =>
+    `- ${tool}: ${JSON.stringify(data)}`;
+  return [
+    'Evidence already read for this incident, each row in the exact shape ' +
+      'the named tool returns:',
+    row('get_project_status', operationalProjectView(evidence.project)),
+    ...(evidence.shot
+      ? [row('get_shot_status', operationalShotView(evidence.shot))]
+      : []),
+    ...(evidence.attempt
+      ? [row('get_attempt_status', operationalAttemptView(evidence.attempt))]
+      : []),
+    ...(evidence.revision
+      ? [
+          row(
+            'get_workflow_revision_validation',
+            operationalRevisionView(evidence.revision),
+          ),
+        ]
+      : []),
+    'Those tools return this same JSON, so use your tool calls for what is ' +
+      'not above -- get_recent_incidents and get_executor_readiness -- and ' +
+      'then submit.',
+  ].join('\n');
+}
+
 type OperationalToolDetails =
   | { readonly ok: true; readonly code: 'OK'; readonly data?: unknown }
-  | { readonly ok: false; readonly code: string };
+  | {
+      readonly ok: false;
+      readonly code: string;
+      /** W7: what to do about `code`, in a sentence the model can act on. */
+      readonly message: string;
+    };
+
+/** What each tool accepts, for the one denial the model can fix by re-reading this. */
+const OPERATIONAL_TOOL_ARGUMENTS: Record<OperationalToolName, string> = {
+  get_project_status: 'It takes an optional projectId and nothing else.',
+  get_shot_status: 'It takes shotId, and optionally projectId.',
+  get_workflow_revision_validation:
+    'It takes shotId and revisionId, and optionally projectId.',
+  get_attempt_status: 'It takes attemptId, and optionally projectId.',
+  get_recent_incidents: 'It takes an optional projectId and nothing else.',
+  get_executor_readiness: 'It takes no arguments.',
+};
+
+/**
+ * W7: a denial the model can act on. A bare code cannot distinguish "you
+ * asked about the wrong resource" from "that evidence does not exist", so a
+ * model spends several blind retries telling them apart. A scope denial
+ * therefore names the identifier this run is actually scoped to -- one
+ * corrective turn -- and every other denial says plainly that the evidence is
+ * not coming, so the conclusion has to be reached without it.
+ */
+function operationalDenialMessage(
+  context: OperationalToolContext,
+  code: string,
+  operation: OperationalToolName,
+): string {
+  const scoped = (
+    label: 'shotId' | 'attemptId' | 'workflowRevisionId',
+    noun: string,
+  ): string => {
+    const value = context[label];
+    return value
+      ? `${operation} is scoped to this incident: call it with ${label}=${value}.`
+      : `${operation} did not accept that ${label}. This incident is scoped to projectId=${context.projectId} and names no ${noun}, so there is no other one to try -- conclude from the evidence you do have.`;
+  };
+  const unavailable = (noun: string): string =>
+    `The ${noun} for this incident is not readable. Retrying ${operation} will not change that -- reach your conclusion from the evidence you do have.`;
+  switch (code) {
+    case 'PROJECT_SCOPE_DENIED':
+      return `${operation} is scoped to this incident: call it with projectId=${context.projectId}, or omit projectId.`;
+    case 'SHOT_SCOPE_DENIED':
+      return scoped('shotId', 'shot');
+    case 'ATTEMPT_SCOPE_DENIED':
+      return scoped('attemptId', 'attempt');
+    case 'WORKFLOW_SCOPE_DENIED':
+      return context.shotId && context.workflowRevisionId
+        ? `${operation} is scoped to this incident: call it with shotId=${context.shotId} and revisionId=${context.workflowRevisionId}.`
+        : scoped('workflowRevisionId', 'workflow revision');
+    case 'INVALID_ARGUMENTS':
+      return `${operation} could not read its arguments. ${OPERATIONAL_TOOL_ARGUMENTS[operation]}`;
+    case 'PROJECT_NOT_FOUND':
+      return unavailable('project');
+    case 'SHOT_NOT_FOUND':
+      return unavailable('shot');
+    case 'WORKFLOW_REVISION_NOT_FOUND':
+      return unavailable('workflow revision');
+    case 'ATTEMPT_NOT_FOUND':
+      return unavailable('attempt');
+    case 'INCIDENTS_UNAVAILABLE':
+      return unavailable('incident history');
+    case 'EXECUTOR_UNAVAILABLE':
+      return unavailable('executor readiness');
+    default:
+      return `${operation} was denied (${code}). Reach your conclusion from the evidence you do have.`;
+  }
+}
 
 function operationalDenied(
   context: OperationalToolContext,
   code: string,
-  operation: string,
+  operation: OperationalToolName,
 ): AgentToolResult<OperationalToolDetails> {
   context.onPolicyDenial?.(code, operation);
-  return textResult({ ok: false, code });
+  return textResult({
+    ok: false,
+    code,
+    message: operationalDenialMessage(context, code, operation),
+  });
 }
 
 function operationalProject(
   context: OperationalToolContext,
   requestedProjectId: string | undefined,
-  operation: string,
+  operation: OperationalToolName,
 ): Uuid | undefined {
   if (
     requestedProjectId !== undefined &&
@@ -249,7 +440,7 @@ function operationalResource(
   context: OperationalToolContext,
   requested: string,
   expected: Uuid | undefined,
-  operation: string,
+  operation: OperationalToolName,
 ): Uuid | undefined {
   const resourceId = operationalUuid(requested);
   if (!resourceId || (expected !== undefined && resourceId !== expected)) {
@@ -328,13 +519,7 @@ export function createOperationalReadTools(
           return textResult({
             ok: true,
             code: 'OK',
-            data: {
-              id: project.id,
-              status: project.status,
-              budgetMicrousd: project.budgetMicrousd,
-              spentMicrousd: project.spentMicrousd,
-              remainingMicrousd: project.remainingMicrousd,
-            } satisfies OperationalProjectToolView,
+            data: operationalProjectView(project),
           });
         } catch {
           return operationalDenied(
@@ -393,25 +578,10 @@ export function createOperationalReadTools(
               'get_shot_status',
             );
           }
-          const acceptanceCriteria = Array.isArray(shot.acceptanceCriteria)
-            ? shot.acceptanceCriteria
-                .filter(
-                  (criterion): criterion is string =>
-                    typeof criterion === 'string' &&
-                    criterion.trim().length > 0,
-                )
-                .slice(0, 8)
-                .map((criterion) => criterion.trim().slice(0, 280))
-            : [];
           return textResult({
             ok: true,
             code: 'OK',
-            data: {
-              id: shot.id,
-              projectId: shot.projectId,
-              status: shot.status,
-              acceptanceCriteria,
-            },
+            data: operationalShotView(shot),
           });
         } catch {
           return operationalDenied(
@@ -485,32 +655,7 @@ export function createOperationalReadTools(
           return textResult({
             ok: true,
             code: 'OK',
-            data: {
-              id: revision.id,
-              projectId: revision.projectId,
-              shotId: revision.shotId,
-              profileId: operationalText(
-                revision.profileId,
-                128,
-                'unknown-profile',
-              ),
-              profileVersion: operationalText(
-                revision.profileVersion,
-                64,
-                'unknown-version',
-              ),
-              validationStatus: revision.validationStatus,
-              validationErrors: operationalErrors(revision.validationErrors),
-              ...(revision.executorFingerprint
-                ? {
-                    executorFingerprint: operationalText(
-                      revision.executorFingerprint,
-                      256,
-                      'unknown',
-                    ),
-                  }
-                : {}),
-            },
+            data: operationalRevisionView(revision),
           });
         } catch {
           return operationalDenied(
@@ -576,15 +721,7 @@ export function createOperationalReadTools(
           return textResult({
             ok: true,
             code: 'OK',
-            data: {
-              id: attempt.id,
-              projectId: attempt.projectId,
-              shotId: attempt.shotId,
-              status: attempt.status,
-              ...(attempt.failureCode
-                ? { failureCode: attempt.failureCode }
-                : {}),
-            },
+            data: operationalAttemptView(attempt),
           });
         } catch {
           return operationalDenied(

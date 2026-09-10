@@ -1054,6 +1054,67 @@ describe('Phase 7E step 3: a non-faux provider via submit_recommendation', () =>
     });
   }
 
+  it('seeds the resolved evidence into the prompt, so the model needs no read call to reach it', async () => {
+    // W6: `resolveEvidence` has already read project, shot, attempt and
+    // revision before the model is called. Rendering those rows removes the
+    // 2-4 round trips the model spent re-fetching them.
+    const prompts: string[] = [];
+    const { app, store, dispatcher } = await setupHosted(
+      hostedStreamFn(
+        [
+          // Consumed by the `workflow.revision.invalid` trigger that
+          // `createApprovedShot` enqueues, drained below.
+          fauxAssistantMessage([
+            fauxToolCall('submit_recommendation', validRecommendationArgs),
+          ]),
+          fauxAssistantMessage([
+            fauxToolCall('submit_recommendation', validRecommendationArgs),
+          ]),
+        ],
+        (_model, context) => prompts.push(transcriptText(context.messages)),
+      ),
+    );
+    const { projectId, shotId } = await createApprovedShot(
+      app,
+      'hosted-evidence',
+    );
+    await drain(dispatcher);
+
+    // The drained trigger carries a workflow revision, so its prompt has the
+    // fourth row -- with the validation result the model would otherwise
+    // have spent a call on.
+    expect(prompts[0]).toContain(`- get_workflow_revision_validation: {"id":"`);
+    expect(prompts[0]).toContain('"validationStatus":"invalid"');
+
+    await appendEvent(store, {
+      projectId,
+      shotId,
+      type: 'executor.unavailable',
+    });
+    expect(await dispatcher.pollOnce()).toBe(true);
+
+    const seeded = prompts[1] ?? '';
+    expect(seeded).toContain(`- get_project_status: {"id":"${projectId}"`);
+    expect(seeded).toContain(`- get_shot_status: {"id":"${shotId}"`);
+    // This event names no attempt and no revision, so neither row is
+    // invented for it.
+    expect(seeded).not.toContain('- get_attempt_status:');
+    expect(seeded).not.toContain('- get_workflow_revision_validation:');
+
+    const recommendation = (await recommendations(store, projectId)).find(
+      (candidate) => candidate.recommendationCode === 'EXECUTOR_UNAVAILABLE',
+    );
+    const runs = await store.withTransaction((repositories) =>
+      repositories.agentRuns.listByProject(DEV_TENANT_ID, projectId),
+    );
+    const run = runs.find(
+      (candidate) => candidate.id === recommendation?.piAgentRunId,
+    );
+    expect(run?.status).toBe('succeeded');
+    // Submission only: the evidence it concluded from arrived in the prompt.
+    expect(run?.toolCalls).toBe(1);
+  });
+
   it('seeds the scoped identifiers into the prompt, and still denies an out-of-scope identifier the model supplies', async () => {
     const calls: Array<{ readonly promptText: string }> = [];
     const wrongShotId = testId();
@@ -1077,7 +1138,7 @@ describe('Phase 7E step 3: a non-faux provider via submit_recommendation', () =>
           ]),
         ],
         (_model, context) =>
-          calls.push({ promptText: JSON.stringify(context.messages) }),
+          calls.push({ promptText: transcriptText(context.messages) }),
       ),
     );
     const { projectId, shotId } = await createApprovedShot(app, 'hosted-scope');
@@ -1093,6 +1154,12 @@ describe('Phase 7E step 3: a non-faux provider via submit_recommendation', () =>
     // calls[0] belongs to the drained workflow.revision.invalid trigger.
     expect(calls[1]?.promptText).toContain(`projectId=${projectId}`);
     expect(calls[1]?.promptText).toContain(`shotId=${shotId}`);
+
+    // W7: the denial the model reads next names the identifier this run is
+    // scoped to, so the correction is one turn rather than several guesses.
+    expect(calls[2]?.promptText).toContain(
+      `get_shot_status is scoped to this incident: call it with shotId=${shotId}.`,
+    );
 
     const denialEvents = telemetry
       .getSpans()

@@ -1,5 +1,55 @@
 # Changelog
 
+## The evidence arrives with the prompt, and a denial says what to do
+
+Evidence level: Offline fake. No provider call was made. Closes W6 and W7, the
+last two slices of `docs/75-PHASE-7E-STEP-3-FOLLOWUP-TOOL-USE.md`.
+
+- **W6 — the operator stops re-reading what the adapter already read.**
+  `resolveEvidence` loads project, shot, attempt and revision *before* the
+  model is called -- it has to, since a missing row means there is no incident
+  to reason about -- and then the model spent 2-4 tool calls fetching the same
+  rows back. `describeOperationalEvidence` (`@h3/agent-tools`) renders them,
+  and `operationalPrompt` appends the block to the run's first message. Rows
+  the incident does not have are not rendered, so an `executor.unavailable`
+  event is not handed an invented workflow revision.
+- **The seeded rows are the tool's rows, not a second rendering of them.** Each
+  view's sanitizer -- truncation, fallbacks, field order -- is now one function
+  (`operationalProjectView`, `operationalShotView`, `operationalRevisionView`,
+  `operationalAttemptView`) called by both the tool that returns it and the
+  prompt renderer. A model that distrusts the seed and re-reads a row gets
+  byte-identical JSON, which the test asserts literally: for each of the four
+  tools, the prompt block contains `- <tool>: ${JSON.stringify(details.data)}`
+  taken from that tool's own result. The tools stay available and
+  authoritative; nothing is withheld.
+- **W7 — a denial the model can act on.** `operationalDenied` returned
+  `{"ok":false,"code":"SHOT_SCOPE_DENIED"}` and nothing else, which cannot
+  distinguish "you asked about the wrong shot" from "this incident has no
+  shot" -- so the model told them apart by guessing, at a turn each. Every
+  denial now carries a `message` beside the code:
+
+  | Denial | What the model now reads |
+  |---|---|
+  | scope denied, resource in scope | `get_shot_status is scoped to this incident: call it with shotId=<id>.` |
+  | scope denied, none in scope | `... names no shot, so there is no other one to try -- conclude from the evidence you do have.` |
+  | not found / unavailable | `The executor readiness for this incident is not readable. Retrying ... will not change that ...` |
+  | invalid arguments | `get_attempt_status could not read its arguments. It takes attemptId, and optionally projectId.` |
+
+- **No scope rule changed.** The codes are the same codes, the
+  `policy.denial` span event is unchanged, and `createOperationalReadTools`
+  is still six reads. W7 adds a sentence to a result the model was already
+  getting; the operator test asserts that sentence reaches the next request's
+  transcript, which is the only place it matters.
+- Three incidental dedupes, each one a place this change would otherwise have
+  had to edit twice: `ToolDetails` and `OperationalToolDetails` were identical
+  declarations of the same shape (the new `message` field would have gone into
+  both), `operator.ts`'s `ResolvedOperationalViews` is now an alias of the
+  exported `OperationalEvidenceViews` the renderer takes, and `runPi`'s
+  evidence parameter is `ResolvedOperationalEvidence` rather than a fifth
+  inline copy of the same five fields.
+- 4 new tests, unit suite 254 to 258, files unchanged at 26; integration
+  unchanged at 18 across 10 files.
+
 ## One redactor, two callers
 
 Evidence level: Offline fake. No provider call was made. Removes the divergent

@@ -18,8 +18,10 @@ import { deepseekProvider } from '@earendil-works/pi-ai/providers/deepseek';
 import {
   createOperationalReadTools,
   createOperationalSubmissionTool,
+  describeOperationalEvidence,
   validateOperationalRecommendation,
   type OperationalAttemptToolView,
+  type OperationalEvidenceViews,
   type OperationalExecutorToolView,
   type OperationalIncidentToolView,
   type OperationalProjectToolView,
@@ -569,13 +571,13 @@ interface OperatorRunResult {
   readonly providerCostMicrousd: number;
 }
 
-/** Durable evidence views. Plain data -- safe to hold across a commit. */
-interface ResolvedOperationalViews {
-  readonly project: OperationalProjectToolView;
-  readonly shot?: OperationalShotToolView;
-  readonly attempt?: OperationalAttemptToolView;
-  readonly revision?: OperationalWorkflowRevisionToolView;
-}
+/**
+ * Durable evidence views. Plain data -- safe to hold across a commit. The one
+ * declaration lives in `@h3/agent-tools` beside `describeOperationalEvidence`,
+ * which renders exactly these views into the prompt (W6); this name is what
+ * the adapter calls them.
+ */
+type ResolvedOperationalViews = OperationalEvidenceViews;
 
 /**
  * Views plus the tool services that resolved them. `services` is bound to one
@@ -1259,13 +1261,7 @@ export class OperationalPiAdapter {
 
   private async runPi(
     event: DomainEvent & { readonly type: OperationalTriggerEventType },
-    evidence: {
-      readonly project: OperationalProjectToolView;
-      readonly shot?: OperationalShotToolView;
-      readonly attempt?: OperationalAttemptToolView;
-      readonly revision?: OperationalWorkflowRevisionToolView;
-      readonly services: OperationalToolServices;
-    },
+    evidence: ResolvedOperationalEvidence,
   ): Promise<OperatorRunResult> {
     const rootSpan = this.telemetry.startRootSpan
       ? this.telemetry.startRootSpan(
@@ -1505,7 +1501,7 @@ export class OperationalPiAdapter {
           agent.abort();
         }, this.timeoutMs);
         try {
-          await agent.prompt(operationalPrompt(event, toolContext));
+          await agent.prompt(operationalPrompt(event, toolContext, evidence));
           await agent.waitForIdle();
         } finally {
           clearTimeout(timeout);
@@ -1646,10 +1642,18 @@ const OPERATIONAL_SYSTEM_PROMPT =
   'request or describe infrastructure access, and never propose an action ' +
   'the evidence tools did not support.';
 
-/** Seeds the identifiers the adapter already knows, so the model stops guessing them. */
+/**
+ * Seeds what the adapter already knows: the scoped identifiers, so the model
+ * stops guessing them, and (W6) the evidence `resolveEvidence` has already
+ * read, so the model stops spending 2-4 round trips re-fetching rows this
+ * process is holding. The tools stay available and authoritative -- the
+ * seeded rows are rendered by `describeOperationalEvidence` through the same
+ * sanitizers, so re-reading one returns the same JSON.
+ */
 function operationalPrompt(
   event: DomainEvent & { readonly type: OperationalTriggerEventType },
   context: OperationalToolContext,
+  evidence: ResolvedOperationalViews,
 ): string {
   const scope = [`projectId=${context.projectId}`];
   if (context.shotId) scope.push(`shotId=${context.shotId}`);
@@ -1659,7 +1663,8 @@ function operationalPrompt(
   }
   return (
     `Review durable event ${event.id} (${event.type}) for this incident. ` +
-    `Scoped identifiers available to the evidence tools: ${scope.join(', ')}.`
+    `Scoped identifiers available to the evidence tools: ${scope.join(', ')}.` +
+    `\n\n${describeOperationalEvidence(evidence)}`
   );
 }
 

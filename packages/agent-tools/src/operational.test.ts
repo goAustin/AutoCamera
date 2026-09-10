@@ -4,6 +4,7 @@ import {
   OPERATIONAL_TOOL_NAMES,
   createOperationalReadTools,
   createOperationalSubmissionTool,
+  describeOperationalEvidence,
   validateOperationalRecommendation,
   describeOperationalRecommendationIssues,
   type OperationalToolServices,
@@ -116,13 +117,17 @@ describe('operational Pi read-only tools', () => {
     );
   });
 
-  it('denies cross-project and cross-resource reads', async () => {
+  it('denies cross-project and cross-resource reads, naming the identifier that is in scope', async () => {
+    // W7: the code still says which rule was hit; the sentence beside it says
+    // what to call instead, so the correction costs one turn rather than
+    // several blind ones.
     const projectResult = await tool('get_project_status').execute('call-1', {
       projectId: otherProjectId,
     });
     expect(projectResult.details).toEqual({
       ok: false,
       code: 'PROJECT_SCOPE_DENIED',
+      message: `get_project_status is scoped to this incident: call it with projectId=${projectId}, or omit projectId.`,
     });
 
     const shotResult = await tool('get_shot_status').execute('call-2', {
@@ -132,7 +137,129 @@ describe('operational Pi read-only tools', () => {
     expect(shotResult.details).toEqual({
       ok: false,
       code: 'SHOT_SCOPE_DENIED',
+      message: `get_shot_status is scoped to this incident: call it with shotId=${shotId}.`,
     });
+    // What the model actually reads is the text block, not `details`.
+    expect(shotResult.content[0]).toEqual({
+      type: 'text',
+      text: JSON.stringify(shotResult.details),
+    });
+  });
+
+  it('tells the model when evidence is out of scope, unreadable, or asked for wrongly', async () => {
+    const unscoped = createOperationalReadTools({
+      tenantId,
+      projectId,
+      services: services(),
+    });
+    const shotless = unscoped.find(
+      (candidate) => candidate.name === 'get_shot_status',
+    );
+    if (!shotless) throw new Error('Missing tool get_shot_status.');
+
+    // No shot in scope at all: there is no identifier to hand back, so the
+    // model is told to stop guessing rather than to try another one. A v4
+    // UUID is the reachable shape of that -- it passes the input schema and
+    // fails the v7 identifier check.
+    const outOfScope = await shotless.execute('call-1', {
+      shotId: '00000000-0000-4000-8000-000000000009',
+    });
+    expect(outOfScope.details).toEqual({
+      ok: false,
+      code: 'SHOT_SCOPE_DENIED',
+      message:
+        'get_shot_status did not accept that shotId. This incident is ' +
+        `scoped to projectId=${projectId} and names no shot, so there is no ` +
+        'other one to try -- conclude from the evidence you do have.',
+    });
+
+    // A service that throws is not a retryable condition either.
+    const failing = tool('get_executor_readiness', {
+      ...services(),
+      getExecutorReadiness: async () => {
+        throw new Error('executor is down');
+      },
+    });
+    expect(await failing.execute('call-2', {})).toMatchObject({
+      details: {
+        code: 'EXECUTOR_UNAVAILABLE',
+        message:
+          'The executor readiness for this incident is not readable. ' +
+          'Retrying get_executor_readiness will not change that -- reach ' +
+          'your conclusion from the evidence you do have.',
+      },
+    });
+
+    // Bad arguments name what the tool takes.
+    const badArguments = await tool('get_attempt_status').execute('call-3', {
+      attempt: attemptId,
+    });
+    expect(badArguments.details).toEqual({
+      ok: false,
+      code: 'INVALID_ARGUMENTS',
+      message:
+        'get_attempt_status could not read its arguments. It takes ' +
+        'attemptId, and optionally projectId.',
+    });
+  });
+
+  it('seeds the resolved evidence in the exact shape the tools return it', async () => {
+    // W6: the prompt block and the tool result are one sanitizer, so a model
+    // that re-reads a seeded row gets the same bytes back and has nothing to
+    // reconcile.
+    const resolved = services();
+    const evidence = {
+      project: (await resolved.getProjectStatus(tenantId, projectId)) as never,
+      shot: (await resolved.getShotStatus(
+        tenantId,
+        projectId,
+        shotId,
+      )) as never,
+      attempt: (await resolved.getAttemptStatus(
+        tenantId,
+        projectId,
+        attemptId,
+      )) as never,
+      revision: (await resolved.getWorkflowRevisionValidation(
+        tenantId,
+        projectId,
+        shotId,
+        revisionId,
+      )) as never,
+    };
+    const seeded = describeOperationalEvidence(evidence);
+
+    for (const [name, args] of [
+      ['get_project_status', { projectId }],
+      ['get_shot_status', { projectId, shotId }],
+      ['get_attempt_status', { projectId, attemptId }],
+      ['get_workflow_revision_validation', { projectId, shotId, revisionId }],
+    ] as const) {
+      const result = await tool(name).execute('call-1', args);
+      const details = result.details as { readonly data: unknown };
+      expect(seeded).toContain(`- ${name}: ${JSON.stringify(details.data)}`);
+    }
+
+    // The two views nobody resolved stay a reason to call a tool.
+    expect(seeded).not.toContain('- get_recent_incidents:');
+    expect(seeded).not.toContain('- get_executor_readiness:');
+    expect(seeded).toContain('use your tool calls for what is not above');
+  });
+
+  it('omits an evidence row the incident does not have', () => {
+    const seeded = describeOperationalEvidence({
+      project: {
+        id: projectId,
+        status: 'needs_attention',
+        budgetMicrousd: null,
+        spentMicrousd: 0,
+        remainingMicrousd: null,
+      },
+    });
+    expect(seeded).toContain('- get_project_status:');
+    expect(seeded).not.toContain('- get_shot_status:');
+    expect(seeded).not.toContain('- get_attempt_status:');
+    expect(seeded).not.toContain('- get_workflow_revision_validation:');
   });
 
   it('returns bounded typed evidence without prompt, graph, or artifact data', async () => {
