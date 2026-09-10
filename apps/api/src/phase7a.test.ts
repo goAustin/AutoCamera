@@ -1,17 +1,22 @@
 import { afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { getApiConfig } from '@h3/config';
-import { createInMemoryStore, type TransactionalStore } from '@h3/db';
+import {
+  createInMemoryStore,
+  type AgentRunRecord,
+  type TransactionalStore,
+} from '@h3/db';
 import {
   DeterministicFakeComfyService,
   FakeComfyClient,
 } from '@h3/comfy-client';
-import { assertUuid } from '@h3/domain';
+import { assertUuid, createUuidV7 } from '@h3/domain';
 import {
   hashWorkflowExecutionEnvelope,
   loadMinimaxH3Fixtures,
 } from '@h3/workflow-compiler';
 import { buildApiApp } from './app.js';
 import { DEV_TENANT_ID } from './application.js';
+import { DEFAULT_ESTIMATED_ATTEMPT_COST } from './generation.js';
 
 const apps = new Set<Awaited<ReturnType<typeof buildApiApp>>>();
 
@@ -290,6 +295,81 @@ describe('Phase 7A thin-core runs', () => {
     expect(events.map((event) => event.type)).toContain(
       'project.budget_denied',
     );
+  });
+
+  it('admits an attempt against a project whose monitoring cost dwarfs its budget', async () => {
+    const { app, store } = createApp();
+    const projectResponse = await app.inject({
+      method: 'POST',
+      url: '/v1/projects',
+      headers: authHeaders('phase7a-inference-not-budget'),
+      payload: {
+        title: 'Heavily monitored project',
+        brief: 'Monitoring spend must never deny generation.',
+        targetDurationSeconds: 3,
+        // Exactly one attempt's worth of budget, so a breaker that summed
+        // inference into `nextSpend` would deny over a single microusd.
+        budgetMicrousd: DEFAULT_ESTIMATED_ATTEMPT_COST,
+      },
+    });
+    expect(projectResponse.statusCode).toBe(201);
+    const projectId = assertUuid(projectResponse.json().project.id as string);
+
+    // Five times the whole budget, spent on watching the project rather than
+    // on generating anything.
+    const inferenceCostMicrousd = DEFAULT_ESTIMATED_ATTEMPT_COST * 5;
+    const startedAt = new Date().toISOString();
+    await store.withTransaction((repositories) =>
+      repositories.agentRuns.create({
+        id: createUuidV7(),
+        tenantId: DEV_TENANT_ID,
+        projectId,
+        runId: 'phase7a-operator-run',
+        sessionId: 'session-phase7a-operator-run',
+        objective:
+          'Recommend a bounded operational action from durable evidence.',
+        provider: 'faux',
+        model: 'faux-model',
+        status: 'succeeded',
+        toolCalls: 1,
+        inputTokens: 100,
+        outputTokens: 50,
+        totalTokens: 150,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        providerCostMicrousd: inferenceCostMicrousd,
+        startedAt,
+        version: 1,
+        updatedAt: startedAt,
+      } satisfies AgentRunRecord),
+    );
+
+    const admitted = await submitRun(app, 'phase7a-inference-admitted', {
+      projectId,
+    });
+    expect(admitted.statusCode).toBe(201);
+
+    const events = await store.withTransaction((repositories) =>
+      repositories.events.listByProject(projectId),
+    );
+    expect(events.map((event) => event.type)).not.toContain(
+      'project.budget_denied',
+    );
+
+    // The attempt moved attempt spend and nothing else: the two figures stay
+    // distinct after a real generation, not only on a freshly created project.
+    const cost = await app.inject({
+      method: 'GET',
+      url: `/v1/projects/${projectId}/cost`,
+      headers: authHeaders(),
+    });
+    expect(cost.statusCode).toBe(200);
+    expect(cost.json()).toMatchObject({
+      budgetMicrousd: DEFAULT_ESTIMATED_ATTEMPT_COST,
+      spentMicrousd: DEFAULT_ESTIMATED_ATTEMPT_COST,
+      remainingMicrousd: 0,
+      inferenceCostMicrousd,
+    });
   });
 
   it('pins failed and running records, reviews without lifecycle transitions, and unpins reversibly', async () => {

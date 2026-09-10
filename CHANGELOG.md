@@ -1,5 +1,46 @@
 # Changelog
 
+## Monitoring spend cannot deny a generation, and a test that would notice
+
+Evidence level: Offline. No provider call was made -- the new test seeds one
+`agent_runs` row through the repository inside a transaction, the same way the
+step 5 tests below already do. Closes the second half of the step 5 acceptance
+gate in `docs/75-PHASE-7E-OPERATIONAL-INTELLIGENCE.md`, which the entry below
+left open.
+
+- **The admission half was asserted nowhere.** The gate reads "Inference spend
+  is reported separately from attempt spend, *and budget enforcement still keys
+  on attempt spend only*." The three tests in the entry below cover the first
+  half only: every one of them reads `GET /cost` and none reaches
+  `createAttempt`, and neither existing `BUDGET_EXCEEDED` test
+  (`generation.test.ts:494`, `phase7a.test.ts:285`) seeds an `agent_runs` row.
+  Denial ignoring inference cost was true by construction and pinned by
+  nothing, which is exactly the property a later "total cost" refactor would
+  break silently.
+- **`phase7a.test.ts:299`** -- "admits an attempt against a project whose
+  monitoring cost dwarfs its budget" -- budgets a project at exactly
+  `DEFAULT_ESTIMATED_ATTEMPT_COST`, so it can afford one attempt and not one
+  microusd more, then seeds an `agent_runs` row worth five times that whole
+  budget. `POST /v1/runs` must return 201, no `project.budget_denied` event may
+  be appended, and `GET /cost` must afterwards show `spentMicrousd` moved by
+  exactly one attempt with `inferenceCostMicrousd` still at five times the
+  budget. Any inference microusd reaching `nextSpend` flips the run to 409.
+- **Verified by mutation, not by passing.** Folding
+  `agentRuns.sumProviderCostMicrousd` into `createAttempt`'s `nextSpend`
+  (`generation.ts:660`) fails this test and only this test -- 1 failed, 13
+  passed in the file -- which is both the proof that the guard bites and the
+  proof that the gap was real. `generation.ts` was restored; the test file is
+  the only source change in this entry.
+- **Correction to the entry below.** It claimed the zero-runs integration test
+  pins the `COALESCE` in `sumProviderCostMicrousd`, "since that particular
+  divergence is invisible to a unit test running only the in-memory store".
+  It does not. Removing the `COALESCE` leaves all 20 integration tests passing,
+  because `databaseNumber(result.rows[0]?.total ?? 0)` swallows the NULL on the
+  JS side -- and `Number(null)` is `0` even without the `?? 0`. The `COALESCE`
+  stays and the test stays; the sentence describing what guards what has been
+  corrected in place.
+- 266 unit (26 files, was 265) and 20 integration (10 files, unchanged).
+
 ## Two figures where there was one: what monitoring the incident cost
 
 Evidence level: Offline. No provider call was made -- every fixture in the
@@ -28,12 +69,14 @@ step 5 of `docs/75-PHASE-7E-OPERATIONAL-INTELLIGENCE.md`.
   -- ids, timestamps, status -- to answer a question that needs one summed
   column, and a project accumulates one `agent_runs` row per operator
   trigger or digest for its whole lifetime, while `GET /cost` is a plain
-  read a dashboard can poll. The `COALESCE` matters: a bare `SUM` over zero
-  matching rows is `NULL` in Postgres, and the in-memory store's `.reduce`
-  needs the same zero seed -- both must return a plain `0`, which is
-  asserted against a real database in `domain-api.integration.test.ts`,
-  since that particular divergence is invisible to a unit test running only
-  the in-memory store.
+  read a dashboard can poll. The `COALESCE` is deliberate -- a bare `SUM`
+  over zero matching rows is `NULL` in Postgres, and the in-memory store's
+  `.reduce` needs the same zero seed -- but it is belt-and-braces rather
+  than the load-bearing guard, and this entry originally claimed otherwise:
+  see the correction in the entry above. What
+  `domain-api.integration.test.ts` pins against a real database is the
+  observable contract -- `inferenceCostMicrousd` is the number `0` and never
+  `null` -- together with the query's shape over a real BIGINT column.
 - **No metric added.** The spec allows reusing
   `video_operator_recommendations_total` if a new counter can be justified;
   `GET /cost` is a pure read and none of its existing three fields emit a
