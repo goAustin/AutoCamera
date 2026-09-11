@@ -37,6 +37,17 @@ structured-output failure — and the model call runs outside the outbox
 transaction. Automated verification in this repository runs entirely against
 `faux` or an injected stub; no paid call is made by any test.
 
+A session digest (`POST /v1/projects/:projectId/digest`) runs the same
+read-only tools over a time window instead of a single event, returning one
+bounded, Zod-validated summary and recording its own cost; the window is
+enforced on the underlying reads, and a run id outside it is denied rather
+than cited. `GET /v1/projects/:projectId/cost` reports `inferenceCostMicrousd`
+as a fourth figure alongside budget/spent/remaining — what monitoring a
+project has cost, summed across its `agent_runs` rows — kept separate from
+`spentMicrousd`; budget admission for a new attempt still keys on attempt
+spend alone. This closes Phase 7E, and with it **Phase 7 (7A-7E) is
+complete**.
+
 ## What is not implemented
 
 - **Real H3 inference.** No GPU has been provisioned, no weights are bundled,
@@ -44,9 +55,6 @@ transaction. Automated verification in this repository runs entirely against
 - **The remote ComfyUI contract.** `COMFY_LIVE_TEST=1 COMFY_MODE=remote pnpm
   test:comfy-live` reports SKIP, not pass, because no pinned remote executor is
   configured here. Also Phase 8.
-- **A cross-run digest and inference-cost reporting.** `POST /v1/digest` and
-  splitting inference spend from attempt spend on the cost endpoint are
-  specified (Phase 7E steps 4-5) but not built.
 - Production billing, autoscaling, multitenancy, SLOs, and Kubernetes.
 
 Fake output is not a quality or throughput benchmark, and no capture in this
@@ -59,12 +67,12 @@ recorded in [`EVIDENCE-MANIFEST.md`](EVIDENCE-MANIFEST.md).
 |---|---|
 | Frozen install | PASS |
 | Format, lint, strict TypeScript, production build | PASS — all exit 0 |
-| Unit suite | PASS — 254 tests across 26 files |
-| Integration suite | PASS — 18 tests across 10 files, PostgreSQL-backed |
+| Unit suite | PASS — 278 tests across 27 files |
+| Integration suite | PASS — 22 tests across 11 files, PostgreSQL-backed |
 | Browser suite | PASS — 10/10 at the last recorded full run |
 | Token isolation | PASS — `storageHasCredential: false`, `globalsHaveCredential: false`, `crossOriginProtected: true` |
 | Documentation and provenance | PASS — 13 captures accounted for |
-| Secret scan | PASS — 184 tracked files inspected |
+| Secret scan | PASS — 190 tracked files inspected |
 | Live ComfyUI contract | SKIP — no configured pinned remote executor |
 | Real H3 GPU smoke | NOT RUN — Phase 8 |
 
