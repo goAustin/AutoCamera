@@ -1,5 +1,33 @@
 # Changelog
 
+## A real clip, through the managed run path
+
+Evidence level moves. Phase 8 step 2 ran on a rented RTX 5090
+(`docs/85-PHASE-8-STEP2-RESULT.md`): `POST /v1/runs` accepted the pinned graph
+with `validation: validated`, the in-process worker drove the real executor,
+media evaluation passed, and the attempt reached `accepted` with a stored
+artifact -- h264 960x544, 124 frames, 24 fps, 5.17 s, AAC 32 kHz stereo. That
+is the profile default exactly. **This discharges row 2.12**, the only row that
+can carry a real-generation claim.
+
+**Phase 8 is still not complete.** Row 2.11 -- the six browser-bridge checks --
+needs the section 5 gateway and an authenticated browser session, neither of
+which was stood up. It is split into its own pass, which the runbook permits;
+the gate is every row, so the gate is open.
+
+- Topology A end to end on the rented host: PostgreSQL 16.15, Node 24.21.0,
+  pnpm 9.15.0, migrations applied, ComfyUI bound to `127.0.0.1:8188` and never
+  published. All five model files sha256-verified against the publisher's
+  bytes, the turbo LoRA included.
+- `COMFY_LIVE_TEST=1 COMFY_MODE=remote pnpm test:comfy-live` **passed on its
+  first-ever run** against a pinned remote executor.
+- The budget breaker governed a real attempt: `budgetMicrousd` 3000000,
+  `spentMicrousd` 0 -> 100000.
+- Cost $1.315, of which about $0.80 was the meter running while nobody was
+  driving it. The watchdog was armed throughout and the ceiling was never at
+  risk, so the waste was bounded -- but bounded waste is still waste. A
+  completed background wait is a work item, not a notification.
+
 ## The graph we ship, submitted to a real executor for the first time
 
 Evidence level: **Real H3 inference, once, on rented hardware.** Phase 8 step 1

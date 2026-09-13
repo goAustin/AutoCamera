@@ -1,7 +1,15 @@
 # Status
 
-Evidence level: **Offline fake**. No real MiniMax H3 clip has been generated,
-and no remote executor has been exercised in this environment.
+Evidence level: **One real generation, through the managed run path.** On
+2026-09-13 a pinned remote executor was exercised on a rented RTX 5090 and
+produced a clip at the profile defaults — 960x544, 124 frames, 24 fps, 5.17 s,
+AAC 32 kHz stereo — submitted through `POST /v1/runs` against a budgeted
+project and stored as an **accepted** attempt (`docs/85-PHASE-8-STEP2-RESULT.md`).
+
+**Phase 8 is not complete.** Its gate is every row of Step 2's table, and row
+2.11 — the six browser-bridge checks of `infra/gpu-executor/README.md` §6 — was
+split into a separate pass and has not been performed. Everything in this
+repository that is not that one clip remains offline fake output.
 
 ## What is implemented
 
@@ -50,15 +58,19 @@ complete**.
 
 ## What is not implemented
 
-- **Real H3 inference.** No GPU has been provisioned, no weights are bundled,
-  and no real clip has been generated. Deferred to Phase 8.
-- **The remote ComfyUI contract.** `COMFY_LIVE_TEST=1 COMFY_MODE=remote pnpm
-  test:comfy-live` reports SKIP, not pass, because no pinned remote executor is
-  configured here. Also Phase 8.
+- **The Phase 8 gate, row 2.11.** The six browser-bridge checks of
+  `infra/gpu-executor/README.md` §6 need the §5 gateway and an authenticated
+  browser session; neither was stood up on the rented host. Split into its own
+  pass, so the gate is not discharged.
+- **Repeatable real inference.** One generation has been produced, on a host
+  that no longer exists. Nothing here provisions a GPU on demand, and no
+  weights are bundled.
 - Production billing, autoscaling, multitenancy, SLOs, and Kubernetes.
 
-Fake output is not a quality or throughput benchmark, and no capture in this
-repository may be read as evidence of H3 inference. Capture provenance is
+Fake output is not a quality or throughput benchmark. Exactly one capture —
+`deliverables/phase8-step2/profile-default-via-videoops.mp4` — is real H3
+inference; every other capture in this repository is fake output and may not be
+read as evidence of it. Capture provenance is
 recorded in [`EVIDENCE-MANIFEST.md`](EVIDENCE-MANIFEST.md).
 
 ## Verification record
@@ -73,8 +85,9 @@ recorded in [`EVIDENCE-MANIFEST.md`](EVIDENCE-MANIFEST.md).
 | Token isolation | PASS — `storageHasCredential: false`, `globalsHaveCredential: false`, `crossOriginProtected: true` |
 | Documentation and provenance | PASS — 12 captures accounted for |
 | Secret scan | PASS — 190 tracked files inspected |
-| Live ComfyUI contract | SKIP — no configured pinned remote executor |
-| Real H3 GPU smoke | NOT RUN — Phase 8 |
+| Live ComfyUI contract | PASS — against the pinned remote executor on a rented RTX 5090, 2026-09-13 |
+| Real H3 GPU smoke | PASS — accepted attempt at profile defaults through `POST /v1/runs` |
+| Phase 8 gate row 2.11 | NOT RUN — browser bridge checks split into a separate pass |
 
 ## Known issues
 
