@@ -2,24 +2,42 @@ import { describe, expect, it } from 'vitest';
 import {
   ComfyClientError,
   ComfyPromptRejectedError,
+  type ComfyScenario,
   ComfyStreamDisconnectedError,
   ComfySubmissionUncertainError,
+  type ComfyWebSocketLike,
+  computeComfyCapabilityFingerprint,
   DeterministicFakeComfyService,
   FakeComfyClient,
   HttpWsComfyClient,
-  computeComfyCapabilityFingerprint,
-  type ComfyWebSocketLike,
-  type ComfyScenario,
 } from './index.js';
 
 const waitForTimers = async (): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, 5));
 
 describe('Comfy client contract', () => {
-  it('keeps the legacy fake object-info fingerprint stable', () => {
+  // The default service now answers with the pinned capture rather than a
+  // hand-written stand-in, so this fingerprint must equal the one
+  // `apps/fake-comfy` serves. Both packages pin the literal deliberately: when
+  // the ComfyUI pin moves and the fixture is re-captured, both should be
+  // updated as one visible decision, not drift apart the way the two fixtures
+  // it replaced did.
+  it('serves the pinned object-info contract, matching apps/fake-comfy', () => {
     expect(
       new DeterministicFakeComfyService().capabilities.capabilityFingerprint,
-    ).toBe('bdc5637c1238dc499167d6382eb44090e5a1ece4dbf0086996a54827a447b978');
+    ).toBe('4da7d9759f98506d8f8ac52e802e17fabe7917e8a058df1c3c325bde8390d90e');
+  });
+
+  // The specific input whose absence from the old stand-in let a graph the real
+  // executor rejects validate clean offline.
+  it('carries the required inputs the replaced stand-in omitted', () => {
+    const unetLoader = new DeterministicFakeComfyService().getObjectInfo()
+      .UNETLoader as
+      | { readonly input?: { readonly required?: Record<string, unknown> } }
+      | undefined;
+    expect(Object.keys(unetLoader?.input?.required ?? {})).toContain(
+      'weight_dtype',
+    );
   });
 
   it.each([

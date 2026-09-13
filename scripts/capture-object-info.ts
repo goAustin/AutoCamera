@@ -199,7 +199,7 @@ function parseArguments(): {
   const outputPath = resolveRepositoryPath(
     positional[1] ||
       process.env.H3_OBJECT_INFO_FIXTURE_PATH ||
-      'apps/fake-comfy/fixtures/object-info.pinned.json',
+      'packages/comfy-client/fixtures/object-info.pinned.json',
   );
   const metaPath = outputPath.replace(/\.json$/u, '.meta.json');
   const templatePath = resolveRepositoryPath(

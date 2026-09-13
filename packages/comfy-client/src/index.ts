@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const DEFAULT_MAX_JSON_RESPONSE_BYTES = 8 * 1024 * 1024;
 const DEFAULT_MAX_OUTPUT_BYTES = 512 * 1024 * 1024;
@@ -366,48 +367,41 @@ function loadGeneratedFixtureBytes(seed: number): Uint8Array {
   return createDeterministicFixtureBytes(seed);
 }
 
-const LEGACY_FAKE_OBJECT_INFO: ComfyObjectInfoResponse = {
-  UNETLoader: {
-    input: {
-      required: {
-        unet_name: [['minimax_h3_fl2va_pruned_int8_convrot.safetensors']],
-      },
-    },
-  },
-  CLIPLoader: {
-    input: {
-      required: {
-        clip_name: [['qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors']],
-      },
-    },
-  },
-  VAELoader: {
-    input: {
-      required: {
-        vae_name: [
-          [
-            'minimax_h3_video_vae_fp16.safetensors',
-            'minimax_h3_audio_vae_fp32.safetensors',
-          ],
-        ],
-      },
-    },
-  },
-  MiniMaxH3ImageToVideo: {},
-  RandomNoise: {},
-  BasicScheduler: {},
-  KSamplerSelect: {},
-  BasicGuider: {},
-  SamplerCustomAdvanced: {},
-  VAEDecode: {},
-  VAEDecodeAudio: {},
-  CreateVideo: {},
-  SaveVideo: {},
-  // Retained for the Phase 3 compatibility client/tests.
-  CLIPTextEncode: {},
-  EmptyHunyuanLatentVideo: {},
-  KSampler: {},
-};
+/**
+ * Absolute path to the one `object_info` contract this repository has: captured
+ * from the pinned ComfyUI by `scripts/capture-object-info.ts`. It lives beside
+ * this package because `apps/fake-comfy` depends on it and not the reverse.
+ * Resolves identically from `src/` and `dist/`, both one level under the
+ * package root.
+ */
+export const PINNED_OBJECT_INFO_PATH = resolve(
+  dirname(fileURLToPath(import.meta.url)),
+  '../fixtures/object-info.pinned.json',
+);
+
+let pinnedObjectInfo: ComfyObjectInfoResponse | undefined;
+
+/**
+ * Load the pinned capture, memoised. This replaced a hand-written sixteen-class
+ * stand-in whose node specs were mostly empty: it declared
+ * `UNETLoader.input.required` as `unet_name` alone, so a graph missing the
+ * required `weight_dtype` validated clean here and was rejected by the real
+ * executor with 400. Two contracts meant the weaker one silently won wherever a
+ * caller supplied its own service. There is now one.
+ */
+export function loadPinnedObjectInfo(): ComfyObjectInfoResponse {
+  if (pinnedObjectInfo) return pinnedObjectInfo;
+  const value: unknown = JSON.parse(
+    readFileSync(PINNED_OBJECT_INFO_PATH, 'utf8'),
+  );
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new Error(
+      `Pinned ComfyUI object-info fixture at ${PINNED_OBJECT_INFO_PATH} is not a JSON object`,
+    );
+  }
+  pinnedObjectInfo = value as ComfyObjectInfoResponse;
+  return pinnedObjectInfo;
+}
 
 export class DeterministicFakeComfyService {
   readonly capabilities: ComfyCapabilities;
@@ -426,7 +420,7 @@ export class DeterministicFakeComfyService {
     } = {},
   ) {
     this.outputBytes = options.outputBytes ?? loadGeneratedFixtureBytes;
-    this.objectInfo = options.objectInfo ?? LEGACY_FAKE_OBJECT_INFO;
+    this.objectInfo = options.objectInfo ?? loadPinnedObjectInfo();
     this.capabilities = {
       apiVersion: '0.0.1-fake',
       supportsWebSocket: true,
