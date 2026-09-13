@@ -3,9 +3,16 @@ import { defineConfig } from '@playwright/test';
 const apiPort = Number(process.env.E2E_API_PORT ?? 3300);
 const fakeComfyPort = Number(process.env.E2E_FAKE_COMFY_PORT ?? 38188);
 const webPort = Number(process.env.E2E_WEB_PORT ?? 35173);
+const gatewayPort = Number(process.env.E2E_GATEWAY_PORT ?? 38190);
 const apiOrigin = `http://127.0.0.1:${apiPort}`;
 const fakeComfyOrigin = `http://127.0.0.1:${fakeComfyPort}`;
 const webOrigin = `http://127.0.0.1:${webPort}`;
+const gatewayOrigin = `http://127.0.0.1:${gatewayPort}`;
+
+// `commonEnvironment` below reaches the webServer processes, not the test
+// workers. This config module is evaluated in the runner and in each worker,
+// so setting it here is what e2e/comfy-gateway.spec.ts actually reads.
+process.env.E2E_GATEWAY_ORIGIN = gatewayOrigin;
 
 const inheritedEnvironment = Object.fromEntries(
   Object.entries(process.env).filter(
@@ -54,6 +61,7 @@ const commonEnvironment = {
   WEB_HOST: '127.0.0.1',
   WEB_PORT: String(webPort),
   VITE_API_ORIGIN: apiOrigin,
+  E2E_GATEWAY_ORIGIN: gatewayOrigin,
 };
 
 export default defineConfig({
@@ -79,6 +87,25 @@ export default defineConfig({
       url: `${fakeComfyOrigin}/health`,
       timeout: 120_000,
       reuseExistingServer: false,
+    },
+    {
+      // The ComfyUI browser gateway (infra/caddy/Caddyfile). Docker is already
+      // a hard prerequisite for this suite -- scripts/test-e2e.ts refuses to
+      // run without PostgreSQL -- so requiring it here adds no new dependency,
+      // and it lets e2e/comfy-gateway.spec.ts assert the section 5 denials on
+      // every run instead of once by hand on a rented host.
+      command:
+        'docker compose -f infra/compose.yaml --profile gateway up comfy-gateway',
+      cwd: process.cwd(),
+      env: {
+        ...commonEnvironment,
+        GATEWAY_PORT: String(gatewayPort),
+        COMFY_UPSTREAM: `host.docker.internal:${fakeComfyPort}`,
+        VIDEOOPS_STUDIO_ORIGIN: webOrigin,
+      },
+      url: `${gatewayOrigin}/comfy/system_stats`,
+      timeout: 120_000,
+      reuseExistingServer: true,
     },
     {
       command: 'pnpm exec tsx apps/api/src/main.ts',

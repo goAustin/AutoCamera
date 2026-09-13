@@ -17,6 +17,30 @@ services:
       retries: 10
       start_period: 5s
 
+  # The browser editor route. Denies queue mutation so every generation has to
+  # arrive through POST /v1/runs; see caddy/Caddyfile and gpu-executor
+  # README section 5.
+  comfy-gateway:
+    profiles: [gateway]
+    image: caddy:2.11.4-alpine
+    restart: unless-stopped
+    environment:
+      GATEWAY_PORT: "8190"
+      COMFY_UPSTREAM: ${COMFY_UPSTREAM:-host.docker.internal:8188}
+      STUDIO_ORIGIN: ${VIDEOOPS_STUDIO_ORIGIN:-http://127.0.0.1:5173}
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "127.0.0.1:${GATEWAY_PORT:-8190}:8190"
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "8190"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 2s
+
   otel-collector:
     profiles: [observability]
     image: otel/opentelemetry-collector-contrib:0.136.0

@@ -58,10 +58,12 @@ complete**.
 
 ## What is not implemented
 
-- **The Phase 8 gate, row 2.11.** The six browser-bridge checks of
-  `infra/gpu-executor/README.md` §6 need the §5 gateway and an authenticated
-  browser session; neither was stood up on the rented host. Split into its own
-  pass, so the gate is not discharged.
+- **The Phase 8 gate, row 2.11.** Item 5 — gateway denial of browser queue
+  mutation — is now closed by `e2e/comfy-gateway.spec.ts` against the Caddy
+  route in `infra/caddy/Caddyfile`. Item 1 is still open: whether real
+  ComfyUI's pip-served pinned frontend behaves like the
+  `.data/comfy-frontend/dist` build the suite exercises. The row, and so the
+  gate, is not discharged.
 - **Repeatable real inference.** One generation has been produced, on a host
   that no longer exists. Nothing here provisions a GPU on demand, and no
   weights are bundled.
@@ -81,7 +83,8 @@ recorded in [`EVIDENCE-MANIFEST.md`](EVIDENCE-MANIFEST.md).
 | Format, lint, strict TypeScript, production build | PASS — all exit 0 |
 | Unit suite | PASS — 280 tests across 27 files |
 | Integration suite | PASS — 22 tests across 11 files, PostgreSQL-backed |
-| Browser suite | PASS — 10/10 at the last recorded full run |
+| Browser suite | 12/17 here — the 7 new gateway tests pass; 4 `run-view` failures reproduce on a clean tree and predate this work, and `demo-screenshots` expects `CAPTURE_EVIDENCE=1` |
+| ComfyUI browser gateway | PASS — 7/7, queue mutation denied at the gateway |
 | Token isolation | PASS — `storageHasCredential: false`, `globalsHaveCredential: false`, `crossOriginProtected: true` |
 | Documentation and provenance | PASS — 12 captures accounted for |
 | Secret scan | PASS — 190 tracked files inspected |

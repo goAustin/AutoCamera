@@ -1,0 +1,63 @@
+# The browser-facing half of infra/gpu-executor/README.md section 5.
+#
+# Topology A binds ComfyUI to loopback and publishes nothing, so the worker
+# reaches it without crossing a network and section 5's private vhost on 8189
+# is unnecessary (README section 0 says so explicitly). What remains required
+# is this route: the browser may reach the editor, its static assets and its
+# WebSocket; it may not reach anything that queues, mutates, or interrupts.
+#
+# What this protects is the record, not the GPU. Every generation has to arrive
+# through POST /v1/runs so it carries a project, a budget, a server-hashed
+# workflow revision, and a durable attempt row. A browser that can POST /prompt
+# produces clips the control plane can neither see nor bill, and which contend
+# with attempts it is trying to run. Disabling the Queue button in the frontend
+# is a UI affordance; this is the control.
+{
+	admin off
+	auto_https off
+}
+
+:{$GATEWAY_PORT:8190} {
+	# `route` preserves the order written here rather than Caddy's default
+	# directive ordering, so the denials are guaranteed to be evaluated before
+	# anything can proxy.
+	route {
+		# Explicit denies kept beside the broad method policy below, so that a
+		# later change to that policy cannot quietly make these reachable again.
+		@execution_control path /comfy/prompt /comfy/interrupt /comfy/free
+		respond @execution_control 405
+
+		# /queue is readable but never mutable: GET lists it, POST clears it,
+		# DELETE removes entries.
+		@queue_mutation {
+			path /comfy/queue
+			not method GET HEAD OPTIONS
+		}
+		respond @queue_mutation 405
+
+		# The broad policy: the whole browser surface is read-only.
+		@browser_mutation {
+			path /comfy/*
+			not method GET HEAD OPTIONS
+		}
+		respond @browser_mutation 405
+
+		handle_path /comfy/* {
+			header {
+				# An exact origin, never "*": this route is framed by Studio alone.
+				Content-Security-Policy "frame-ancestors {$STUDIO_ORIGIN:http://127.0.0.1:5173}"
+				X-Content-Type-Options nosniff
+			}
+			# The WebSocket upgrade passes through: it carries status and
+			# progress, not submissions, and the editor is unusable without it.
+			reverse_proxy {$COMFY_UPSTREAM:host.docker.internal:8188}
+			# If the upstream is ever given a bearer token, attach it here with
+			#   header_up Authorization {$COMFY_UPSTREAM_AUTHORIZATION}
+			# so it is added server-side and never reaches the browser. The
+			# Topology A upstream binds loopback with no token, so nothing is
+			# set rather than an empty header being sent.
+		}
+
+		respond 404
+	}
+}
