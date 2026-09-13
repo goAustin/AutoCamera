@@ -1,5 +1,38 @@
 # Changelog
 
+## The graph we ship, submitted to a real executor for the first time
+
+Evidence level: **Real H3 inference, once, on rented hardware.** Phase 8 step 1
+ran on an RTX 5090 (`docs/84-PHASE-8-STEP1-ATTEMPT2-RESULT.md`): the pinned
+graph produced a 960x544, 124-frame, 24 fps clip with AAC 32 kHz stereo in 89
+seconds, peak VRAM 31.9 GB of 32.6 GB, for $0.175. **This discharges no
+acceptance-gate item** -- those clips came from ComfyUI directly over loopback,
+not through the VideoOps managed run path, so gate row 2.12 is still open and
+`STATUS.md`'s evidence level is unchanged.
+
+- **`workflows/minimax-h3/api.json` could not be submitted to the pinned
+  ComfyUI.** `UNETLoader` requires `weight_dtype`; the graph omitted it and the
+  real executor answered `400 required_input_missing` on the first POST ever
+  made to one. `editor.json` had the field all along, and the pinned
+  `object_info` declared it required -- only the hand-maintained API graph
+  drifted, because nothing offline could tell.
+- **`apps/fake-comfy` accepted a graph the real executor rejects.** Its
+  `/prompt` and `/api/prompt` handlers carried byte-identical blocks that
+  validated `class_type` and nothing else. Both now call one
+  `collectNodeErrors()` enforcing `input.required` from the pinned capture, and
+  returning ComfyUI's own `required_input_missing` shape. A test submits the
+  shipped `api.json` and expects acceptance, then the same graph with
+  `weight_dtype` removed and expects the 400.
+- **There were two `object_info` contracts.** `DeterministicFakeComfyService`
+  defaulted to a hand-written sixteen-class stand-in, most entries with no
+  input spec at all, so the eleven test files constructing their own service
+  validated against the weaker one. It is deleted. The pinned capture -- a
+  strict superset -- moved to `packages/comfy-client/fixtures/`, the layer that
+  owns it, and is now the single default. The separately pinned fingerprints
+  `bdc5637c...` and `4da7d975...` collapsed to one value.
+- Every other test passed unchanged through the switch from sixteen classes to
+  613, which is the evidence that the stricter contract costs nothing.
+
 ## Four hours of a rented GPU, in one bounded paragraph
 
 Evidence level: Offline. No provider call was made -- every test runs against

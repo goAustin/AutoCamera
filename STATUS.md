@@ -67,11 +67,11 @@ recorded in [`EVIDENCE-MANIFEST.md`](EVIDENCE-MANIFEST.md).
 |---|---|
 | Frozen install | PASS |
 | Format, lint, strict TypeScript, production build | PASS — all exit 0 |
-| Unit suite | PASS — 278 tests across 27 files |
+| Unit suite | PASS — 280 tests across 27 files |
 | Integration suite | PASS — 22 tests across 11 files, PostgreSQL-backed |
 | Browser suite | PASS — 10/10 at the last recorded full run |
 | Token isolation | PASS — `storageHasCredential: false`, `globalsHaveCredential: false`, `crossOriginProtected: true` |
-| Documentation and provenance | PASS — 13 captures accounted for |
+| Documentation and provenance | PASS — 12 captures accounted for |
 | Secret scan | PASS — 190 tracked files inspected |
 | Live ComfyUI contract | SKIP — no configured pinned remote executor |
 | Real H3 GPU smoke | NOT RUN — Phase 8 |
