@@ -2,15 +2,16 @@ import { createHash } from 'node:crypto';
 import { createReadStream, readFileSync, statSync } from 'node:fs';
 import { dirname, extname, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import Fastify, { type FastifyInstance, type FastifyReply } from 'fastify';
 import {
-  DeterministicFakeComfyService,
   type ComfyHealthResponse,
-  type ComfyScenario,
   type ComfyObjectInfoResponse,
+  type ComfyScenario,
   type ComfySystemStatsResponse,
+  DeterministicFakeComfyService,
+  PINNED_OBJECT_INFO_PATH,
 } from '@h3/comfy-client';
-import { getFakeComfyConfig, type FakeComfyConfig } from '@h3/config';
+import { type FakeComfyConfig, getFakeComfyConfig } from '@h3/config';
+import Fastify, { type FastifyInstance, type FastifyReply } from 'fastify';
 
 export interface FakeComfyAppOptions {
   readonly config?: FakeComfyConfig;
@@ -26,10 +27,9 @@ const repositoryRoot = resolve(
   dirname(fileURLToPath(import.meta.url)),
   '../../..',
 );
-const defaultObjectInfoPath = resolve(
-  repositoryRoot,
-  'apps/fake-comfy/fixtures/object-info.pinned.json',
-);
+// One contract, owned by @h3/comfy-client — this app and the deterministic
+// fake service must not be able to disagree about what the executor requires.
+const defaultObjectInfoPath = PINNED_OBJECT_INFO_PATH;
 const defaultFrontendRoot = resolve(
   repositoryRoot,
   '.data/comfy-frontend/dist',
@@ -232,6 +232,50 @@ function scenario(value: unknown): ComfyScenario {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Validate a submitted prompt against the pinned `object_info` the way the real
+ * executor does. Checking only `class_type` lets a graph that ComfyUI rejects
+ * pass here: `workflows/minimax-h3/api.json` was missing `UNETLoader`'s
+ * required `weight_dtype` and every offline suite stayed green while the real
+ * executor answered 400. The fixture already carries `input.required`, so the
+ * contract to enforce is the one we captured, not a second-guess of it.
+ */
+function collectNodeErrors(
+  objectInfo: Readonly<Record<string, unknown>>,
+  prompt: Readonly<Record<string, unknown>>,
+): Record<string, unknown> {
+  const nodeErrors: Record<string, unknown> = {};
+  for (const [nodeId, node] of Object.entries(prompt)) {
+    if (!isRecord(node) || typeof node.class_type !== 'string') {
+      nodeErrors[nodeId] = { errors: ['node class_type is required'] };
+      continue;
+    }
+    const spec = objectInfo[node.class_type];
+    if (!isRecord(spec)) {
+      nodeErrors[nodeId] = {
+        class_type: node.class_type,
+        errors: ['node class is not available'],
+      };
+      continue;
+    }
+    const required = isRecord(spec.input) ? spec.input.required : undefined;
+    if (!isRecord(required)) continue;
+    const inputs = isRecord(node.inputs) ? node.inputs : {};
+    const missing = Object.keys(required).filter((name) => !(name in inputs));
+    if (missing.length === 0) continue;
+    nodeErrors[nodeId] = {
+      class_type: node.class_type,
+      errors: missing.map((name) => ({
+        type: 'required_input_missing',
+        message: 'Required input is missing',
+        details: name,
+        extra_info: { input_name: name },
+      })),
+    };
+  }
+  return nodeErrors;
 }
 
 function historyResponse(
@@ -520,18 +564,7 @@ export function buildFakeComfyApp(
         node_errors: {},
       });
     }
-    const availableClasses = new Set(Object.keys(objectInfo));
-    const nodeErrors: Record<string, unknown> = {};
-    for (const [nodeId, node] of Object.entries(prompt)) {
-      if (!isRecord(node) || typeof node.class_type !== 'string') {
-        nodeErrors[nodeId] = { errors: ['node class_type is required'] };
-      } else if (!availableClasses.has(node.class_type)) {
-        nodeErrors[nodeId] = {
-          class_type: node.class_type,
-          errors: ['node class is not available'],
-        };
-      }
-    }
+    const nodeErrors = collectNodeErrors(objectInfo, prompt);
     if (Object.keys(nodeErrors).length > 0) {
       return reply.code(400).send({
         error: 'Prompt validation failed.',
@@ -674,18 +707,7 @@ export function buildFakeComfyApp(
         node_errors: {},
       });
     }
-    const availableClasses = new Set(Object.keys(objectInfo));
-    const nodeErrors: Record<string, unknown> = {};
-    for (const [nodeId, node] of Object.entries(prompt)) {
-      if (!isRecord(node) || typeof node.class_type !== 'string') {
-        nodeErrors[nodeId] = { errors: ['node class_type is required'] };
-      } else if (!availableClasses.has(node.class_type)) {
-        nodeErrors[nodeId] = {
-          class_type: node.class_type,
-          errors: ['node class is not available'],
-        };
-      }
-    }
+    const nodeErrors = collectNodeErrors(objectInfo, prompt);
     if (Object.keys(nodeErrors).length > 0) {
       return reply.code(400).send({
         error: 'Prompt validation failed.',

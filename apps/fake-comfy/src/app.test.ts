@@ -1,12 +1,25 @@
 import { EventEmitter } from 'node:events';
-import { afterEach, describe, expect, it } from 'vitest';
-import { getFakeComfyConfig } from '@h3/config';
+import { readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   computeComfyCapabilityFingerprint,
   DeterministicFakeComfyService,
   HttpWsComfyClient,
 } from '@h3/comfy-client';
+import { getFakeComfyConfig } from '@h3/config';
+import { afterEach, describe, expect, it } from 'vitest';
 import { buildFakeComfyApp } from './app.js';
+
+const shippedApiGraph = JSON.parse(
+  readFileSync(
+    resolve(
+      dirname(fileURLToPath(import.meta.url)),
+      '../../../workflows/minimax-h3/api.json',
+    ),
+    'utf8',
+  ),
+) as Record<string, unknown>;
 
 describe('fake ComfyUI shell', () => {
   let app: ReturnType<typeof buildFakeComfyApp> | undefined;
@@ -16,6 +29,54 @@ describe('fake ComfyUI shell', () => {
       await app.close();
       app = undefined;
     }
+  });
+
+  // The graph this repository ships must satisfy the pinned executor contract.
+  // It did not: `UNETLoader.weight_dtype` was missing, the offline suite stayed
+  // green, and the real ComfyUI rejected it with 400 on the first rented GPU.
+  it('accepts the shipped minimax-h3 api graph', async () => {
+    app = buildFakeComfyApp({
+      config: getFakeComfyConfig({ NODE_ENV: 'test' }),
+    });
+
+    const submitted = await app.inject({
+      method: 'POST',
+      url: '/prompt',
+      headers: { 'content-type': 'application/json' },
+      payload: { prompt: shippedApiGraph },
+    });
+
+    expect(submitted.json().node_errors).toEqual({});
+    expect(submitted.statusCode).toBe(200);
+
+    // …and the same graph with one required input removed must be rejected the
+    // way the real executor rejected it, or this guard proves nothing.
+    const { weight_dtype: _omitted, ...withoutWeightDtype } = (
+      shippedApiGraph['127'] as { inputs: Record<string, unknown> }
+    ).inputs;
+    const rejected = await app.inject({
+      method: 'POST',
+      url: '/prompt',
+      headers: { 'content-type': 'application/json' },
+      payload: {
+        prompt: {
+          ...shippedApiGraph,
+          '127': { class_type: 'UNETLoader', inputs: withoutWeightDtype },
+        },
+      },
+    });
+
+    expect(rejected.statusCode).toBe(400);
+    expect(rejected.json().node_errors['127']).toMatchObject({
+      class_type: 'UNETLoader',
+      errors: [
+        {
+          type: 'required_input_missing',
+          details: 'weight_dtype',
+          extra_info: { input_name: 'weight_dtype' },
+        },
+      ],
+    });
   });
 
   it('returns stable health, readiness, and H3 object information', async () => {
