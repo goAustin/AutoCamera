@@ -4,10 +4,14 @@ This file records where every published capture came from, what it does and does
 not demonstrate, and how it was reviewed for secrets. It exists so that no image
 in this repository has to be taken on trust.
 
-Current evidence level: **Offline fake**. Every capture below was produced by
-the deterministic fake executor under `COMFY_MODE=fake`. No GPU, model weights,
-or real H3 inference is involved in any of them, and none may be read as
-evidence of H3 output quality, throughput, or cost.
+Current evidence level: **One real generation, through the managed run path.**
+That single artifact is recorded under "Real H3 inference record" below, and is
+deliberately not published here.
+
+Every capture published in this repository is **Offline fake**: produced by the
+deterministic fake executor under `COMFY_MODE=fake`. No GPU, model weights, or
+real H3 inference is involved in any of them, and none may be read as evidence
+of H3 output quality, throughput, or cost.
 
 The named deterministic project alias is `demo-project`. No capture contains a
 bearer token, a private executor credential, or a model path.
@@ -95,6 +99,36 @@ Recorded gate values: `storageHasCredential: false`,
 The pinned frontend ref is
 `3697a1bc3ba7f6b98a1ead888721f7676b536eb5`.
 
+## Real H3 inference record
+
+One real generation exists. It ran on 2026-09-13 on a rented RTX 5090, through
+the managed run path, and it is the only artifact in this project's history that
+is not fake output.
+
+| Field | Value |
+|---|---|
+| Date | 2026-09-13 |
+| Path | One managed `POST /v1/runs` against a budgeted project, driven by the durable worker |
+| Executor | Pinned ComfyUI backend `8a33128f…`, reporting ComfyUI 0.34.0; `/object_info` 902 classes, 13/13 required H3 classes present |
+| Host runtime | RTX 5090, `torch 2.14.0+cu130`, CUDA compute capability (12, 0) |
+| Control plane | Same host: PostgreSQL 16.15, Node 24.21.0, pnpm 9.15.0, migrations applied |
+| Models | Five files, all sha256-verified against the publisher's checksums |
+| Submitted parameters | `seed: 42`, `steps: 20`, `requestedWidth: 960`, `requestedHeight: 544`, `requestedDurationSeconds: 5`, `workflowHash: 65dbfb9c…` |
+| Media evaluation | Passed — h264 960x544, 124 frames, 24 fps, 5.17 s, AAC 32 kHz stereo: the pinned profile default exactly |
+| Budget | `budgetMicrousd` 3000000, `spentMicrousd` 0 → 100000 |
+| Outcome | `validation: validated`, attempt `accepted`, artifact stored |
+| Secret review | No private hostname, executor credential, or model path appears in this record |
+
+**The clip itself is not published in this repository.** It sits with the rest of
+that session's raw capture in the ignored `deliverables/` tree, beside the
+working notes in the ignored `docs/` tree. Both are development material and are
+deliberately kept out of what is pushed; this table, `STATUS.md`, and
+`CHANGELOG.md` are the published record of the run.
+
+What it does not establish: it is one clip, on a host that no longer exists.
+Nothing here provisions a GPU on demand, no weights are bundled, and a single
+run is not a quality, latency, throughput, or cost benchmark.
+
 ## Optional observability evidence
 
 The dashboard is provisioned as `h3-videoops-phase6` in Grafana. It is not
@@ -121,6 +155,7 @@ ComfyUI or H3 inference.
 | OTel Collector, Tempo, Prometheus, Grafana | `infra/observability/pin-manifest.json` |
 
 The optional live contract command is
-`COMFY_LIVE_TEST=1 COMFY_MODE=remote pnpm test:comfy-live`. In this environment
-it is recorded as **SKIP** because no configured pinned remote executor exists.
-No real H3 clip was generated.
+`COMFY_LIVE_TEST=1 COMFY_MODE=remote pnpm test:comfy-live`. It **passed** on
+2026-09-13, on its first ever run, against the pinned remote executor recorded
+above. In a checkout with no remote executor configured — the normal case, CI
+included — it is recorded as **SKIP**, never as a pass.

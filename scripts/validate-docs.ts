@@ -69,7 +69,7 @@ for (const phrase of [
 for (const phrase of [
   'Mandatory offline fake walkthrough',
   'Optional live ComfyUI contract walkthrough',
-  'Generate managed',
+  'Managed Run',
   'retryable failure',
   'trace',
   'evidence level',

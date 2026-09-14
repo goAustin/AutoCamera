@@ -34,14 +34,27 @@ The durable control plane, the ComfyUI-first shell, and the offline execution
 loop are implemented and tested. The run view is at
 `assets/screenshots/01-run-history.png` and the rest of the captured set.
 
-**No real MiniMax H3 clip has been generated.** Remote executor compatibility
-and a real GPU smoke run are deferred to **Phase 8** and are not exercised in
-this environment. All current captures are `Offline fake` — produced by the
-deterministic fake executor, not by a GPU. They demonstrate orchestration,
-revisions, retries, evaluation, review, and browser flow. They are not H3
-inference evidence, and fake output is not a quality or throughput benchmark.
+**One real MiniMax H3 clip has been generated, through the managed run path.**
+On 2026-09-13 a pinned remote executor on a rented RTX 5090 accepted the graph
+this repository ships: submitted through a single `POST /v1/runs` against a
+budgeted project, driven by the durable worker, evaluated, and stored as an
+accepted attempt — h264 960x544, 124 frames, 24 fps, 5.17 s, AAC 32 kHz stereo,
+which is the pinned profile default exactly. That host no longer exists and
+nothing here provisions a GPU on demand, so it is a record of one run, not
+something a clone of this repository reproduces.
 
-Capture commands, provenance, and secret review for every image are recorded in
+**Phase 8 is not complete.** Its gate is every row of the step 2 table, and the
+browser-bridge row — whether a real ComfyUI's pip-served pinned frontend behaves
+like the build the browser suite exercises — has not been performed.
+
+Every capture published here is `Offline fake` — produced by the deterministic
+fake executor, not by a GPU. They demonstrate orchestration, revisions, retries,
+evaluation, review, and browser flow. They are not H3 inference evidence, and
+fake output is not a quality or throughput benchmark.
+
+The current evidence level, the verification record, and what remains open are
+in [`STATUS.md`](STATUS.md). Capture commands, provenance, and secret review for
+every image — and the full record of that one real run — are in
 [`EVIDENCE-MANIFEST.md`](EVIDENCE-MANIFEST.md).
 
 ## Quick start
@@ -244,8 +257,9 @@ certification or a public-production readiness claim.
 
 Known limitations are intentionally explicit:
 
-- Remote ComfyUI compatibility is not exercised in this environment, and no real
-  H3 clip has been generated.
+- Real inference is not repeatable from here. Remote ComfyUI compatibility and
+  one real H3 clip were exercised once, on a rented host that no longer exists;
+  nothing in this repository provisions a GPU on demand.
 - No H3 weights are bundled.
 - Production billing, autoscaling, multitenancy, SLOs, and Kubernetes are not
   implemented.
@@ -258,5 +272,5 @@ Known limitations are intentionally explicit:
 
 Dependency attribution, license status, and migration notes are in
 [`DEPENDENCIES.md`](DEPENDENCIES.md) and [`CHANGELOG.md`](CHANGELOG.md). No
-project license has been selected yet; the repository remains private pending
-that owner decision.
+project license has been selected yet, so this repository being readable grants
+no use, modification, or redistribution rights.
