@@ -62,7 +62,7 @@ function shotWithStatus(status: ShotStatus): Shot {
   const shot: Shot = {
     id: id(5),
     projectId: id(6),
-    storyboardProposalId: id(7),
+    implicit: true,
     ordinal: 1,
     purpose: 'Purpose',
     prompt: 'Prompt',

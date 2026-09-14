@@ -185,8 +185,6 @@ export interface ShotDefinition {
 export interface Shot {
   readonly id: Uuid;
   readonly projectId: Uuid;
-  /** Absent only for an implicit graph-first run shot. */
-  readonly storyboardProposalId?: Uuid;
   readonly ordinal: ShotOrdinal;
   readonly purpose: string;
   readonly prompt: string;
@@ -747,12 +745,13 @@ function assertShot(shot: Shot): void {
   parseShotStatus(shot.status);
   assertUuid(shot.id);
   assertUuid(shot.projectId);
-  if (shot.storyboardProposalId !== undefined) {
-    assertUuid(shot.storyboardProposalId);
-  } else if (shot.implicit !== true) {
+  // Phase 7D removed storyboard proposals, and migration 0009 converted every
+  // surviving row. A shot exists only because a run was submitted, so implicit
+  // is now an invariant rather than a discriminator.
+  if (shot.implicit !== true) {
     throw new DomainError(
       'INVALID_SHOT',
-      'A non-implicit shot must identify its storyboard proposal.',
+      'Every shot is created implicitly by a run submission.',
     );
   }
   if (shot.implicit !== undefined && typeof shot.implicit !== 'boolean') {
@@ -1141,7 +1140,6 @@ export function createVideoProject(input: CreateProjectInput): VideoProject {
 export interface CreateShotInput {
   readonly id: Uuid;
   readonly projectId: Uuid;
-  readonly storyboardProposalId?: Uuid;
   readonly implicit?: boolean;
   readonly definition: ShotDefinition;
   readonly now: IsoUtcTimestamp;
@@ -1151,9 +1149,6 @@ export function createShot(input: CreateShotInput): Shot {
   const shot: Shot = {
     id: input.id,
     projectId: input.projectId,
-    ...(input.storyboardProposalId
-      ? { storyboardProposalId: input.storyboardProposalId }
-      : {}),
     ordinal: input.definition.ordinal,
     purpose: input.definition.purpose,
     prompt: input.definition.prompt,

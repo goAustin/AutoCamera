@@ -146,7 +146,6 @@ describe('Phase 7A thin-core runs', () => {
       implicit: true,
       status: 'queued',
     });
-    expect(persisted.shots[0]).not.toHaveProperty('storyboardProposalId');
     expect(persisted.revisions).toHaveLength(1);
   });
 

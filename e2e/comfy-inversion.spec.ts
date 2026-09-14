@@ -153,10 +153,7 @@ test.describe('ComfyUI plugin inversion', () => {
     ).toBeVisible();
     await expect(panel.getByText('Template opened in ComfyUI')).toBeVisible();
     await expect(
-      panel.getByRole('link', { name: 'Start from a brief' }),
-    ).toBeVisible();
-    await expect(
-      panel.getByRole('link', { name: 'Start from a brief' }),
+      panel.getByRole('link', { name: 'Open the full run view' }),
     ).toBeVisible();
     await page.waitForFunction(() => {
       const candidate = (

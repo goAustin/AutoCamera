@@ -263,7 +263,7 @@ function TokenGate({
             : 'AUTHENTICATED PROJECT STUDIO'}
         </p>
         <h1 id="auth-title">
-          {embedded ? 'Connect this panel.' : 'Bring a brief to life.'}
+          {embedded ? 'Connect this panel.' : 'Connect this studio.'}
         </h1>
         <p className="lede">
           This local studio uses a development bearer token. It is held only in
@@ -1801,11 +1801,11 @@ function ManagedPanelPage({
           </p>
           <a
             className="button button--quiet"
-            href="/projects"
+            href="/"
             target="_blank"
             rel="noopener noreferrer"
           >
-            Start from a brief
+            Open the full run view
           </a>
         </section>
       )}

@@ -406,7 +406,6 @@ const shotJsonSchema = {
   properties: {
     id: { type: 'string', format: 'uuid' },
     projectId: { type: 'string', format: 'uuid' },
-    storyboardProposalId: { type: 'string', format: 'uuid' },
     ordinal: { type: 'integer', minimum: 1, maximum: 3 },
     purpose: { type: 'string' },
     prompt: { type: 'string' },
@@ -662,9 +661,6 @@ function shotResponse(shot: Shot): Record<string, unknown> {
     createdAt: shot.createdAt,
     updatedAt: shot.updatedAt,
   };
-  if (shot.storyboardProposalId) {
-    response.storyboardProposalId = shot.storyboardProposalId;
-  }
   for (const key of [
     'visualDescription',
     'cameraDirection',
@@ -1390,6 +1386,17 @@ async function executeIdempotent(
   const key = idempotencyKey(request, keyOverride);
   const hash = requestHash(operation, body);
   return service.withTransaction(async (repositories) => {
+    // `idempotency_records.tenant_id` has a foreign key to `tenants`, so the
+    // reservation below is the first write of any mutation and it cannot be
+    // the one that assumes the row exists. `startApi` seeds it at boot, but an
+    // app built with `buildApiApp` alone -- every integration test, and any
+    // embedder -- has no such prologue, so the first mutation against a fresh
+    // database used to fail the constraint rather than create the project.
+    await repositories.tenants.ensure(
+      service.tenantId,
+      'Development tenant',
+      toIsoUtc(service.clock.now()),
+    );
     const reservation = await repositories.idempotency.reserve(
       service.tenantId,
       key,
@@ -1451,6 +1458,11 @@ async function executeIdempotentDeferred(
   const key = idempotencyKey(request);
   const hash = requestHash(operation, body);
   const replay = await service.withTransaction(async (repositories) => {
+    await repositories.tenants.ensure(
+      service.tenantId,
+      'Development tenant',
+      toIsoUtc(service.clock.now()),
+    );
     const reservation = await repositories.idempotency.reserve(
       service.tenantId,
       key,
@@ -2202,11 +2214,14 @@ export function buildApiApp(options: ApiAppOptions = {}): FastifyInstance {
       info: {
         title: 'H3 VideoOps API',
         description:
-          'Phase 4 Pi planning, policy tools, and durable preview API.',
-        version: '0.4.0',
+          'Graph-first durable runs, artifact review, and bounded operator tools.',
+        version: '0.1.0',
       },
       tags: [
-        { name: 'projects', description: 'Project and storyboard operations' },
+        {
+          name: 'projects',
+          description: 'Project, budget, and cost operations',
+        },
         {
           name: 'generation',
           description: 'Preview attempts and human review',
@@ -2458,13 +2473,6 @@ export function buildApiApp(options: ApiAppOptions = {}): FastifyInstance {
         let budgetDenialScope:
           | { readonly projectId: Uuid; readonly shotId: Uuid }
           | undefined;
-        await service.withTransaction((repositories) =>
-          repositories.tenants.ensure(
-            service.tenantId,
-            'Development tenant',
-            toIsoUtc(clock.now()),
-          ),
-        );
         let response: IdempotentResponse;
         try {
           response = await executeIdempotent(

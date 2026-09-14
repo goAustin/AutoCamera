@@ -206,6 +206,12 @@ export class ProjectApplicationService {
     return shot;
   }
 
+  // `planning` and `awaiting_storyboard_approval` are not reachable any more --
+  // nothing writes them since Phase 7D removed the planner. They stay here, in
+  // the domain status union, and in the telemetry label allowlist because the
+  // `video_projects_status_check` constraint still permits them and a database
+  // seeded before 7D can still hold a row in one. Promoting such a project is
+  // the point of this method; dropping the cases would strand it.
   async prepareDirectRunProjectInTransaction(
     repositories: Repositories,
     projectId: Uuid,
