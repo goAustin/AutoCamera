@@ -91,6 +91,7 @@ recorded in [`EVIDENCE-MANIFEST.md`](EVIDENCE-MANIFEST.md).
 | Live ComfyUI contract | PASS — against the pinned remote executor on a rented RTX 5090, 2026-09-13 |
 | Real H3 GPU smoke | PASS — accepted attempt at profile defaults through `POST /v1/runs` |
 | Phase 8 gate row 2.11 | NOT RUN — browser bridge checks split into a separate pass |
+| GitHub Actions CI | PASS — every step on `d1855b4`, including the browser suite |
 
 ## Known issues
 

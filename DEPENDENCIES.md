@@ -65,9 +65,27 @@ not remove PostgreSQL or artifact data.
 
 ## License status
 
-The H3 VideoOps project itself is private and has **no project license selected
-yet**. This is a documented owner decision for a future public distribution,
-not an implicit grant of rights. No third-party source or model weights are
-relicensed by this repository. The next release that makes the project public
-must select a project license and include the required upstream notices before
-publishing.
+The H3 VideoOps project itself is **MIT licensed** ([`LICENSE`](LICENSE)). That
+covers the code in this repository and nothing else: no third-party source or
+model weights are relicensed by it.
+
+MIT is chosen against a GPL-3.0 neighbour deliberately. Both the ComfyUI backend
+and its frontend are GPL-3.0, and neither is vendored here — the pins above name
+external repositories, and `scripts/fetch-comfy-frontend.sh` fetches into the
+ignored `.data/` tree at build time. Copyleft attaches on distributing the
+covered work or a derivative of it, and this repository distributes neither: the
+control plane reaches ComfyUI over HTTP and WebSocket, and the bridge under
+`integrations/comfyui-videoops` ships no ComfyUI code, imports no ComfyUI Python
+module, and registers no execution nodes. Installing that bridge into a GPL-3.0
+ComfyUI remains the installer's own combination, which MIT terms do not obstruct.
+
+Copying ComfyUI source into the bridge, or shipping a fork of the frontend,
+would change this: that directory would then be a derivative work and would have
+to carry GPL-3.0.
+
+**Open item.** `workflows/minimax-h3/api.json` and `editor.json` derive from the
+official `Comfy-Org/workflow_templates` H3 template, and the fetch script pulls
+only `templates/`, so no upstream licence file accompanies them here. Their terms
+are unverified, which now also reaches the offline fixture that compiles from
+`api.json`. Resolve it against that repository's own licence before relying on
+those two files being MIT.

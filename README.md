@@ -271,6 +271,6 @@ Known limitations are intentionally explicit:
   surfaces instead.
 
 Dependency attribution, license status, and migration notes are in
-[`DEPENDENCIES.md`](DEPENDENCIES.md) and [`CHANGELOG.md`](CHANGELOG.md). No
-project license has been selected yet, so this repository being readable grants
-no use, modification, or redistribution rights.
+[`DEPENDENCIES.md`](DEPENDENCIES.md) and [`CHANGELOG.md`](CHANGELOG.md). This
+project is MIT licensed ([`LICENSE`](LICENSE)); ComfyUI, which it drives, is
+GPL-3.0 and is not vendored or redistributed here.
