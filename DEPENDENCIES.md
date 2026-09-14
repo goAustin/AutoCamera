@@ -41,7 +41,7 @@ checks use the existing package manager and repository scripts.
 |---|---|---|
 | ComfyUI backend (`Comfy-Org/ComfyUI`) | `8a33128f2f8c5585c57486c07de481241e70a39c` | Separate backend checkout; live contract only |
 | ComfyUI frontend (`Comfy-Org/ComfyUI_frontend`) | `3697a1bc3ba7f6b98a1ead888721f7676b536eb5` | Separate frontend checkout; editor only |
-| `Comfy-Org/workflow_templates` | `d3b4a9e89573162b005961865164c18c8ae2206b` | Official H3 T2V template source |
+| `Comfy-Org/workflow_templates` | `d3b4a9e89573162b005961865164c18c8ae2206b` | Official H3 T2V template source; **MIT**, retain its notice with `workflows/minimax-h3/` |
 | `MiniMax-AI/MiniMax-H3` | `d21241f0a4b3acbb34c97dae47fa417b7065e438` | Inference source; no code or weights bundled |
 
 The profile's model filenames are recorded in
@@ -83,9 +83,11 @@ Copying ComfyUI source into the bridge, or shipping a fork of the frontend,
 would change this: that directory would then be a derivative work and would have
 to carry GPL-3.0.
 
-**Open item.** `workflows/minimax-h3/api.json` and `editor.json` derive from the
-official `Comfy-Org/workflow_templates` H3 template, and the fetch script pulls
-only `templates/`, so no upstream licence file accompanies them here. Their terms
-are unverified, which now also reaches the offline fixture that compiles from
-`api.json`. Resolve it against that repository's own licence before relying on
-those two files being MIT.
+`workflows/minimax-h3/api.json` and `editor.json` derive from the official
+`Comfy-Org/workflow_templates` H3 template, which is **MIT** — verified
+2026-09-14 against that repository, not assumed from ComfyUI's own GPL-3.0.
+Comfy-Org licenses the two separately: the engine is copyleft, the templates
+meant to be reused are not. Those two files therefore carry compatible terms,
+and so does the offline fixture that compiles from `api.json`. MIT is not
+attribution-free: retain Comfy-Org's copyright and permission notice alongside
+them in any redistribution that includes a substantial portion of the template.
