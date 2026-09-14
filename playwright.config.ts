@@ -56,7 +56,15 @@ const commonEnvironment = {
   API_PORT: String(apiPort),
   WEB_ORIGIN: webOrigin,
   VIDEOOPS_STUDIO_ORIGIN: webOrigin,
-  FAKE_COMFY_HOST: '127.0.0.1',
+  // Not 127.0.0.1, and it matters. The gateway webServer above runs Caddy in a
+  // container and proxies to this process through `host.docker.internal`. On
+  // Docker Desktop that name reaches a loopback-bound host socket; on Linux --
+  // every CI run -- `host-gateway` resolves to the bridge address, and a
+  // loopback-bound socket refuses it. The whole browser suite then fails before
+  // its first test, on the gateway health check's 120s timeout, while passing
+  // on every developer machine. The API and web servers below stay on loopback
+  // because nothing outside this host has to reach them; this one does.
+  FAKE_COMFY_HOST: '0.0.0.0',
   FAKE_COMFY_PORT: String(fakeComfyPort),
   WEB_HOST: '127.0.0.1',
   WEB_PORT: String(webPort),
