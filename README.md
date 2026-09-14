@@ -14,29 +14,101 @@ recommendations. MiniMax H3 owns inference only.
 
 ## Quick start
 
-Requirements: Node.js 24 LTS, Corepack with pnpm 9.15.0, a Compose-compatible
-runtime, and `ffmpeg`/`ffprobe`.
+Every command, from nothing to a running system. Nothing is skipped.
+
+### 1. Install the prerequisites (once per machine)
 
 ```sh
-corepack enable                  # once, on Node 24
+# macOS
+brew install ffmpeg
+brew install --cask docker            # then launch Docker Desktop once
+curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash
+nvm install 24 && nvm use 24
+```
+
+```sh
+# Ubuntu / Debian
+sudo apt-get update && sudo apt-get install -y ffmpeg docker.io docker-compose-v2
+curl -fsSL https://deb.nodesource.com/setup_24.x | sudo -E bash -
+sudo apt-get install -y nodejs
+```
+
+### 2. Clone and start
+
+```sh
+git clone https://github.com/goAustin/AutoCamera.git
+cd AutoCamera
+corepack enable
 pnpm install --frozen-lockfile
 pnpm dev
 ```
 
-That is the whole path from `git clone` to a running system, about ten seconds
-after the install. The launcher writes `.env` from `.env.example` if you have
-none, creates the media fixture, starts PostgreSQL, applies migrations, builds
-the workspace, and starts the API, worker, fake ComfyUI service, and Project
-Studio. No cloud account, paid provider, model download, or GPU is needed.
+`pnpm dev` writes `.env` from `.env.example`, starts PostgreSQL, applies
+migrations, builds, and starts the API, worker, fake ComfyUI, and Project
+Studio. Leave it running; it takes about ten seconds.
 
-Open the fake ComfyUI shell at `http://127.0.0.1:8188` for the ComfyUI-first
-flow and enter the development token from `.env` when the VideoOps panel asks.
-Project Studio is at `http://127.0.0.1:5173`; readiness is at
-`http://127.0.0.1:3000/health/ready`.
+### 3. Confirm it is up
 
-Only the prerequisites nothing works without — Node 24, a container runtime,
-`ffmpeg`/`ffprobe` — stop the launch. Everything else warns and the stack starts
-anyway. Run `pnpm prerequisites` for the strict audit.
+In a second terminal:
+
+```sh
+curl http://127.0.0.1:3000/health/ready
+# {"service":"api","status":"ok","dependencies":{"postgres":"ok"}}
+```
+
+Open **<http://127.0.0.1:5173>**, paste the token `dev-token`, and click
+**Enter Project Studio**. You should land on **Run history**. That is the whole
+system running, against the bundled simulator — no GPU, no account, no spend.
+
+### 4. Generate something
+
+```sh
+pnpm demo:seed       # creates the "[Demo] Product story control room" project
+```
+
+Submit the graph this repository ships, against that project:
+
+```sh
+PROJECT_ID=$(curl -sS http://127.0.0.1:3000/v1/projects \
+  -H "authorization: Bearer dev-token" \
+  | node -pe "JSON.parse(require('fs').readFileSync(0)).projects.find(p=>p.title.startsWith('[Demo]')).id")
+
+curl -sS -X POST http://127.0.0.1:3000/v1/runs \
+  -H "authorization: Bearer dev-token" \
+  -H 'content-type: application/json' \
+  -H "idempotency-key: first-run-$(date +%s)" \
+  -d "{\"projectId\":\"$PROJECT_ID\",
+       \"editorGraph\":$(cat workflows/minimax-h3/editor.json),
+       \"apiGraph\":$(cat workflows/minimax-h3/api.json)}"
+```
+
+Refresh Project Studio. The run appears in **Run history** and finishes in about
+a second: the worker claims it, the simulator returns the fixture clip, the
+artifact is stored and evaluated, and the attempt lands on **Awaiting Review**
+with evaluation **Passed**. Select it, play the clip, then click **Accept
+passing attempt**. That is the whole loop — submission, queue, execution,
+artifact, evaluation, human review.
+
+### 5. Use ComfyUI as the front door (optional)
+
+The fake shell at `:8188` serves the real pinned ComfyUI editor, which is not
+vendored here. Fetch and build it once — without this it answers `503`:
+
+```sh
+pnpm comfy:frontend
+```
+
+Open **<http://127.0.0.1:8188>**, load the H3 template, and use **Managed Run**.
+The VideoOps panel mounts in the sidebar; the native Queue button is disabled on
+purpose, because every run goes through the managed path.
+
+### Stopping and resetting
+
+```sh
+# Ctrl-C the pnpm dev terminal, then:
+pnpm infra:down                 # stop PostgreSQL
+pnpm demo:reset -- --force      # remove only the demo project and its artifacts
+```
 
 ### Choose an executor
 
@@ -63,41 +135,60 @@ Expect the first bring-up to be dominated by downloading the weights.
 ComfyUI is a separate checkout: it is not vendored here, and its model directory
 is never a client resource.
 
-1. **Clone ComfyUI at the pinned ref** from
-   [`infra/gpu-executor/pin-manifest.json`](infra/gpu-executor/pin-manifest.json)
-   (`8a33128f…`), create a virtualenv, and install its requirements with the
-   CUDA 13 index.
-2. **Place the five model files** under that checkout:
+Run these on whichever machine has the GPU — your own or a rented host.
 
-   ```text
-   models/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors
-   models/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors
-   models/vae/minimax_h3_video_vae_fp16.safetensors
-   models/vae/minimax_h3_audio_vae_fp32.safetensors
-   models/loras/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors
-   ```
+```sh
+# 1. ComfyUI at the pinned ref, with a CUDA 13 build of torch
+git clone https://github.com/Comfy-Org/ComfyUI.git ~/comfyui-h3
+cd ~/comfyui-h3
+git checkout 8a33128f2f8c5585c57486c07de481241e70a39c
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt \
+  --extra-index-url https://download.pytorch.org/whl/cu130
+```
 
-3. **Install the VideoOps bridge**: copy
-   [`integrations/comfyui-videoops`](integrations/comfyui-videoops) to
-   `ComfyUI/custom_nodes/comfyui-videoops`. It is frontend-only and registers no
-   execution nodes.
-4. **Start ComfyUI on loopback**: `--listen 127.0.0.1 --port 8188`.
-5. **Set the executor in `.env`**, then `pnpm dev` — it skips the fake service in
-   this mode:
+```sh
+# 2. The five model files (~44 GB, and the slow part)
+HF=https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main
+LORA=https://huggingface.co/lightx2v/Minimax-h3-Turbo/resolve/main
+mkdir -p models/{diffusion_models,text_encoders,vae,loras}
+curl -L -o models/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors \
+  $HF/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors
+curl -L -o models/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors \
+  $HF/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors
+curl -L -o models/vae/minimax_h3_video_vae_fp16.safetensors \
+  $HF/vae/minimax_h3_video_vae_fp16.safetensors
+curl -L -o models/vae/minimax_h3_audio_vae_fp32.safetensors \
+  $HF/vae/minimax_h3_audio_vae_fp32.safetensors
+curl -L -o models/loras/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors \
+  $LORA/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors
+```
 
-   ```dotenv
-   COMFY_MODE=remote
-   COMFY_BASE_URL=http://127.0.0.1:8188
-   COMFY_WS_URL=ws://127.0.0.1:8188/ws
-   COMFY_FRONTEND_URL=http://127.0.0.1:8188
-   ```
+```sh
+# 3. The VideoOps bridge (frontend-only, registers no execution nodes)
+cp -r ~/AutoCamera/integrations/comfyui-videoops ~/comfyui-h3/custom_nodes/
 
-6. **Confirm before submitting**: `GET /v1/executor` must report ready, and the
-   opt-in contract check should pass once per host:
+# 4. Start ComfyUI on loopback and leave it running
+.venv/bin/python main.py --listen 127.0.0.1 --port 8188
+```
 
-   ```sh
-   COMFY_LIVE_TEST=1 COMFY_MODE=remote pnpm test:comfy-live
-   ```
+```sh
+# 5. Point VideoOps at it, in a second terminal
+cd ~/AutoCamera
+cat >> .env <<'EOF'
+COMFY_MODE=remote
+COMFY_BASE_URL=http://127.0.0.1:8188
+COMFY_WS_URL=ws://127.0.0.1:8188/ws
+COMFY_FRONTEND_URL=http://127.0.0.1:8188
+EOF
+pnpm dev                                  # skips the fake service in this mode
+```
+
+```sh
+# 6. Confirm the executor before submitting anything
+curl http://127.0.0.1:3000/v1/executor -H "authorization: Bearer dev-token"
+COMFY_LIVE_TEST=1 COMFY_MODE=remote pnpm test:comfy-live
+```
 
 Then use it exactly as in fake mode: open ComfyUI, load the H3 graph, choose
 **Managed Run**.
@@ -114,27 +205,12 @@ runbook and covers what this section does not: the other topologies, the browser
 gateway that denies `POST /prompt` and queue mutation, keeping models on a
 volume that outlives the host, the cost breaker, and teardown.
 
-### Five-minute demo
+### A longer walkthrough
 
-With the local stack running, seed the deterministic project and follow
-[`DEMO-SCRIPT.md`](DEMO-SCRIPT.md):
-
-```sh
-pnpm demo:seed
-```
-
-The seed creates only the named `[Demo] Product story control room` draft; it
-does not pre-complete revisions, attempts, or review. It is idempotent. To
-remove only that named demo project and its artifact objects:
-
-```sh
-pnpm demo:reset -- --force
-```
-
-The reset prints its exact local database, development tenant, and artifact root
-before mutation, requires `--force`, rejects unsafe paths, and preserves
-unrelated projects and artifacts. It never touches model directories or a remote
-ComfyUI output directory.
+[`DEMO-SCRIPT.md`](DEMO-SCRIPT.md) is a talk track over the same stack: the
+retryable-failure and derived-retry paths, the operator findings and their
+confirmations, the cost and digest routes, and following one trace through
+Tempo.
 
 ## What it does
 

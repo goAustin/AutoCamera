@@ -1,4 +1,5 @@
 import { copyFileSync, existsSync, readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { spawn, type ChildProcess } from 'node:child_process';
 
 interface ManagedProcess {
@@ -81,6 +82,24 @@ function startManaged(label: string, args: readonly string[]): ManagedProcess {
 
 ensureLocalEnvironment();
 loadLocalEnvironment();
+
+// Both of these default to cwd-relative paths, and every child below runs with
+// its own package directory as cwd because `pnpm --filter` puts it there. The
+// fake executor's fixture lookup then misses and falls back -- silently, in a
+// `catch {}` -- to a 184-byte synthetic stub, so every managed run in `pnpm dev`
+// failed evaluation with MEDIA_INVALID_CONTAINER while the browser suite passed,
+// because playwright.config.ts has always pinned these absolutely. Artifacts
+// landed under `apps/api/.data/` for the same reason. `resolve` is a no-op on a
+// value that is already absolute, so an explicit setting still wins.
+const repositoryRoot = process.cwd();
+process.env.H3_MEDIA_FIXTURE_PATH = resolve(
+  repositoryRoot,
+  process.env.H3_MEDIA_FIXTURE_PATH ?? '.data/fixtures/h3-t2v-fixture.mp4',
+);
+process.env.ARTIFACT_ROOT = resolve(
+  repositoryRoot,
+  process.env.ARTIFACT_ROOT ?? '.data/artifacts',
+);
 
 try {
   const comfyMode = process.env.COMFY_MODE ?? 'fake';
