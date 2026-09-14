@@ -63,20 +63,28 @@ Requirements: Node.js 24 LTS, Corepack with pnpm 9.15.0, a Compose-compatible
 runtime, and `ffmpeg`/`ffprobe`.
 
 ```sh
-nvm install 24
-nvm use 24
-corepack enable
-corepack prepare pnpm@9.15.0 --activate
-cp .env.example .env
+corepack enable                  # once, on Node 24
 pnpm install --frozen-lockfile
-pnpm prerequisites
 pnpm dev
 ```
 
-The development launcher audits prerequisites, creates the synthetic media
-fixture, starts PostgreSQL, applies migrations, builds the workspace, and starts
-the API, worker, fake ComfyUI service, and Project Studio. No cloud account,
-paid provider, hosted LLM key, model download, or GPU is needed.
+That is the whole path from `git clone` to a running system — roughly ten
+seconds after the install, on a warm machine. Nothing needs to be configured
+first: the launcher writes `.env` from `.env.example` if you have none (an
+existing one is never touched), creates the synthetic media fixture, starts
+PostgreSQL, applies migrations, builds the workspace, and starts the API,
+worker, fake ComfyUI service, and Project Studio. No cloud account, paid
+provider, hosted LLM key, model download, or GPU is needed.
+
+The launcher's prerequisite audit is advisory: a missing Node 24, container
+runtime, or `ffmpeg`/`ffprobe` stops it, because nothing works without them, and
+everything else — a short disk, a port it believes is occupied — is printed as a
+warning and the stack starts anyway. Run the strict audit yourself when you want
+one before deploying, and it will refuse on any failure:
+
+```sh
+pnpm prerequisites
+```
 
 Project Studio is at `http://127.0.0.1:5173` and supplies the embedded panel.
 The fake ComfyUI graph shell is at `http://127.0.0.1:8188`; open it first for
@@ -177,6 +185,9 @@ API supports bounded byte-range responses for playback. Clients submit opaque
 resource IDs, never filesystem paths or object keys.
 
 ## Verification
+
+None of this is required to run the system — `pnpm dev` above needs none of it.
+These are the gates the project holds itself to, and CI runs them on every push:
 
 ```sh
 pnpm check                           # format, lint, strict TypeScript, unit tests, build

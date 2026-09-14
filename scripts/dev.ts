@@ -1,10 +1,27 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { copyFileSync, existsSync, readFileSync } from 'node:fs';
 import { spawn, type ChildProcess } from 'node:child_process';
 
 interface ManagedProcess {
   readonly label: string;
   readonly child: ChildProcess;
   readonly exited: Promise<number>;
+}
+
+/**
+ * A clone has no `.env`, and without one the first thing a newcomer sees is
+ * `Invalid or missing environment variables: DEV_AUTH_TOKEN` from a service
+ * that has already started booting. The example file is the answer every time
+ * -- it is a complete local configuration, not a template with blanks -- so
+ * copy it rather than asking someone to. An existing `.env` is never touched.
+ */
+function ensureLocalEnvironment(): void {
+  const envPath = `${process.cwd()}/.env`;
+  const examplePath = `${process.cwd()}/.env.example`;
+  if (existsSync(envPath) || !existsSync(examplePath)) {
+    return;
+  }
+  copyFileSync(examplePath, envPath);
+  console.log('Created .env from .env.example (local development defaults).');
 }
 
 function loadLocalEnvironment(): void {
@@ -62,6 +79,7 @@ function startManaged(label: string, args: readonly string[]): ManagedProcess {
   return { label, child, exited };
 }
 
+ensureLocalEnvironment();
 loadLocalEnvironment();
 
 try {
@@ -70,6 +88,10 @@ try {
     throw new Error('COMFY_MODE must be either fake or remote.');
   }
 
+  // Advisory: a blocking prerequisite still stops the launch, but a warning --
+  // a short disk, a port this checker thinks is occupied -- does not. Run
+  // `pnpm prerequisites` directly for the strict audit before a deployment.
+  process.env.H3_PREREQUISITES_MODE ??= 'advisory';
   await run('pnpm', ['prerequisites']);
   await run('pnpm', ['media:fixture']);
   await run('pnpm', ['infra:up']);

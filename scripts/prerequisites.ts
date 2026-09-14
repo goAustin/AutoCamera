@@ -6,11 +6,22 @@ const REQUIRED_NODE_MAJOR = 24;
 const PINNED_PNPM_VERSION = '9.15.0';
 const MINIMUM_FREE_BYTES = 10 * 1024 ** 3;
 
+/**
+ * `blocking` means the stack cannot start, or starts and is silently broken,
+ * without it. `advisory` means it is worth knowing and is not a reason to
+ * refuse to launch: a short disk fills up slowly and says so, and a port this
+ * audit calls occupied is most often the previous run of this same stack --
+ * where the server's own EADDRINUSE is a better message than a pre-emptive
+ * refusal from a checker that cannot see whose process it is.
+ */
+type Severity = 'blocking' | 'advisory';
+
 interface CheckResult {
   readonly name: string;
   readonly ok: boolean;
   readonly detail: string;
   readonly action: string;
+  readonly severity: Severity;
 }
 
 interface CommandResult {
@@ -114,6 +125,7 @@ function inspectCompose(): CheckResult {
         ok: true,
         detail: `Docker Compose ${dockerCompose.version}`,
         action: '',
+        severity: 'blocking',
       };
     }
   }
@@ -125,6 +137,7 @@ function inspectCompose(): CheckResult {
       ok: true,
       detail: `Podman Compose ${podmanCompose.version}`,
       action: '',
+      severity: 'blocking',
     };
   }
 
@@ -134,12 +147,14 @@ function inspectCompose(): CheckResult {
     detail:
       'Docker Compose, Podman Compose, and an active container runtime were not detected',
     action: 'Install/start Docker Desktop: brew install --cask docker',
+    severity: 'blocking',
   };
 }
 
 async function audit(): Promise<CheckResult[]> {
   const nodeMajor = Number(process.versions.node.split('.')[0]);
   const nodeCheck: CheckResult = {
+    severity: 'blocking',
     name: 'Node.js 24 LTS',
     ok: nodeMajor === REQUIRED_NODE_MAJOR,
     detail: `found Node.js ${process.versions.node}`,
@@ -148,6 +163,7 @@ async function audit(): Promise<CheckResult[]> {
 
   const corepack = runVersionCommand('corepack', ['--version']);
   const corepackCheck: CheckResult = {
+    severity: 'advisory',
     name: 'Corepack',
     ok: corepack.ok,
     detail: corepack.ok
@@ -158,6 +174,7 @@ async function audit(): Promise<CheckResult[]> {
 
   const pnpm = runVersionCommand('pnpm', ['--version']);
   const pnpmCheck: CheckResult = {
+    severity: 'advisory',
     name: `pnpm ${PINNED_PNPM_VERSION}`,
     ok: pnpm.ok && pnpm.version === PINNED_PNPM_VERSION,
     detail: pnpm.ok ? `found pnpm ${pnpm.version}` : 'pnpm was not detected',
@@ -166,6 +183,7 @@ async function audit(): Promise<CheckResult[]> {
 
   const ffmpeg = runVersionCommand('ffmpeg', ['-version']);
   const ffmpegCheck: CheckResult = {
+    severity: 'blocking',
     name: 'ffmpeg',
     ok: ffmpeg.ok,
     detail: ffmpeg.ok ? `found ${ffmpeg.version}` : 'ffmpeg was not detected',
@@ -174,6 +192,7 @@ async function audit(): Promise<CheckResult[]> {
 
   const ffprobe = runVersionCommand('ffprobe', ['-version']);
   const ffprobeCheck: CheckResult = {
+    severity: 'blocking',
     name: 'ffprobe',
     ok: ffprobe.ok,
     detail: ffprobe.ok
@@ -185,6 +204,7 @@ async function audit(): Promise<CheckResult[]> {
   const filesystem = statfsSync(process.cwd());
   const availableBytes = Number(filesystem.bavail) * Number(filesystem.bsize);
   const diskCheck: CheckResult = {
+    severity: 'advisory',
     name: 'Free disk space',
     ok: availableBytes >= MINIMUM_FREE_BYTES,
     detail: `${(availableBytes / 1024 ** 3).toFixed(1)} GiB available`,
@@ -223,6 +243,7 @@ async function audit(): Promise<CheckResult[]> {
           state === 'postgres'
             ? 'Keep the existing PostgreSQL service or tunnel and skip starting a second one'
             : 'Stop the process using this port or set a different local port',
+        severity: 'advisory',
       } satisfies CheckResult;
     }),
   );
@@ -239,22 +260,43 @@ async function audit(): Promise<CheckResult[]> {
   ];
 }
 
+// Two modes, one list of checks. Run directly -- `pnpm prerequisites` -- this
+// is the thorough audit to run once before deploying, and every failure is a
+// failure. Run from `pnpm dev` (which sets the environment variable below),
+// only a blocking failure stops the launch; the rest are printed and the stack
+// comes up anyway. A newcomer who cloned the repository should not be refused a
+// running system because a checker noticed 9.2 GiB free instead of 10.
+const advisoryMode =
+  process.argv.includes('--advisory') ||
+  process.env.H3_PREREQUISITES_MODE === 'advisory';
+
 const checks = await audit();
 console.log('H3 VideoOps prerequisite audit');
 
 for (const check of checks) {
-  console.log(`${check.ok ? 'PASS' : 'FAIL'} ${check.name}: ${check.detail}`);
+  const label = check.ok
+    ? 'PASS'
+    : advisoryMode && check.severity === 'advisory'
+      ? 'WARN'
+      : 'FAIL';
+  console.log(`${label} ${check.name}: ${check.detail}`);
   if (!check.ok) {
     console.log(`      Action: ${check.action}`);
   }
 }
 
 const failures = checks.filter((check) => !check.ok);
-if (failures.length > 0) {
-  console.log(
-    `Result: BLOCKED — ${failures.length} prerequisite check(s) failed.`,
-  );
+const blocking = advisoryMode
+  ? failures.filter((check) => check.severity === 'blocking')
+  : failures;
+
+if (blocking.length > 0) {
+  console.log(`Result: BLOCKED — ${blocking.length} prerequisite(s) missing.`);
   process.exitCode = 1;
+} else if (failures.length > 0) {
+  console.log(
+    `Result: READY with ${failures.length} warning(s) — nothing that stops the stack starting.`,
+  );
 } else {
   console.log('Result: READY — all local prerequisites are available.');
 }
