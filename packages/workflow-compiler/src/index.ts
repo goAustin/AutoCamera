@@ -93,73 +93,236 @@ export class WorkflowCompileError extends Error {
   }
 }
 
+/**
+ * The graph this project ships, verbatim: `workflows/minimax-h3/api.json`, the
+ * one a pinned remote ComfyUI accepted on 2026-09-13. It is duplicated here
+ * rather than read at import time so this module stays a pure constant, and
+ * `index.test.ts` asserts the two are identical -- the same bargain
+ * `packages/comfy-client` makes with the pinned capability fingerprint: one
+ * visible decision when the pin moves, instead of two copies drifting.
+ *
+ * The four-node stand-in this replaced (CLIPTextEncode, EmptyHunyuanLatentVideo,
+ * KSampler, SaveVideo, with most required inputs simply absent) predated the
+ * fake executor enforcing `input.required` from the pinned catalogue. Once it
+ * did, the offline path submitted a graph the real executor would reject, and
+ * every non-managed attempt failed COMFY_UNAVAILABLE.
+ */
 export const FIXTURE_WORKFLOW: FixtureWorkflow = {
-  '1': {
-    class_type: 'CLIPTextEncode',
-    inputs: { text: 'fixture prompt' },
-  },
-  '2': {
-    class_type: 'EmptyHunyuanLatentVideo',
+  '92': {
+    class_type: 'SaveVideo',
     inputs: {
-      width: MVP_PREVIEW_WIDTH,
-      height: MVP_PREVIEW_HEIGHT,
-      length: MVP_PREVIEW_FPS * 5,
+      video: ['130', 0],
+      filename_prefix: 'video/MiniMax_H3',
+      format: 'auto',
+      codec: 'auto',
+    },
+    _meta: {
+      title: 'SaveVideo',
     },
   },
-  '3': {
-    class_type: 'KSampler',
-    inputs: { seed: 1, steps: 8 },
+  '119': {
+    class_type: 'VAELoader',
+    inputs: {
+      vae_name: 'minimax_h3_video_vae_fp16.safetensors',
+    },
+    _meta: {
+      title: 'VAELoader',
+    },
   },
-  '4': {
-    class_type: 'SaveVideo',
-    inputs: { filename_prefix: 'h3-t2v-fixture' },
+  '120': {
+    class_type: 'VAELoader',
+    inputs: {
+      vae_name: 'minimax_h3_audio_vae_fp32.safetensors',
+    },
+    _meta: {
+      title: 'VAELoader',
+    },
+  },
+  '121': {
+    class_type: 'VAEDecodeAudio',
+    inputs: {
+      samples: ['125', 0],
+      vae: ['120', 0],
+    },
+    _meta: {
+      title: 'VAEDecodeAudio',
+    },
+  },
+  '122': {
+    class_type: 'VAEDecode',
+    inputs: {
+      samples: ['125', 0],
+      vae: ['119', 0],
+    },
+    _meta: {
+      title: 'VAEDecode',
+    },
+  },
+  '123': {
+    class_type: 'KSamplerSelect',
+    inputs: {
+      sampler_name: 'res_multistep',
+    },
+    _meta: {
+      title: 'KSamplerSelect',
+    },
+  },
+  '124': {
+    class_type: 'BasicScheduler',
+    inputs: {
+      model: ['127', 0],
+      steps: 20,
+      scheduler: 'simple',
+      denoise: 1,
+    },
+    _meta: {
+      title: 'BasicScheduler',
+    },
+  },
+  '125': {
+    class_type: 'SamplerCustomAdvanced',
+    inputs: {
+      noise: ['129', 0],
+      guider: ['126', 0],
+      sampler: ['123', 0],
+      sigmas: ['124', 0],
+      latent_image: ['131', 1],
+    },
+    _meta: {
+      title: 'SamplerCustomAdvanced',
+    },
+  },
+  '126': {
+    class_type: 'BasicGuider',
+    inputs: {
+      model: ['127', 0],
+      conditioning: ['131', 0],
+    },
+    _meta: {
+      title: 'BasicGuider',
+    },
+  },
+  '127': {
+    class_type: 'UNETLoader',
+    inputs: {
+      unet_name: 'minimax_h3_fl2va_pruned_int8_convrot.safetensors',
+      weight_dtype: 'default',
+    },
+    _meta: {
+      title: 'UNETLoader',
+    },
+  },
+  '128': {
+    class_type: 'CLIPLoader',
+    inputs: {
+      clip_name: 'qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors',
+      type: 'minimax',
+      device: 'default',
+    },
+    _meta: {
+      title: 'CLIPLoader',
+    },
+  },
+  '129': {
+    class_type: 'RandomNoise',
+    inputs: {
+      noise_seed: 42,
+    },
+    _meta: {
+      title: 'RandomNoise',
+    },
+  },
+  '130': {
+    class_type: 'CreateVideo',
+    inputs: {
+      images: ['122', 0],
+      audio: ['121', 0],
+      fps: 24,
+      bit_depth: 8,
+    },
+    _meta: {
+      title: 'CreateVideo',
+    },
+  },
+  '131': {
+    class_type: 'MiniMaxH3ImageToVideo',
+    inputs: {
+      clip: ['128', 0],
+      vae: ['119', 0],
+      prompt:
+        'A polished product moves through a cool blue studio with natural stereo sound, smooth camera motion, and a confident premium finish.',
+      width: 960,
+      height: 544,
+      length: 124,
+    },
+    _meta: {
+      title: 'MiniMaxH3ImageToVideo',
+    },
   },
 };
 
+/**
+ * Bindings address the shipped graph's own nodes: generation parameters live on
+ * `MiniMaxH3ImageToVideo` (131), the seed on `RandomNoise` (129), and step count
+ * on `BasicScheduler` (124). `requiredNodes` names those three plus the output
+ * node, which is what `validateManifest` refuses to compile without.
+ */
 export const FIXTURE_MANIFEST: WorkflowManifest = {
   family: 'h3-t2v-fixture',
-  version: 'h3-t2v-fixture-v1',
+  version: 'h3-t2v-fixture-v2',
   requiredNodes: [
-    { nodeId: '1', classType: 'CLIPTextEncode' },
-    { nodeId: '2', classType: 'EmptyHunyuanLatentVideo' },
-    { nodeId: '3', classType: 'KSampler' },
-    { nodeId: '4', classType: 'SaveVideo' },
+    {
+      nodeId: '124',
+      classType: 'BasicScheduler',
+    },
+    {
+      nodeId: '129',
+      classType: 'RandomNoise',
+    },
+    {
+      nodeId: '131',
+      classType: 'MiniMaxH3ImageToVideo',
+    },
+    {
+      nodeId: '92',
+      classType: 'SaveVideo',
+    },
   ],
   bindings: [
     {
       name: 'prompt',
-      nodeId: '1',
-      classType: 'CLIPTextEncode',
-      path: ['inputs', 'text'],
+      nodeId: '131',
+      classType: 'MiniMaxH3ImageToVideo',
+      path: ['inputs', 'prompt'],
     },
     {
       name: 'width',
-      nodeId: '2',
-      classType: 'EmptyHunyuanLatentVideo',
+      nodeId: '131',
+      classType: 'MiniMaxH3ImageToVideo',
       path: ['inputs', 'width'],
     },
     {
       name: 'height',
-      nodeId: '2',
-      classType: 'EmptyHunyuanLatentVideo',
+      nodeId: '131',
+      classType: 'MiniMaxH3ImageToVideo',
       path: ['inputs', 'height'],
     },
     {
       name: 'durationFrames',
-      nodeId: '2',
-      classType: 'EmptyHunyuanLatentVideo',
+      nodeId: '131',
+      classType: 'MiniMaxH3ImageToVideo',
       path: ['inputs', 'length'],
     },
     {
       name: 'seed',
-      nodeId: '3',
-      classType: 'KSampler',
-      path: ['inputs', 'seed'],
+      nodeId: '129',
+      classType: 'RandomNoise',
+      path: ['inputs', 'noise_seed'],
     },
     {
       name: 'steps',
-      nodeId: '3',
-      classType: 'KSampler',
+      nodeId: '124',
+      classType: 'BasicScheduler',
       path: ['inputs', 'steps'],
     },
   ],
@@ -469,7 +632,15 @@ export async function loadFixtureFiles(): Promise<{
   readonly workflow: FixtureWorkflow;
   readonly manifest: WorkflowManifest;
 }> {
-  const workflowUrl = new URL('./fixture-workflow.json', import.meta.url);
+  // The graph is read from the one shipped copy -- the same file
+  // `loadMinimaxH3Fixtures` reads -- rather than from a third copy beside this
+  // module. `fixture-workflow.json` was that third copy; nothing but one test
+  // ever loaded it, which is how it stayed four nodes long after the graph we
+  // ship grew to fourteen.
+  const workflowUrl = new URL(
+    '../../../workflows/minimax-h3/api.json',
+    import.meta.url,
+  );
   const manifestUrl = new URL('./fixture-manifest.json', import.meta.url);
   try {
     const [workflowText, manifestText] = await Promise.all([
@@ -526,13 +697,5 @@ export async function compileAndPersistWorkflow(
   });
   return { ...compiled, workflowVersionId: options.id };
 }
-
-export const PHASE_3_WORKFLOW_FIXTURE = {
-  version: FIXTURE_MANIFEST.version,
-  name: FIXTURE_MANIFEST.family,
-  hash: createHash('sha256')
-    .update(canonicalizeJson(FIXTURE_WORKFLOW), 'utf8')
-    .digest('hex'),
-} as const;
 
 export * from './minimax-h3.js';

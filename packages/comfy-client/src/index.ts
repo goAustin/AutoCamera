@@ -374,6 +374,55 @@ function loadGeneratedFixtureBytes(seed: number): Uint8Array {
  * Resolves identically from `src/` and `dist/`, both one level under the
  * package root.
  */
+/**
+ * Validate a submitted prompt against the pinned `object_info` the way the real
+ * executor does. Checking only `class_type` lets a graph that ComfyUI rejects
+ * pass here: `workflows/minimax-h3/api.json` was missing `UNETLoader`'s
+ * required `weight_dtype` and every offline suite stayed green while the real
+ * executor answered 400. The fixture already carries `input.required`, so the
+ * contract to enforce is the one we captured, not a second-guess of it.
+ *
+ * It lives beside the capture rather than in `apps/fake-comfy` because the
+ * offline compiler has to be able to check its own output against the same
+ * rule. Two implementations of "what the executor requires" is the bug this
+ * function exists to prevent.
+ */
+export function collectNodeErrors(
+  objectInfo: Readonly<Record<string, unknown>>,
+  prompt: Readonly<Record<string, unknown>>,
+): Record<string, unknown> {
+  const nodeErrors: Record<string, unknown> = {};
+  for (const [nodeId, node] of Object.entries(prompt)) {
+    if (!isRecord(node) || typeof node.class_type !== 'string') {
+      nodeErrors[nodeId] = { errors: ['node class_type is required'] };
+      continue;
+    }
+    const spec = objectInfo[node.class_type];
+    if (!isRecord(spec)) {
+      nodeErrors[nodeId] = {
+        class_type: node.class_type,
+        errors: ['node class is not available'],
+      };
+      continue;
+    }
+    const required = isRecord(spec.input) ? spec.input.required : undefined;
+    if (!isRecord(required)) continue;
+    const inputs = isRecord(node.inputs) ? node.inputs : {};
+    const missing = Object.keys(required).filter((name) => !(name in inputs));
+    if (missing.length === 0) continue;
+    nodeErrors[nodeId] = {
+      class_type: node.class_type,
+      errors: missing.map((name) => ({
+        type: 'required_input_missing',
+        message: 'Required input is missing',
+        details: name,
+        extra_info: { input_name: name },
+      })),
+    };
+  }
+  return nodeErrors;
+}
+
 export const PINNED_OBJECT_INFO_PATH = resolve(
   dirname(fileURLToPath(import.meta.url)),
   '../fixtures/object-info.pinned.json',

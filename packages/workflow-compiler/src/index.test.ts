@@ -39,16 +39,14 @@ describe('fixture workflow compiler', () => {
     const second = compileWorkflow(input);
 
     expect(first.workflowHash).toBe(second.workflowHash);
-    expect(first.workflow['1']?.inputs.text).toBe(input.prompt);
-    expect(first.workflow['2']?.inputs).toMatchObject({
+    expect(first.workflow['131']?.inputs).toMatchObject({
+      prompt: input.prompt,
       width: 960,
       height: 544,
       length: 120,
     });
-    expect(first.workflow['3']?.inputs).toMatchObject({
-      seed: 1234,
-      steps: 12,
-    });
+    expect(first.workflow['129']?.inputs.noise_seed).toBe(1234);
+    expect(first.workflow['124']?.inputs.steps).toBe(12);
     expect(first.durationFrames).toBe(120);
     expect(first.durationSeconds).toBe(5);
   });
@@ -101,16 +99,16 @@ describe('fixture workflow compiler', () => {
 
   it('fails closed for missing and mismatched required nodes', () => {
     const missingNode = cloneWorkflow();
-    delete (missingNode as Record<string, unknown>)['2'];
+    delete (missingNode as Record<string, unknown>)['131'];
     expectCompileError(
       () => compileWorkflow({ prompt: 'x', seed: 1, steps: 8 }, missingNode),
       'MISSING_NODE',
     );
 
     const wrongClass = cloneWorkflow();
-    const node = wrongClass['2'];
+    const node = wrongClass['131'];
     if (!node) throw new Error('fixture node missing');
-    wrongClass['2'] = { ...node, class_type: 'WrongNode' };
+    wrongClass['131'] = { ...node, class_type: 'WrongNode' };
     expectCompileError(
       () => compileWorkflow({ prompt: 'x', seed: 1, steps: 8 }, wrongClass),
       'MISMATCHED_NODE_CLASS',
@@ -176,9 +174,9 @@ describe('fixture workflow compiler', () => {
         ...cloneManifest().bindings,
         {
           name: 'unknown' as never,
-          nodeId: '1',
-          classType: 'CLIPTextEncode',
-          path: ['inputs', 'text'],
+          nodeId: '131',
+          classType: 'MiniMaxH3ImageToVideo',
+          path: ['inputs', 'prompt'],
         },
       ],
     };
@@ -232,9 +230,9 @@ describe('fixture workflow compiler', () => {
     const fixture = await loadFixtureFiles();
     expect(fixture.manifest.family).toBe('h3-t2v-fixture');
     expect(fixture.manifest.requiredNodes).toContainEqual({
-      nodeId: '4',
+      nodeId: '92',
       classType: 'SaveVideo',
     });
-    expect(fixture.workflow['2']?.class_type).toBe('EmptyHunyuanLatentVideo');
+    expect(fixture.workflow['131']?.class_type).toBe('MiniMaxH3ImageToVideo');
   });
 });

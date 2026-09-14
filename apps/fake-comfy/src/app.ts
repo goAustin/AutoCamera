@@ -7,6 +7,7 @@ import {
   type ComfyObjectInfoResponse,
   type ComfyScenario,
   type ComfySystemStatsResponse,
+  collectNodeErrors,
   DeterministicFakeComfyService,
   PINNED_OBJECT_INFO_PATH,
 } from '@h3/comfy-client';
@@ -232,50 +233,6 @@ function scenario(value: unknown): ComfyScenario {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-/**
- * Validate a submitted prompt against the pinned `object_info` the way the real
- * executor does. Checking only `class_type` lets a graph that ComfyUI rejects
- * pass here: `workflows/minimax-h3/api.json` was missing `UNETLoader`'s
- * required `weight_dtype` and every offline suite stayed green while the real
- * executor answered 400. The fixture already carries `input.required`, so the
- * contract to enforce is the one we captured, not a second-guess of it.
- */
-function collectNodeErrors(
-  objectInfo: Readonly<Record<string, unknown>>,
-  prompt: Readonly<Record<string, unknown>>,
-): Record<string, unknown> {
-  const nodeErrors: Record<string, unknown> = {};
-  for (const [nodeId, node] of Object.entries(prompt)) {
-    if (!isRecord(node) || typeof node.class_type !== 'string') {
-      nodeErrors[nodeId] = { errors: ['node class_type is required'] };
-      continue;
-    }
-    const spec = objectInfo[node.class_type];
-    if (!isRecord(spec)) {
-      nodeErrors[nodeId] = {
-        class_type: node.class_type,
-        errors: ['node class is not available'],
-      };
-      continue;
-    }
-    const required = isRecord(spec.input) ? spec.input.required : undefined;
-    if (!isRecord(required)) continue;
-    const inputs = isRecord(node.inputs) ? node.inputs : {};
-    const missing = Object.keys(required).filter((name) => !(name in inputs));
-    if (missing.length === 0) continue;
-    nodeErrors[nodeId] = {
-      class_type: node.class_type,
-      errors: missing.map((name) => ({
-        type: 'required_input_missing',
-        message: 'Required input is missing',
-        details: name,
-        extra_info: { input_name: name },
-      })),
-    };
-  }
-  return nodeErrors;
 }
 
 function historyResponse(

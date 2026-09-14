@@ -81,13 +81,13 @@ recorded in [`EVIDENCE-MANIFEST.md`](EVIDENCE-MANIFEST.md).
 |---|---|
 | Frozen install | PASS |
 | Format, lint, strict TypeScript, production build | PASS — all exit 0 |
-| Unit suite | PASS — 280 tests across 27 files |
-| Integration suite | PASS — 22 tests across 11 files, PostgreSQL-backed |
-| Browser suite | 12/17 here — the 7 new gateway tests pass; 4 `run-view` failures reproduce on a clean tree and predate this work, and `demo-screenshots` expects `CAPTURE_EVIDENCE=1` |
+| Unit suite | PASS — 284 tests across 28 files |
+| Integration suite | PASS — 23 tests across 12 files, PostgreSQL-backed, verified against a freshly provisioned database as well as a developer one |
+| Browser suite | PASS — 17/17 |
 | ComfyUI browser gateway | PASS — 7/7, queue mutation denied at the gateway |
 | Token isolation | PASS — `storageHasCredential: false`, `globalsHaveCredential: false`, `crossOriginProtected: true` |
 | Documentation and provenance | PASS — 12 captures accounted for |
-| Secret scan | PASS — 190 tracked files inspected |
+| Secret scan | PASS — 194 tracked files inspected |
 | Live ComfyUI contract | PASS — against the pinned remote executor on a rented RTX 5090, 2026-09-13 |
 | Real H3 GPU smoke | PASS — accepted attempt at profile defaults through `POST /v1/runs` |
 | Phase 8 gate row 2.11 | NOT RUN — browser bridge checks split into a separate pass |

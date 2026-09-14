@@ -1,5 +1,92 @@
 # Changelog
 
+## The offline path submits a graph the pinned executor would accept
+
+`caa50de` made `apps/fake-comfy` enforce `input.required` from the pinned
+`object_info` capture, and `ea3ee85` fixed the one graph anybody thought to
+check. The offline fixture was never checked against the same capture, and it
+was missing `clip` on `CLIPTextEncode`, `batch_size` on
+`EmptyHunyuanLatentVideo`, eight of `KSampler`'s required inputs, and `video`
+and `format` on `SaveVideo`. Every non-managed attempt therefore failed
+`COMFY_UNAVAILABLE`, which is five of the seventeen browser tests. **The suite
+is 17/17 for the first time.**
+
+- **The fixture is now `workflows/minimax-h3/api.json`** -- the graph this
+  project ships, that a pinned remote ComfyUI accepted on 2026-09-13, and that
+  passes the pinned capture with zero node errors. A second hand-maintained
+  graph is the drift `caa50de` deleted; keeping one was never going to hold.
+  Bindings moved onto its own nodes: prompt, width, height and length on
+  `MiniMaxH3ImageToVideo` (131), seed on `RandomNoise` (129), steps on
+  `BasicScheduler` (124). Manifest version `h3-t2v-fixture-v2`.
+- **`collectNodeErrors` moved to `@h3/comfy-client`**, beside the capture it
+  reads, and `apps/fake-comfy` imports it. Two implementations of "what the
+  executor requires" is the bug the function exists to prevent.
+- **The missing test now exists** (`apps/api/src/workflow-contract.test.ts`):
+  compile the fixture, run it through that same rule, expect no node errors --
+  plus a mutation case proving the assertion has teeth. It sits in `apps/api`
+  because it is a claim about two packages at once, and the API is where they
+  meet. Nothing offline had ever submitted the compiled fixture to the
+  validator; the browser suite was the only thing that did.
+- **Three copies became two, test-locked.** `fixture-workflow.json` was a third
+  copy that only one test ever loaded, which is how it stayed four nodes long.
+  It is deleted; `loadFixtureFiles` reads the shipped graph. `FIXTURE_WORKFLOW`
+  stays a literal so the module stays a pure constant, and a test asserts it
+  equals the shipped file -- the bargain `packages/comfy-client` already makes
+  with the pinned capability fingerprint. `PHASE_3_WORKFLOW_FIXTURE`, exported
+  with no callers, is gone.
+- `STATUS.md` said those failures "predate this work". They reproduce on a
+  clean tree because the cause is committed, but that checkpoint introduced
+  them. Corrected, along with the suite counts.
+
+## The first mutation on a new database, and the styles for screens that are gone
+
+CI had failed on every push since 2026-09-04 and nothing here reproduced it.
+`idempotency_records.tenant_id` references `tenants`, and the reservation that
+opens every mutation is the first write against that tenant -- so on a database
+where nothing has run yet it failed the foreign key and returned 500. A
+developer database has been mutated at least once, so the row was always
+already there. `startApi` seeds it at boot; `buildApiApp`, which every
+integration test and CI builds, has no such prologue.
+
+- The ensure now sits in both idempotency helpers, before the reservation they
+  open, and `POST /v1/runs`'s private workaround is gone. The regression test
+  builds its schema in a scratch namespace, because "nothing has run yet" is
+  not a state a shared database can be put back into.
+- Cold-database runs were then flaky -- two in eight, always timeouts. Twelve
+  workers each call `runMigrations`, which takes a database-wide advisory lock
+  on purpose. Vitest's 10s hook default is sized for in-memory work; raised to
+  60s, and twelve consecutive cold runs are green.
+- 612 lines of CSS matched no element in any tracked file -- storyboard grid and
+  cards, shot workspace and nav, project list, planning empty state, approval
+  bar, editor panel. A rule that matches nothing cannot change rendering, so
+  this is verifiable rather than judged: all 80 surviving class names still
+  appear in source, and the bundle is 13.6 kB where it was 21.
+- The same removal left a link to `/projects`, which the router answers by
+  redirecting to `/`, behind a button reading "Start from a brief". Migration
+  0009 dropped `shots.storyboard_proposal_id`, so nothing could populate
+  `storyboardProposalId` in the type, its validation, the response, or the
+  OpenAPI schema either. `planning` and `awaiting_storyboard_approval` stay:
+  nothing writes them, but the status check still permits them and a pre-7D row
+  can hold one, which is what `prepareDirectRunProjectInTransaction` promotes.
+
+## The public documents describe what shipped
+
+The repository is public, and its landing page said "No real MiniMax H3 clip
+has been generated" four days after one was. `EVIDENCE-MANIFEST.md` said the
+same, and it is where `STATUS.md` sends readers for provenance.
+
+- README and the evidence manifest now record the 2026-09-13 run: date,
+  executor and runtime pins, submitted parameters, evaluation, budget movement,
+  outcome. `docs/` and `deliverables/` stay ignored, so the manifest states the
+  clip's absence rather than citing a path no reader can open.
+- `ARCHITECTURE.md` and `DEMO-SCRIPT.md` were three phases behind, still
+  describing the planner, the storyboard approval, and a per-shot workspace
+  that the router cannot reach. The talk track now follows what ships.
+- `Generate managed` was never a button. It existed in those two documents and
+  in `validate-docs.ts`, which required the phrase and so kept both passing
+  while they went stale. The gate requires `Managed Run`, the label the action
+  bar carries.
+
 ## A real clip, through the managed run path
 
 Evidence level moves. Phase 8 step 2 ran on a rented RTX 5090

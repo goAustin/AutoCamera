@@ -1,47 +1,59 @@
 {
   "family": "h3-t2v-fixture",
-  "version": "h3-t2v-fixture-v1",
+  "version": "h3-t2v-fixture-v2",
   "requiredNodes": [
-    { "nodeId": "1", "classType": "CLIPTextEncode" },
-    { "nodeId": "2", "classType": "EmptyHunyuanLatentVideo" },
-    { "nodeId": "3", "classType": "KSampler" },
-    { "nodeId": "4", "classType": "SaveVideo" }
+    {
+      "nodeId": "124",
+      "classType": "BasicScheduler"
+    },
+    {
+      "nodeId": "129",
+      "classType": "RandomNoise"
+    },
+    {
+      "nodeId": "131",
+      "classType": "MiniMaxH3ImageToVideo"
+    },
+    {
+      "nodeId": "92",
+      "classType": "SaveVideo"
+    }
   ],
   "bindings": [
     {
       "name": "prompt",
-      "nodeId": "1",
-      "classType": "CLIPTextEncode",
-      "path": ["inputs", "text"]
+      "nodeId": "131",
+      "classType": "MiniMaxH3ImageToVideo",
+      "path": ["inputs", "prompt"]
     },
     {
       "name": "width",
-      "nodeId": "2",
-      "classType": "EmptyHunyuanLatentVideo",
+      "nodeId": "131",
+      "classType": "MiniMaxH3ImageToVideo",
       "path": ["inputs", "width"]
     },
     {
       "name": "height",
-      "nodeId": "2",
-      "classType": "EmptyHunyuanLatentVideo",
+      "nodeId": "131",
+      "classType": "MiniMaxH3ImageToVideo",
       "path": ["inputs", "height"]
     },
     {
       "name": "durationFrames",
-      "nodeId": "2",
-      "classType": "EmptyHunyuanLatentVideo",
+      "nodeId": "131",
+      "classType": "MiniMaxH3ImageToVideo",
       "path": ["inputs", "length"]
     },
     {
       "name": "seed",
-      "nodeId": "3",
-      "classType": "KSampler",
-      "path": ["inputs", "seed"]
+      "nodeId": "129",
+      "classType": "RandomNoise",
+      "path": ["inputs", "noise_seed"]
     },
     {
       "name": "steps",
-      "nodeId": "3",
-      "classType": "KSampler",
+      "nodeId": "124",
+      "classType": "BasicScheduler",
       "path": ["inputs", "steps"]
     }
   ]
