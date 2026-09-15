@@ -25,6 +25,7 @@
     "comfy:frontend": "bash scripts/fetch-comfy-frontend.sh",
     "comfy:capture-object-info": "node --experimental-strip-types scripts/capture-object-info.ts",
     "demo:seed": "node --experimental-strip-types scripts/demo.ts seed",
+    "demo:run": "node --experimental-strip-types scripts/demo.ts run",
     "demo:reset": "node --experimental-strip-types scripts/demo.ts reset",
     "demo:screenshots": "CAPTURE_EVIDENCE=1 node --experimental-strip-types scripts/test-e2e.ts e2e/demo-screenshots.spec.ts",
     "docs:check": "node --experimental-strip-types scripts/validate-docs.ts",

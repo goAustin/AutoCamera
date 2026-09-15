@@ -221,13 +221,136 @@ async function reset(force: boolean): Promise<void> {
   );
 }
 
+interface RunRecord {
+  readonly runId?: string;
+  readonly status?: string;
+  readonly attempt?: { readonly failureCode?: string | null };
+  readonly artifact?: { readonly id?: string } | null;
+  readonly evaluationStatus?: string;
+}
+
+interface ProjectSummary {
+  readonly id: string;
+  readonly title: string;
+}
+
+// `awaiting_review` is where a healthy run stops: the artifact is stored and
+// evaluated, and a person decides. Treating it as non-terminal made this poll
+// until it timed out on a run that had already succeeded.
+const TERMINAL_ATTEMPT_STATUSES = new Set([
+  'awaiting_review',
+  'accepted',
+  'succeeded',
+  'retryable',
+  'failed',
+  'rejected',
+  'timed_out',
+  'cancelled',
+]);
+
+const SUCCESSFUL_ATTEMPT_STATUSES = new Set([
+  'awaiting_review',
+  'accepted',
+  'succeeded',
+]);
+
+/**
+ * Submits the graph this repository ships against the seeded demo project,
+ * through the same managed `POST /v1/runs` the browser uses, and waits for the
+ * attempt to reach a terminal state.
+ *
+ * This exists because the README spelled the same thing out as a project
+ * lookup piped through `node -pe`, two `$(cat ...)` graph bodies and a polling
+ * loop -- correct, and no one wants to retype it on a metered host.
+ */
+async function run(): Promise<void> {
+  const config = getApiConfig({
+    ...process.env,
+    DEV_AUTH_TOKEN: process.env.DEV_AUTH_TOKEN ?? 'demo-local-token',
+  });
+  const origin = `http://${config.apiHost}:${config.apiPort}`;
+  const authorization = `Bearer ${config.devAuthToken}`;
+
+  const projectsResponse = await fetch(`${origin}/v1/projects`, {
+    headers: { authorization },
+  });
+  if (!projectsResponse.ok) {
+    throw new Error(
+      `GET /v1/projects returned ${projectsResponse.status}; is the API running at ${origin}?`,
+    );
+  }
+  const { projects } = (await projectsResponse.json()) as {
+    readonly projects: readonly ProjectSummary[];
+  };
+  const project = projects.find((candidate) =>
+    candidate.title.startsWith('[Demo]'),
+  );
+  if (!project) {
+    throw new Error('No demo project found. Run `pnpm demo:seed` first.');
+  }
+
+  const workflowRoot = resolve(process.cwd(), 'workflows/minimax-h3');
+  const submitResponse = await fetch(`${origin}/v1/runs`, {
+    method: 'POST',
+    headers: {
+      authorization,
+      'content-type': 'application/json',
+      'idempotency-key': `demo-run-${Date.now()}`,
+    },
+    body: JSON.stringify({
+      projectId: project.id,
+      editorGraph: JSON.parse(
+        readFileSync(resolve(workflowRoot, 'editor.json'), 'utf8'),
+      ),
+      apiGraph: JSON.parse(
+        readFileSync(resolve(workflowRoot, 'api.json'), 'utf8'),
+      ),
+    }),
+  });
+  const submitted = (await submitResponse.json()) as RunRecord;
+  if (!submitResponse.ok || !submitted.runId) {
+    throw new Error(
+      `POST /v1/runs returned ${submitResponse.status}: ${JSON.stringify(submitted).slice(0, 400)}`,
+    );
+  }
+  console.log(`Submitted run ${submitted.runId} against ${project.title}.`);
+
+  for (let poll = 0; poll < 240; poll += 1) {
+    const runResponse = await fetch(`${origin}/v1/runs/${submitted.runId}`, {
+      headers: { authorization },
+    });
+    const record = (await runResponse.json()) as RunRecord;
+    const status = record.status ?? 'unknown';
+    if (TERMINAL_ATTEMPT_STATUSES.has(status)) {
+      const failure = record.attempt?.failureCode;
+      console.log(
+        `Attempt ${status}${failure ? ` (${failure})` : ''}, evaluation ` +
+          `${record.evaluationStatus ?? 'not-run'}` +
+          `${record.artifact?.id ? `, artifact ${record.artifact.id}` : ''}.`,
+      );
+      if (!SUCCESSFUL_ATTEMPT_STATUSES.has(status)) {
+        process.exitCode = 1;
+      }
+      return;
+    }
+    await new Promise((settle) => setTimeout(settle, 2000));
+  }
+  throw new Error(
+    'The attempt did not reach a terminal state within 8 minutes.',
+  );
+}
+
 loadLocalEnvironment();
 const [command, ...args] = process.argv.slice(2);
 if (command === 'seed') {
   await seed();
 } else if (command === 'reset') {
   await reset(args.includes('--force'));
+} else if (command === 'run') {
+  await run();
 } else {
-  console.error('Usage: pnpm demo:seed | pnpm demo:reset -- --force');
+  console.error(
+    'Usage: pnpm demo:seed | pnpm demo:run | pnpm demo:reset -- --force',
+  );
   process.exitCode = 2;
 }

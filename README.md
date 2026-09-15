@@ -14,23 +14,10 @@ recommendations. MiniMax H3 owns inference only.
 
 ## Quick start
 
-Three scenarios, one script each:
+Common setup once, then one of three tracks. Every track ends with the same
+system running; only the executor differs.
 
-| Scenario | One command | GPU |
-|---|---|---|
-| This machine, no GPU | `bash scripts/setup/local.sh` | none |
-| Your own Linux GPU box | `bash scripts/setup/gpu-local.sh` | yours |
-| A rented GPU host | `bash scripts/setup/gpu-rented.sh` | rented |
-
-Each is idempotent: re-run it after an interruption and it resumes rather than
-repeating work — a verified model file is never downloaded twice. Each sets the
-system up and stops, so nothing is rented, submitted, or destroyed on your
-behalf.
-
-Everything below is what those scripts do, step by step. Read it to understand
-the system, or when one of them stops somewhere you did not expect.
-
-### 1. Install the prerequisites (once per machine)
+### Common — the libraries, then the code
 
 ```sh
 # macOS
@@ -47,208 +34,86 @@ curl -fsSL https://deb.nodesource.com/setup_24.x | sudo -E bash -
 sudo apt-get install -y nodejs
 ```
 
-### 2. Clone and start
+ffmpeg is not optional: the evaluator shells out to `ffprobe` and `ffmpeg`, and
+without them no attempt can pass evaluation. Docker is needed only by tracks A
+and B, which run PostgreSQL in a container.
 
 ```sh
 git clone https://github.com/goAustin/AutoCamera.git
 cd AutoCamera
-corepack enable
-pnpm install --frozen-lockfile
-pnpm dev
 ```
 
-`pnpm dev` writes `.env` from `.env.example`, starts PostgreSQL, applies
-migrations, builds, and starts the API, worker, fake ComfyUI, and Project
-Studio. Leave it running; it takes about ten seconds.
+Track C needs neither step — its script installs the libraries and clones this
+repository itself, on the rented host.
 
-### 3. Confirm it is up
-
-In a second terminal:
+### Track A — this machine, no GPU
 
 ```sh
-curl http://127.0.0.1:3000/health/ready
-# {"service":"api","status":"ok","dependencies":{"postgres":"ok"}}
+bash scripts/setup/local.sh
 ```
 
-Open **<http://127.0.0.1:5173>**, paste the token `dev-token`, and click
-**Enter Project Studio**. You should land on **Run history**. That is the whole
-system running, against the bundled simulator — no GPU, no account, no spend.
+Installs dependencies and starts everything: PostgreSQL, migrations, the API and
+worker, the bundled ComfyUI simulator, and Project Studio. Leave it running; it
+takes about ten seconds.
 
-### 4. Generate something
+Open **<http://127.0.0.1:5173>**, paste the token `dev-token`, and click **Enter
+Project Studio**. You land on **Run history**. Then generate a clip:
 
 ```sh
 pnpm demo:seed       # creates the "[Demo] Product story control room" project
+pnpm demo:run        # submits the shipped graph, waits for the attempt
 ```
 
-Submit the graph this repository ships, against that project:
+The run appears in **Run history**: the worker claims it, the simulator returns
+the fixture clip, the artifact is stored and evaluated, and the attempt lands on
+**Awaiting Review** with evaluation **Passed**. Select it, play the clip, then
+click **Accept passing attempt**. That is the whole loop — submission, queue,
+execution, artifact, evaluation, human review — with no GPU and no spend.
+
+To drive it from ComfyUI instead, build the pinned editor once with
+`pnpm comfy:frontend` (without it `:8188` answers `503`), then open
+**<http://127.0.0.1:8188>** and use **Managed Run**.
+
+### Track B — your own Linux GPU box
 
 ```sh
-PROJECT_ID=$(curl -sS http://127.0.0.1:3000/v1/projects \
-  -H "authorization: Bearer dev-token" \
-  | node -pe "JSON.parse(require('fs').readFileSync(0)).projects.find(p=>p.title.startsWith('[Demo]')).id")
-
-curl -sS -X POST http://127.0.0.1:3000/v1/runs \
-  -H "authorization: Bearer dev-token" \
-  -H 'content-type: application/json' \
-  -H "idempotency-key: first-run-$(date +%s)" \
-  -d "{\"projectId\":\"$PROJECT_ID\",
-       \"editorGraph\":$(cat workflows/minimax-h3/editor.json),
-       \"apiGraph\":$(cat workflows/minimax-h3/api.json)}"
+bash scripts/setup/gpu-local.sh
 ```
 
-Refresh Project Studio. The run appears in **Run history** and finishes in about
-a second: the worker claims it, the simulator returns the fixture clip, the
-artifact is stored and evaluated, and the attempt lands on **Awaiting Review**
-with evaluation **Passed**. Select it, play the clip, then click **Accept
-passing attempt**. That is the whole loop — submission, queue, execution,
-artifact, evaluation, human review.
+Needs a CUDA 13-capable driver, **at least 32 GB of VRAM** (the verified run
+peaked at 31.9 GB of an RTX 5090's 32.6), **64 GB or more of host RAM** —
+ComfyUI offloads the 32B text encoder there between nodes — and ~120 GB of disk.
 
-### 5. Use ComfyUI as the front door (optional)
-
-The fake shell at `:8188` serves the real pinned ComfyUI editor, which is not
-vendored here. Fetch and build it once — without this it answers `503`:
+The script installs the pinned ComfyUI outside this repository, downloads and
+checksums ~44 GB of weights, installs the frontend bridge, points `.env` at the
+executor on loopback, and starts the stack. The first run is dominated by the
+download; a re-run skips every file it already verified.
 
 ```sh
-pnpm comfy:frontend
-```
-
-Open **<http://127.0.0.1:8188>**, load the H3 template, and use **Managed Run**.
-The VideoOps panel mounts in the sidebar; the native Queue button is disabled on
-purpose, because every run goes through the managed path.
-
-### Stopping and resetting
-
-```sh
-# Ctrl-C the pnpm dev terminal, then:
-pnpm infra:down                 # stop PostgreSQL
-pnpm demo:reset -- --force      # remove only the demo project and its artifacts
-```
-
-### Choose an executor
-
-The control plane is identical in all three; only the executor changes.
-
-| `COMFY_MODE` | Executor | GPU | Use it for |
-|---|---|---|---|
-| `fake` (default) | bundled simulator | none | The whole loop with no GPU and no spend — the commands above |
-| `remote` | ComfyUI on your own machine | yours | Real H3 generation locally |
-| `remote` | ComfyUI on a rented host | rented | Real H3 generation without owning the card |
-
-`remote` means *a real ComfyUI*, not *a remote machine* — your own GPU uses it
-too, pointed at `127.0.0.1`. And `fake` is not a lesser mode: it is the only way
-to test the recovery paths, because a real GPU cannot be asked to drop a
-WebSocket, emit a duplicate event, or return an uncertain submission on demand.
-
-### Run it on a GPU
-
-A real executor needs a GPU with **at least 32 GB of VRAM** (the verified run
-peaked at 31.9 GB of an RTX 5090's 32.6), about **44 GB of model files**, ~120 GB
-of disk, and a **CUDA 13-capable driver** (verified with `torch 2.14.0+cu130`).
-Expect the first bring-up to be dominated by downloading the weights.
-
-ComfyUI is a separate checkout: it is not vendored here, and its model directory
-is never a client resource.
-
-`bash scripts/setup/gpu-local.sh` performs every step below and then starts the
-stack. Run these by hand instead if you want to see each one land — on whichever
-machine has the GPU, your own or a rented host.
-
-```sh
-# 1. ComfyUI at the pinned ref, with a CUDA 13 build of torch
-git clone https://github.com/Comfy-Org/ComfyUI.git ~/comfyui-h3
-cd ~/comfyui-h3
-git checkout 8a33128f2f8c5585c57486c07de481241e70a39c
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt \
-  --extra-index-url https://download.pytorch.org/whl/cu130
-```
-
-```sh
-# 2. The five model files (~44 GB, and the slow part)
-HF=https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main
-LORA=https://huggingface.co/lightx2v/Minimax-h3-Turbo/resolve/main
-mkdir -p models/{diffusion_models,text_encoders,vae,loras}
-curl -L -o models/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors \
-  $HF/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors
-curl -L -o models/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors \
-  $HF/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors
-curl -L -o models/vae/minimax_h3_video_vae_fp16.safetensors \
-  $HF/vae/minimax_h3_video_vae_fp16.safetensors
-curl -L -o models/vae/minimax_h3_audio_vae_fp32.safetensors \
-  $HF/vae/minimax_h3_audio_vae_fp32.safetensors
-curl -L -o models/loras/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors \
-  $LORA/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors
-```
-
-```sh
-# 3. The VideoOps bridge (frontend-only, registers no execution nodes)
-cp -r ~/AutoCamera/integrations/comfyui-videoops ~/comfyui-h3/custom_nodes/
-
-# 4. Start ComfyUI on loopback and leave it running
-.venv/bin/python main.py --listen 127.0.0.1 --port 8188
-```
-
-```sh
-# 5. Point VideoOps at it, in a second terminal
-cd ~/AutoCamera
-cat >> .env <<'EOF'
-COMFY_MODE=remote
-COMFY_BASE_URL=http://127.0.0.1:8188
-COMFY_WS_URL=ws://127.0.0.1:8188/ws
-COMFY_FRONTEND_URL=http://127.0.0.1:8188
-EOF
-pnpm dev                                  # skips the fake service in this mode
-```
-
-`pnpm dev` starts PostgreSQL through `docker compose`, so it needs a container
-runtime and stops at its prerequisite check without one. A rented GPU image
-usually has none; the next section is the substitute.
-
-```sh
-# 6. Confirm the executor before submitting anything
 curl http://127.0.0.1:3000/v1/executor -H "authorization: Bearer dev-token"
 COMFY_LIVE_TEST=1 COMFY_MODE=remote pnpm test:comfy-live
 ```
 
-Then use it exactly as in fake mode: open ComfyUI, load the H3 graph, choose
-**Managed Run**.
+Then use it exactly as in track A: open ComfyUI, load the H3 graph, **Managed
+Run**.
 
-### On a rented GPU server
-
-The same six steps, with the whole VideoOps stack on the rented host and ComfyUI
-bound to loopback, so no generated byte crosses a network. Because the host is
-disposable, treat its PostgreSQL data and `ARTIFACT_ROOT` as evidence to export
-before teardown rather than as storage.
-
-`bash scripts/setup/gpu-rented.sh` does all of it, including the parts step 5
-changes below, and needs no checkout to start from: point vast.ai's `--onstart`
-at the file, or pipe it in with `curl`, and it clones this repository itself.
-
-Only step 5 changes if you are following along by hand. Rented GPU images ship
-CUDA and Python, not a container runtime, so `pnpm dev` stops before it starts
-anything. Install PostgreSQL from
-the distribution and do its work by hand:
+### Track C — a rented GPU host
 
 ```sh
-# 5. On a host with no container runtime
-apt-get install -y postgresql
-pg_ctlcluster "$(ls /etc/postgresql | head -1)" main start  # no systemd in a container
-su - postgres -c "psql -c \"CREATE ROLE h3_videoops LOGIN PASSWORD 'h3_videoops' SUPERUSER\""
-su - postgres -c "psql -c \"CREATE DATABASE h3_videoops OWNER h3_videoops\""
-
-set -a; . ./.env; set +a     # nothing here reads .env on its own; pnpm dev did it for you
-pnpm build                   # tsc -b first, or db:migrate cannot resolve @h3/domain
-pnpm db:migrate
-node apps/api/dist/main.js   # the API alone: pnpm dev also starts Project Studio
+bash scripts/setup/gpu-rented.sh
 ```
 
-Point `ARTIFACT_ROOT` at an absolute path outside the checkout — the session
-that produced the one real clip used `/srv/videoops/artifacts` — so the evidence
-you copy off before teardown is somewhere you can find it.
+Topology A: the whole VideoOps stack runs on the rented host with ComfyUI bound
+to loopback, so no generated byte crosses a network. The script installs the
+libraries, PostgreSQL, the executor and the weights, builds, migrates, starts the
+API, and stops — having rented, submitted and destroyed nothing. It needs no
+checkout to start from: point vast.ai's `--onstart` at the file, or pipe it in
+with `curl`, and it clones this repository itself.
 
-That API is enough to submit runs and collect artifacts, and is how the one real
-clip was produced. Project Studio is a second process, and reaching it means an
-SSH tunnel rather than a published port:
+Because the host is disposable, treat its PostgreSQL data and `ARTIFACT_ROOT` as
+evidence to export before teardown rather than as storage.
+
+Project Studio is a second process there, reached over an SSH tunnel:
 
 ```sh
 # on the host, alongside the API
@@ -264,12 +129,51 @@ exact `parentOrigin` check, and — where a gateway fronts ComfyUI — its
 `frame-ancestors` header all pin one exact origin. A tunnel that preserves
 `127.0.0.1:5173` satisfies every one of them with no configuration change, on
 this rental and the next. A published port or a provider hostname breaks all
-three at once, and has to be re-edited on every re-rental.
+three at once.
 
 [`infra/gpu-executor/README.md`](infra/gpu-executor/README.md) is the full host
-runbook and covers what this section does not: the other topologies, the browser
-gateway that denies `POST /prompt` and queue mutation, keeping models on a
-volume that outlives the host, the cost breaker, and teardown.
+runbook, and every step the script performs written out by hand: the other
+topologies, the browser gateway that denies `POST /prompt` and queue mutation,
+keeping models on a volume that outlives the host, the cost breaker, teardown.
+
+### Stopping and resetting
+
+```sh
+# Ctrl-C the setup terminal, then:
+pnpm infra:down                 # stop PostgreSQL
+pnpm demo:reset -- --force      # remove only the demo project and its artifacts
+```
+
+### Choose an executor
+
+The control plane is identical in all three; only the executor changes.
+
+| `COMFY_MODE` | Executor | GPU | Track |
+|---|---|---|---|
+| `fake` (default) | bundled simulator | none | A |
+| `remote` | ComfyUI on your own machine | yours | B |
+| `remote` | ComfyUI on a rented host | rented | C |
+
+`remote` means *a real ComfyUI*, not *a remote machine* — your own GPU uses it
+too, pointed at `127.0.0.1`. And `fake` is not a lesser mode: it is the only way
+to test the recovery paths, because a real GPU cannot be asked to drop a
+WebSocket, emit a duplicate event, or return an uncertain submission on demand.
+
+### Why track C is not just track B
+
+`pnpm dev` starts PostgreSQL through `docker compose`, and a container runtime is
+a blocking prerequisite, so on a rented image that has none it stops before
+starting anything. Track C's script does that work directly instead — this is
+what it runs, if you would rather follow along by hand:
+
+```sh
+apt-get install -y postgresql ffmpeg
+pg_ctlcluster "$(ls /etc/postgresql | head -1)" main start
+set -a; . ./.env; set +a     # nothing here reads .env on its own
+pnpm build                   # tsc -b first, or db:migrate cannot resolve @h3/domain
+pnpm db:migrate
+node apps/api/dist/main.js   # the API alone: pnpm dev also starts Project Studio
+```
 
 ### A longer walkthrough
 
