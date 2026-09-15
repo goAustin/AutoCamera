@@ -10,6 +10,9 @@
   "packageManager": "pnpm@9.15.0",
   "scripts": {
     "prerequisites": "node --experimental-strip-types scripts/prerequisites.ts",
+    "setup:local": "bash scripts/setup/local.sh",
+    "setup:gpu": "bash scripts/setup/gpu-local.sh",
+    "setup:rented": "bash scripts/setup/gpu-rented.sh",
     "dev": "node --experimental-strip-types scripts/dev.ts",
     "lint": "biome lint .",
     "format": "biome format --write .",
