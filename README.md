@@ -46,6 +46,28 @@ cd AutoCamera
 Track C needs neither step — its script installs the libraries and clones this
 repository itself, on the rented host.
 
+### Where things are
+
+Three addresses, the same in every track. They are always on **loopback** — the
+system never publishes a port — so on a rented host you reach them through the
+SSH tunnel in track C, which maps the ports identically so these URLs do not
+change.
+
+| | Address | What you do there |
+|---|---|---|
+| **ComfyUI** | <http://127.0.0.1:8188> | Load the H3 graph and press **Managed Run**. This is where you generate video |
+| **Project Studio** | <http://127.0.0.1:5173> | Run history, play the clip, accept or reject. Sign in with the token in `DEV_AUTH_TOKEN` — `dev-token` by default |
+| **VideoOps API** | <http://127.0.0.1:3000> | `/health/ready`, `/v1/executor`, and the managed `POST /v1/runs` |
+
+In track A that ComfyUI port is the bundled simulator's shell, which serves the
+real pinned editor only after `pnpm comfy:frontend` and answers `503` until then.
+In tracks B and C it is the real ComfyUI.
+
+You can generate from either end: **Managed Run** in ComfyUI, or `pnpm demo:run`
+against the API. Both take the same managed path and both land in Project Studio
+for review — the browser is a convenience, not a requirement, which is what makes
+a headless rented host workable.
+
 ### Track A — this machine, no GPU
 
 ```sh
@@ -94,8 +116,8 @@ curl http://127.0.0.1:3000/v1/executor -H "authorization: Bearer dev-token"
 COMFY_LIVE_TEST=1 COMFY_MODE=remote pnpm test:comfy-live
 ```
 
-Then use it exactly as in track A: open ComfyUI, load the H3 graph, **Managed
-Run**.
+Then use it exactly as in track A — ComfyUI at <http://127.0.0.1:8188>, Project
+Studio at <http://127.0.0.1:5173>. The executor is the only thing that changed.
 
 ### Track C — a rented GPU host
 
@@ -183,6 +205,10 @@ VITE_API_ORIGIN=http://127.0.0.1:3000 pnpm --filter @h3/web dev
 ssh -N -p <port> root@<host> \
   -L 5173:127.0.0.1:5173 -L 3000:127.0.0.1:3000 -L 8188:127.0.0.1:8188
 ```
+
+With that tunnel open, the addresses above work unchanged in the browser on your
+own machine: ComfyUI at <http://127.0.0.1:8188>, Project Studio at
+<http://127.0.0.1:5173>. Nothing is published from the rented host.
 
 Map the ports identically. The API's CORS allowlist (`WEB_ORIGIN`), the bridge's
 exact `parentOrigin` check, and — where a gateway fronts ComfyUI — its
