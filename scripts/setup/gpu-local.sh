@@ -17,6 +17,7 @@ setup_label="setup (local GPU)"
 . "$repository_root/scripts/setup/lib.sh"
 
 comfy_root="${COMFY_ROOT:-$HOME/comfyui-h3}"
+comfy_port="${COMFY_PORT:-8188}"
 cd "$repository_root"
 
 [[ "$(uname -s)" == "Linux" ]] ||
@@ -28,22 +29,24 @@ ensure_node_and_pnpm
 pnpm install --frozen-lockfile
 
 step "Executor"
-COMFY_ROOT="$comfy_root" "$repository_root/scripts/setup/comfy-executor.sh" --start
+COMFY_ROOT="$comfy_root" COMFY_PORT="$comfy_port" \
+  "$repository_root/scripts/setup/comfy-executor.sh" --start
 
 step "Pointing VideoOps at it"
 [[ -f .env ]] || cp .env.example .env
 set_env_value .env COMFY_MODE remote
-set_env_value .env COMFY_BASE_URL http://127.0.0.1:8188
-set_env_value .env COMFY_WS_URL ws://127.0.0.1:8188/ws
-set_env_value .env COMFY_FRONTEND_URL http://127.0.0.1:8188
-printf '    COMFY_MODE=remote against 127.0.0.1:8188\n'
+set_env_value .env COMFY_BASE_URL "http://127.0.0.1:$comfy_port"
+set_env_value .env COMFY_WS_URL "ws://127.0.0.1:$comfy_port/ws"
+set_env_value .env COMFY_FRONTEND_URL "http://127.0.0.1:$comfy_port"
+printf '    COMFY_MODE=remote against 127.0.0.1:%s\n' "$comfy_port"
 
 step "Verify before submitting anything"
 cat <<'GUIDE_EOF'
     curl http://127.0.0.1:3000/v1/executor -H "authorization: Bearer dev-token"
     COMFY_LIVE_TEST=1 COMFY_MODE=remote pnpm test:comfy-live
 
-    Then open http://127.0.0.1:8188, load the H3 template, and use Managed Run.
+    Then open ComfyUI (COMFY_PORT, 8188 by default), load the H3 template,
+    and use Managed Run.
 GUIDE_EOF
 
 step "Starting the stack (Ctrl-C to stop)"
