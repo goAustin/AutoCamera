@@ -66,6 +66,51 @@ afterAll(async () => {
 });
 
 describe.skipIf(!databaseAvailable)('Phase 7A PostgreSQL thin core', () => {
+  // Each direct run creates one implicit shot, so the fourth against a project
+  // is the first with an ordinal past 3. Migration 0007 dropped the 1-3 range
+  // check and the domain type is any positive integer, but the row mapper kept
+  // enforcing 1|2|3 -- so the fourth run wrote its shot, failed mapping the row
+  // back, and rolled back. Every subsequent run against that project failed the
+  // same way, permanently, with INVALID_SHOT.
+  it('accepts direct runs past the third against one project', async () => {
+    const first = await app.inject({
+      method: 'POST',
+      url: '/v1/runs',
+      headers: authHeaders('phase7a-ordinal-1'),
+      payload: {
+        editorGraph: fixtures.editorGraph,
+        apiGraph: fixtures.apiGraph,
+        idempotencyKey: 'phase7a-ordinal-1',
+      },
+    });
+    expect(first.statusCode).toBe(201);
+    const projectId = assertUuid(first.json().projectId as string);
+
+    for (const ordinal of [2, 3, 4, 5]) {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/runs',
+        headers: authHeaders(`phase7a-ordinal-${ordinal}`),
+        payload: {
+          projectId,
+          editorGraph: fixtures.editorGraph,
+          apiGraph: fixtures.apiGraph,
+          idempotencyKey: `phase7a-ordinal-${ordinal}`,
+        },
+      });
+      expect(
+        response.statusCode,
+        `run ${ordinal} against the same project: ${response.body}`,
+      ).toBe(201);
+    }
+
+    const shots = await pool.query<{ ordinal: number }>(
+      'SELECT ordinal FROM shots WHERE project_id = $1 ORDER BY ordinal',
+      [projectId],
+    );
+    expect(shots.rows.map((row) => row.ordinal)).toEqual([1, 2, 3, 4, 5]);
+  });
+
   it('persists direct runs and allows review annotations after lifecycle terminality', async () => {
     const submitted = await app.inject({
       method: 'POST',

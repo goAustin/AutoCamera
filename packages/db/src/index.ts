@@ -1343,8 +1343,14 @@ function mapProject(row: ProjectRow): VideoProject {
   };
 }
 
+// Mirrors `shots_ordinal_positive` from migration 0007, which dropped the
+// original `ordinal BETWEEN 1 AND 3` check. Implicit graph-first run shots get
+// one ordinal per run and go past 3; the three-shot limit belongs to storyboard
+// proposals, which are validated separately. Leaving 1|2|3 here meant the
+// fourth direct run against any project wrote its shot and then failed mapping
+// the row back, rolling the transaction back every time -- permanently.
 function shotOrdinal(value: number): Shot['ordinal'] {
-  if (value === 1 || value === 2 || value === 3) {
+  if (Number.isInteger(value) && value > 0) {
     return value;
   }
   throw new DomainError('INVALID_SHOT', 'Stored shot ordinal is invalid.');

@@ -2439,7 +2439,18 @@ export function buildApiApp(options: ApiAppOptions = {}): FastifyInstance {
             },
             additionalProperties: false,
           },
-          response: { 201: schemas.runResponse, 422: schemas.runResponse },
+          // A 422 on this route carries two legitimate shapes: the
+          // invalid-revision run response returned below, and an RFC7807
+          // problem document from sendProblem. Binding schemas.runResponse to
+          // the status admitted only the first, so every *thrown* 422 failed
+          // serialization and reached the client as an opaque 500 with its
+          // error code destroyed. The status stays declared because Fastify
+          // types reply.code() from these keys; the shape is permissive
+          // because the status genuinely has more than one.
+          response: {
+            201: schemas.runResponse,
+            422: { type: 'object', additionalProperties: true },
+          },
         },
       },
       async (request, reply) => {
