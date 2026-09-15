@@ -1,10 +1,18 @@
 # Status
 
-Evidence level: **One real generation, through the managed run path.** On
-2026-09-13 a pinned remote executor was exercised on a rented RTX 5090 and
+Evidence level: **Two real generations, through the managed run path, on
+different hardware.** On 2026-09-13 a pinned remote executor on a rented RTX 5090
 produced a clip at the profile defaults — 960x544, 124 frames, 24 fps, 5.17 s,
-AAC 32 kHz stereo — submitted through `POST /v1/runs` against a budgeted
-project and stored as an **accepted** attempt (`docs/85-PHASE-8-STEP2-RESULT.md`).
+AAC 32 kHz stereo — submitted through `POST /v1/runs` against a budgeted project
+and stored as an **accepted** attempt (`docs/85-PHASE-8-STEP2-RESULT.md`).
+
+On 2026-09-15 the same profile was produced again on a rented **RTX PRO 5000
+Blackwell** running `torch 2.10.0+cu130`, this time provisioned end to end by
+`scripts/setup/gpu-rented.sh` from a clean clone with no manual install steps.
+The capability fingerprint and workflow hash were identical to the first run;
+the attempt reached **`awaiting_review`** with evaluation passed and was not
+carried through human review. Recorded in
+[`EVIDENCE-MANIFEST.md`](EVIDENCE-MANIFEST.md).
 
 **Phase 8 is not complete.** Its gate is every row of Step 2's table, and row
 2.11 — the six browser-bridge checks of `infra/gpu-executor/README.md` §6 — was
@@ -64,9 +72,11 @@ complete**.
   ComfyUI's pip-served pinned frontend behaves like the
   `.data/comfy-frontend/dist` build the suite exercises. The row, and so the
   gate, is not discharged.
-- **Repeatable real inference.** One generation has been produced, on a host
-  that no longer exists. Nothing here provisions a GPU on demand, and no
-  weights are bundled.
+- **On-demand GPU provisioning.** The setup scripts install and run the system
+  on a host you have already rented; nothing here rents one. No weights are
+  bundled. Real inference is now reproducible — the 2026-09-15 run came from a
+  clean clone on hardware the first run never touched — but it is reproducible
+  by a person who provisions a host, not by CI.
 - Production billing, autoscaling, multitenancy, SLOs, and Kubernetes.
 
 Fake output is not a quality or throughput benchmark. Exactly one capture —
@@ -89,11 +99,30 @@ recorded in [`EVIDENCE-MANIFEST.md`](EVIDENCE-MANIFEST.md).
 | Documentation and provenance | PASS — 12 captures accounted for |
 | Secret scan | PASS — 199 tracked files inspected |
 | Live ComfyUI contract | PASS — against the pinned remote executor on a rented RTX 5090, 2026-09-13 |
-| Real H3 GPU smoke | PASS — accepted attempt at profile defaults through `POST /v1/runs` |
+| Real H3 GPU smoke | PASS — accepted attempt at profile defaults through `POST /v1/runs`, 2026-09-13 |
+| Real H3 GPU smoke, reproduced | PASS — 2026-09-15, RTX PRO 5000 Blackwell, provisioned by `scripts/setup/gpu-rented.sh` from a clean clone; identical capability fingerprint and workflow hash; attempt `awaiting_review`, evaluation passed |
 | Phase 8 gate row 2.11 | NOT RUN — browser bridge checks split into a separate pass |
 | GitHub Actions CI | PASS — every step on `d1855b4`, including the browser suite |
 
 ## Known issues
+
+**The frontend bridge is reported as `IMPORT FAILED` by real ComfyUI.** On
+2026-09-15 ComfyUI 0.34.0 logged `Skip … comfyui-videoops module for custom nodes
+due to the lack of NODE_CLASS_MAPPINGS or comfy_entrypoint` followed by
+`0.0 seconds (IMPORT FAILED)`. The package declares only `WEB_DIRECTORY` and
+registers no execution nodes, which is deliberate and is what
+`pin-manifest.json` asserts. Whether ComfyUI still serves the extension's web
+directory after logging that was **not determined** — no browser was opened on
+that host. This sharpens Phase 8 row 2.11 item 1 rather than closing it: the
+question is no longer only whether the pip-served frontend matches the built
+dist, but whether the bridge loads at all under this ComfyUI version. Generation
+is unaffected; both real runs were submitted through the API.
+
+**A prebuilt ComfyUI image cannot host the pinned executor on the default port.**
+Such images serve their own ComfyUI behind a proxy bound to the IPv4 wildcard on
+8188, so the pinned executor cannot bind there, and the image's preinstalled
+torch becomes the one it runs. `COMFY_PORT` selects another port; a plain
+CUDA/PyTorch base image avoids the situation.
 
 The pinned ComfyUI frontend exposes no supported queue-interception hook. This
 release does not monkey-patch frontend internals; it disables the native

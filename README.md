@@ -313,18 +313,26 @@ The durable control plane, the ComfyUI-first shell, and the offline execution
 loop are implemented and tested. The run view is at
 `assets/screenshots/01-run-history.png` and the rest of the captured set.
 
-**One real MiniMax H3 clip has been generated, through the managed run path.**
-On 2026-09-13 a pinned remote executor on a rented RTX 5090 accepted the graph
-this repository ships: submitted through a single `POST /v1/runs` against a
-budgeted project, driven by the durable worker, evaluated, and stored as an
-accepted attempt — h264 960x544, 124 frames, 24 fps, 5.17 s, AAC 32 kHz stereo,
-which is the pinned profile default exactly. That host no longer exists and
-nothing here provisions a GPU on demand, so it is a record of one run, not
-something a clone of this repository reproduces.
+**Two real MiniMax H3 clips have been generated, through the managed run path,
+on different hardware.** On 2026-09-13 a pinned remote executor on a rented RTX
+5090 accepted the graph this repository ships: submitted through a single
+`POST /v1/runs` against a budgeted project, driven by the durable worker,
+evaluated, and stored as an accepted attempt — h264 960x544, 124 frames, 24 fps,
+5.17 s, AAC 32 kHz stereo, the pinned profile default exactly.
+
+On 2026-09-15 the same profile was produced again on a rented RTX PRO 5000
+Blackwell, provisioned end to end by `scripts/setup/gpu-rented.sh` from a clean
+clone with no manual install steps, and reaching `awaiting_review` with
+evaluation passed. The capability fingerprint and workflow hash matched the first
+run exactly, on a different card and a different PyTorch build. So the profile is
+reproducible from a clone — but you still have to rent the host yourself, and no
+weights are bundled.
 
 **Phase 8 is not complete.** Its gate is every row of the step 2 table, and the
-browser-bridge row — whether a real ComfyUI's pip-served pinned frontend behaves
-like the build the browser suite exercises — has not been performed.
+browser-bridge row has not been performed. Real ComfyUI logs the frontend bridge
+as `IMPORT FAILED` — it registers no execution nodes by design — and whether the
+extension's web directory is still served after that was never checked in a
+browser. Generation is unaffected: both real runs were submitted through the API.
 
 Every capture published here is `Offline fake` — produced by the deterministic
 fake executor, not by a GPU. They demonstrate orchestration, revisions, retries,
@@ -333,7 +341,7 @@ fake output is not a quality or throughput benchmark.
 
 The current evidence level, the verification record, and what remains open are
 in [`STATUS.md`](STATUS.md). Capture commands, provenance, and secret review for
-every image — and the full record of that one real run — are in
+every image — and the full record of both real runs — are in
 [`EVIDENCE-MANIFEST.md`](EVIDENCE-MANIFEST.md).
 
 ## Architecture

@@ -4,9 +4,9 @@ This file records where every published capture came from, what it does and does
 not demonstrate, and how it was reviewed for secrets. It exists so that no image
 in this repository has to be taken on trust.
 
-Current evidence level: **One real generation, through the managed run path.**
-That single artifact is recorded under "Real H3 inference record" below, and is
-deliberately not published here.
+Current evidence level: **Two real generations, through the managed run path,
+on different hardware.** Both are recorded under "Real H3 inference record"
+below, and neither artifact is published here.
 
 Every capture published in this repository is **Offline fake**: produced by the
 deterministic fake executor under `COMFY_MODE=fake`. No GPU, model weights, or
@@ -101,9 +101,15 @@ The pinned frontend ref is
 
 ## Real H3 inference record
 
-One real generation exists. It ran on 2026-09-13 on a rented RTX 5090, through
-the managed run path, and it is the only artifact in this project's history that
-is not fake output.
+Two real generations exist, both through the managed run path. They are the only
+artifacts in this project's history that are not fake output.
+
+The second matters for a different reason than the first. The first proved the
+remote H3 path works at all; the second was produced from a clean clone by
+`scripts/setup/gpu-rented.sh`, on a different card and a different PyTorch, and
+so speaks to whether the first is reproducible rather than singular.
+
+### Run 1 — 2026-09-13
 
 | Field | Value |
 |---|---|
@@ -119,15 +125,41 @@ is not fake output.
 | Outcome | `validation: validated`, attempt `accepted`, artifact stored |
 | Secret review | No private hostname, executor credential, or model path appears in this record |
 
-**The clip itself is not published in this repository.** It sits with the rest of
+### Run 2 — 2026-09-15
+
+| Field | Value |
+|---|---|
+| Date | 2026-09-15 |
+| Path | `pnpm demo:seed` then `pnpm demo:run` — one managed `POST /v1/runs` against the budgeted demo project, driven by the durable worker |
+| Provisioning | `scripts/setup/gpu-rented.sh` from a clean clone, `COMFY_PORT=8189`; no manual install steps |
+| Executor | Pinned ComfyUI backend `8a33128f…`, reporting ComfyUI 0.34.0; 13/13 required H3 classes present |
+| Host runtime | RTX PRO 5000 Blackwell (48 GB), `torch 2.10.0+cu130`, Python 3.12.14, CUDA compute capability (12, 0) |
+| Control plane | Same host, Topology A: PostgreSQL 16.15, Node 24.20.0, migrations applied |
+| Models | Five files, all sha256-verified against `modelSources` in `pin-manifest.json` |
+| Capability fingerprint | `2123b7a0…` — **identical to run 1**, despite the different card and PyTorch |
+| Submitted parameters | `seed: 42`, `steps: 20`, `requestedWidth: 960`, `requestedHeight: 544`, `requestedDurationSeconds: 5`, `workflowHash: 65dbfb9c…` — the same hash as run 1 |
+| Media evaluation | Passed — h264 960x544, 124 frames, 24 fps, 5.167 s, AAC 32 kHz stereo, decoded from the stored bytes rather than ComfyUI's output directory |
+| Outcome | `validation: validated`, attempt **`awaiting_review`**, artifact stored |
+| Not done | No human review step. Run 1 reached `accepted`; this one was left at `awaiting_review`, which is where a healthy run stops until a person decides |
+| Secret review | No private hostname, executor credential, or model path appears in this record |
+
+**Neither clip is published in this repository.** It sits with the rest of
 that session's raw capture in the ignored `deliverables/` tree, beside the
 working notes in the ignored `docs/` tree. Both are development material and are
 deliberately kept out of what is pushed; this table, `STATUS.md`, and
 `CHANGELOG.md` are the published record of the run.
 
-What it does not establish: it is one clip, on a host that no longer exists.
-Nothing here provisions a GPU on demand, no weights are bundled, and a single
-run is not a quality, latency, throughput, or cost benchmark.
+What these establish: the pinned profile runs on more than one Blackwell card
+and more than one PyTorch build, and the setup scripts reproduce it from a clean
+clone without manual steps. The identical capability fingerprint and workflow
+hash across both runs are what make that comparison meaningful rather than
+anecdotal.
+
+What they do not establish: two clips are not a quality, latency, throughput or
+cost benchmark. Nothing here provisions a GPU on demand, no weights are bundled,
+and both hosts were destroyed or are disposable. Run 2's torch 2.10.0 was chosen
+by the base image rather than pinned, so it records what happened to work, not a
+supported matrix.
 
 ## Optional observability evidence
 

@@ -115,10 +115,11 @@ happens to it afterwards.
     inspect `/metrics` or the provisioned Grafana dashboard for status,
     validation, queue, evaluation, recommendation, and SSE panels.
 12. **Limitations.** Say plainly: everything in this walkthrough is fake
-    output. Exactly one real H3 clip exists in this project's history — one
-    managed run on a rented RTX 5090 on 2026-09-13, recorded in
-    `EVIDENCE-MANIFEST.md` and not published here — on a host that no longer
-    exists. Nothing provisions a GPU on demand, Phase 8's gate is still open,
+    output. Exactly two real H3 clips exist in this project's history — one
+    managed run on a rented RTX 5090 on 2026-09-13, and a second on a rented
+    RTX PRO 5000 Blackwell on 2026-09-15 provisioned from a clean clone by
+    `scripts/setup/gpu-rented.sh`, both recorded in `EVIDENCE-MANIFEST.md` and
+    neither published here. Nothing provisions a GPU on demand, Phase 8's gate is still open,
     and fake output is not a quality, latency, throughput, or cost benchmark.
 
 Capture the deterministic evidence set with:

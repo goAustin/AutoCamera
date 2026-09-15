@@ -1,7 +1,7 @@
 # H3 VideoOps architecture
 
 This document describes the shipped system: a ComfyUI-first durable control
-plane. One real generation has run through it end to end, on a rented GPU host,
+plane. Two real generations have run through it end to end, on rented GPU hosts,
 on 2026-09-13. Phase 8, which closes the remote deployment path, is not
 complete. `STATUS.md` carries the current evidence level.
 
