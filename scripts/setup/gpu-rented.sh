@@ -24,6 +24,7 @@ videoops_repository="${VIDEOOPS_REPOSITORY:-https://github.com/goAustin/AutoCame
 videoops_root="${VIDEOOPS_ROOT:-/srv/videoops/src}"
 comfy_root="${COMFY_ROOT:-/srv/comfyui-h3}"
 artifact_root="${ARTIFACT_ROOT:-/srv/videoops/artifacts}"
+comfy_port="${COMFY_PORT:-8188}"
 api_log="${API_LOG:-/var/log/videoops-api.log}"
 setup_label="setup (rented GPU)"
 
@@ -110,6 +111,14 @@ elif [[ ! -f "$videoops_root/package.json" ]]; then
   run_privileged mkdir -p "$(dirname "$videoops_root")"
   run_privileged chown -R "$(id -u):$(id -g)" "$(dirname "$videoops_root")"
   git clone --quiet "$videoops_repository" "$videoops_root"
+elif [[ -d "$videoops_root/.git" ]]; then
+  # A rented host is disposable and this checkout is not somewhere anyone
+  # develops, so a re-run should pick up fixes rather than silently keep the
+  # revision that was current when the host was first built.
+  step "VideoOps source"
+  git -C "$videoops_root" pull --ff-only --quiet || \
+    printf '    could not fast-forward; leaving the checkout as it is\n'
+  printf '    at %s\n' "$(git -C "$videoops_root" rev-parse --short HEAD)"
 fi
 cd "$videoops_root"
 printf '    source at %s\n' "$videoops_root"
@@ -121,7 +130,8 @@ pnpm install --frozen-lockfile
 
 # --------------------------------------------------------------- executor ----
 step "Executor"
-COMFY_ROOT="$comfy_root" "$videoops_root/scripts/setup/comfy-executor.sh" --start
+COMFY_ROOT="$comfy_root" COMFY_PORT="$comfy_port" \
+  "$videoops_root/scripts/setup/comfy-executor.sh" --start
 
 # ------------------------------------------------------------ the control ----
 step "Control plane"
@@ -144,9 +154,9 @@ PYTHON_EOF
 }
 mkdir -p "$artifact_root"
 set_env_value .env COMFY_MODE remote
-set_env_value .env COMFY_BASE_URL http://127.0.0.1:8188
-set_env_value .env COMFY_WS_URL ws://127.0.0.1:8188/ws
-set_env_value .env COMFY_FRONTEND_URL http://127.0.0.1:8188
+set_env_value .env COMFY_BASE_URL "http://127.0.0.1:$comfy_port"
+set_env_value .env COMFY_WS_URL "ws://127.0.0.1:$comfy_port/ws"
+set_env_value .env COMFY_FRONTEND_URL "http://127.0.0.1:$comfy_port"
 # Absolute, and outside the checkout: this is the evidence you copy off before
 # teardown, not somewhere to go looking for afterwards.
 set_env_value .env ARTIFACT_ROOT "$artifact_root"
@@ -176,11 +186,11 @@ printf '    %s\n' "$(curl -fsS http://127.0.0.1:3000/health/ready)"
 # ------------------------------------------------------------- readiness -----
 step "Readiness"
 printf '    listening:\n'
-ss -ltnp 2>/dev/null | grep -E ':8188|:3000' | sed 's/^/      /' || true
-python3 - <<'PYTHON_EOF'
-import json, urllib.request
+ss -ltnp 2>/dev/null | grep -E ":$comfy_port|:3000" | sed 's/^/      /' || true
+COMFY_PORT="$comfy_port" python3 - <<'PYTHON_EOF'
+import json, os, urllib.request
 
-def get(path, base="http://127.0.0.1:8188"):
+def get(path, base=f"http://127.0.0.1:{os.environ.get('COMFY_PORT', '8188')}"):
     with urllib.request.urlopen(base + path, timeout=30) as response:
         return json.load(response)
 

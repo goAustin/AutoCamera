@@ -16,6 +16,9 @@ set -euo pipefail
 repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 pin_manifest_path="$repository_root/infra/gpu-executor/pin-manifest.json"
 comfy_root="${COMFY_ROOT:-$HOME/comfyui-h3}"
+# Some prebuilt images already own 8188 -- a ComfyUI template ships its own
+# ComfyUI behind a proxy on that port. Override with COMFY_PORT when that is so.
+comfy_port="${COMFY_PORT:-8188}"
 torch_index_url="${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu130}"
 start_executor=0
 skip_models=0
@@ -160,26 +163,31 @@ if [[ "$start_executor" == "1" ]]; then
   # cannot bind, exits with "Port 8188 is already in use", and the readiness
   # poll below then waits six minutes and blames the host for a port that was
   # answering the whole time.
-  if curl -fsS http://127.0.0.1:8188/system_stats >/dev/null 2>&1; then
-    printf '    already serving on 127.0.0.1:8188; leaving it alone\n'
+  if curl -fsS "http://127.0.0.1:$comfy_port/system_stats" >/dev/null 2>&1; then
+    printf '    already serving on 127.0.0.1:%s; leaving it alone\n' "$comfy_port"
     exit 0
+  fi
+  # Something holding the port that is not our executor can never be waited out.
+  if command -v ss >/dev/null && ss -ltn "sport = :$comfy_port" | grep -q LISTEN; then
+    ss -ltnp "sport = :$comfy_port" | sed 's/^/      /'
+    die "port $comfy_port is held by another process and it is not the pinned executor. Re-run with COMFY_PORT=<free port> (the VideoOps COMFY_* values must match)."
   fi
   # Loopback only, and never published: the worker reaches it without crossing a
   # network, which is what keeps the private-route invariant true by construction.
   nohup "$comfy_root/.venv/bin/python" "$comfy_root/main.py" \
-    --listen 127.0.0.1 --port 8188 --disable-auto-launch \
+    --listen 127.0.0.1 --port "$comfy_port" --disable-auto-launch \
     >"$comfy_root/comfyui.log" 2>&1 &
   printf '%s' "$!" >"$comfy_root/comfyui.pid"
   for _ in $(seq 1 180); do
-    if curl -fsS http://127.0.0.1:8188/system_stats >/dev/null 2>&1; then
-      printf '    serving on 127.0.0.1:8188 (log: %s)\n' "$comfy_root/comfyui.log"
+    if curl -fsS "http://127.0.0.1:$comfy_port/system_stats" >/dev/null 2>&1; then
+      printf '    serving on 127.0.0.1:%s (log: %s)\n' "$comfy_port" "$comfy_root/comfyui.log"
       exit 0
     fi
     sleep 2
   done
-  die "ComfyUI did not answer on 127.0.0.1:8188 within six minutes. Check the end of $comfy_root/comfyui.log: 'Port 8188 is already in use' means another executor holds it, and 'ss -ltnp | grep 8188' names the process"
+  die "ComfyUI did not answer on 127.0.0.1:$comfy_port within six minutes; see the end of $comfy_root/comfyui.log"
 fi
 
 step "Executor installed at $comfy_root"
-printf '    start it with: %s/.venv/bin/python %s/main.py --listen 127.0.0.1 --port 8188\n' \
-  "$comfy_root" "$comfy_root"
+printf '    start it with: %s/.venv/bin/python %s/main.py --listen 127.0.0.1 --port %s\n' \
+  "$comfy_root" "$comfy_root" "$comfy_port"
