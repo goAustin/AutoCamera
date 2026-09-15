@@ -48,16 +48,20 @@ repository itself, on the rented host.
 
 ### Where things are
 
-Three addresses, the same in every track. They are always on **loopback** — the
-system never publishes a port — so on a rented host you reach them through the
-SSH tunnel in track C, which maps the ports identically so these URLs do not
-change.
+Three services, on **loopback** in every track — the system never publishes a
+port, which is why a rented host is reached through the SSH tunnel in track C.
 
-| | Address | What you do there |
-|---|---|---|
-| **ComfyUI** | <http://127.0.0.1:8188> | Load the H3 graph and press **Managed Run**. This is where you generate video. `COMFY_PORT` moves it when 8188 is taken |
-| **Project Studio** | <http://127.0.0.1:5173> | Run history, play the clip, accept or reject. Sign in with the token in `DEV_AUTH_TOKEN` — `dev-token` by default |
-| **VideoOps API** | <http://127.0.0.1:3000> | `/health/ready`, `/v1/executor`, and the managed `POST /v1/runs` |
+| | Default address | Set by | What you do there |
+|---|---|---|---|
+| **ComfyUI** | <http://127.0.0.1:8188> | `COMFY_PORT` | Load the H3 graph and press **Managed Run**. This is where you generate video |
+| **Project Studio** | <http://127.0.0.1:5173> | `WEB_PORT` | Run history, play the clip, accept or reject. Sign in with the token in `DEV_AUTH_TOKEN` — `dev-token` by default |
+| **VideoOps API** | <http://127.0.0.1:3000> | `API_PORT` | `/health/ready`, `/v1/executor`, and the managed `POST /v1/runs` |
+
+**These are defaults, not fixed addresses.** `COMFY_PORT` is the one you are most
+likely to have to change, because a prebuilt ComfyUI image already owns 8188 — a
+rented host commonly ends up on 8189. Whatever you set it to replaces 8188
+everywhere below, including on *both* sides of the `-L` in the track C tunnel and
+in the browser address you open.
 
 In track A that ComfyUI port is the bundled simulator's shell, which serves the
 real pinned editor only after `pnpm comfy:frontend` and answers `503` until then.
