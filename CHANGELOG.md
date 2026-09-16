@@ -1,5 +1,81 @@
 # Changelog
 
+## A second real generation, on hardware the first one never touched
+
+2026-09-15, a rented RTX PRO 5000 Blackwell running `torch 2.10.0+cu130`
+produced the pinned profile again -- 960x544, 124 frames, 24 fps, 5.167 s, AAC
+32 kHz stereo -- provisioned end to end by `scripts/setup/gpu-rented.sh` from a
+clean clone with no manual install steps. The capability fingerprint and the
+workflow hash were identical to the 2026-09-13 RTX 5090 run, which is what makes
+this a reproduction rather than a second anecdote.
+
+The attempt reached `awaiting_review` with evaluation passed; no human review
+step was performed, so it is not recorded as `accepted`. Run 2's torch was
+chosen by the base image rather than pinned, so it records what happened to
+work, not a supported matrix.
+
+- **"A record of one run, not something a clone of this repository reproduces"
+  is retired.** A clone did reproduce it. What remains true is that you rent the
+  host yourself and no weights are bundled, so the open item is on-demand
+  provisioning, not repeatability.
+- **Real ComfyUI logs the frontend bridge as `IMPORT FAILED`** -- it declares
+  only `WEB_DIRECTORY` and registers no execution nodes, which is deliberate.
+  Whether the extension's web directory is still served after that was not
+  determined, so Phase 8 row 2.11 item 1 is sharpened rather than closed.
+  Generation is unaffected: both real runs were submitted through the API.
+
+## One script per scenario, and the checksums they verify against
+
+Three scenarios now have one command each -- `scripts/setup/local.sh` for this
+machine with no GPU, `gpu-local.sh` for your own Linux box, `gpu-rented.sh` for
+a rented host. The two GPU scripts share `comfy-executor.sh`, which installs the
+pinned ComfyUI, the weights and the frontend bridge; that half is identical
+whether the card is yours or rented, so it is written once.
+
+- **`modelSources` in `pin-manifest.json`** carries a URL, byte count and sha256
+  per model file. Nothing is hardcoded in a script, so a pin bump stays a
+  manifest edit. The sha256 values are the LFS content hashes from the
+  HuggingFace hub API, re-verified byte-for-byte against all five files.
+  Downloads are checked and skipped when already correct, so a re-run after an
+  interruption costs nothing rather than 44 GB.
+- **`ffmpeg` is installed explicitly** on the rented path. The evaluator shells
+  out to `ffprobe` and `ffmpeg` and both are blocking prerequisites; the earlier
+  session only worked because its base image happened to ship them.
+- **`COMFY_PORT` selects the executor port**, defaulting to 8188, and moves the
+  three `COMFY_*` values with it. A prebuilt ComfyUI image already serves its own
+  ComfyUI on 8188 behind a proxy bound to the IPv4 wildcard, so the pinned
+  executor cannot bind there at all. The executor now checks the port first and
+  names the process holding it instead of waiting out a bind that cannot succeed.
+- **Every script sets the system up and stops.** None rents, submits or
+  destroys. `gpu-rented.sh` prints the budgeted-project command rather than
+  running it, because `POST /v1/runs` without a `projectId` enforces no budget.
+
+## The fourth direct run against a project failed forever, and said 500
+
+Two defects, the first hiding the second. `app.ts` bound `schemas.runResponse`
+to the 422 slot of `POST /v1/runs`. A 422 there has two legitimate shapes -- the
+invalid-revision run response, and an RFC7807 problem document from
+`sendProblem` -- and the binding admitted only the first, so every *thrown* 422
+failed serialization and reached the client as an opaque 500 with its error code
+destroyed. It was the only route in this API that schemas an error status.
+
+With the error visible it read `INVALID_SHOT`, "Stored shot ordinal is invalid."
+Each direct run creates one implicit shot, so the fourth against a project is the
+first with an ordinal past 3. Migration `0007` dropped `ordinal BETWEEN 1 AND 3`
+for `ordinal >= 1`, `ShotOrdinal` is any positive integer, and
+`createImplicitShotInTransaction` carries a comment saying a project's run count
+is unbounded. The row mapper in `packages/db` alone was never updated, so the
+fourth run wrote its shot, threw mapping the row back, and rolled the
+transaction back -- on every attempt after, permanently, for that project.
+
+- **The regression test submits five runs against one project** and asserts
+  ordinals 1-5. Reverting the mapper makes it fail on run 4 with `INVALID_SHOT`,
+  which is also how the serialization fix was confirmed: the failure is now a
+  readable problem document instead of a 500.
+- **`pnpm demo:run`** replaces the README's project lookup piped through
+  `node -pe`, two `$(cat ...)` graph bodies, an idempotency key and a polling
+  loop.
+
 ## The offline path submits a graph the pinned executor would accept
 
 `caa50de` made `apps/fake-comfy` enforce `input.required` from the pinned

@@ -79,11 +79,11 @@ complete**.
   by a person who provisions a host, not by CI.
 - Production billing, autoscaling, multitenancy, SLOs, and Kubernetes.
 
-Fake output is not a quality or throughput benchmark. Exactly one capture —
-`deliverables/phase8-step2/profile-default-via-videoops.mp4` — is real H3
-inference; every other capture in this repository is fake output and may not be
-read as evidence of it. Capture provenance is
-recorded in [`EVIDENCE-MANIFEST.md`](EVIDENCE-MANIFEST.md).
+Fake output is not a quality or throughput benchmark. Exactly two captures are
+real H3 inference — the 2026-09-13 and 2026-09-15 runs, both held outside what
+this repository publishes. Every other capture here is fake output and may not be
+read as evidence of it. Capture provenance is recorded in
+[`EVIDENCE-MANIFEST.md`](EVIDENCE-MANIFEST.md).
 
 ## Verification record
 
@@ -102,7 +102,7 @@ recorded in [`EVIDENCE-MANIFEST.md`](EVIDENCE-MANIFEST.md).
 | Real H3 GPU smoke | PASS — accepted attempt at profile defaults through `POST /v1/runs`, 2026-09-13 |
 | Real H3 GPU smoke, reproduced | PASS — 2026-09-15, RTX PRO 5000 Blackwell, provisioned by `scripts/setup/gpu-rented.sh` from a clean clone; identical capability fingerprint and workflow hash; attempt `awaiting_review`, evaluation passed |
 | Phase 8 gate row 2.11 | NOT RUN — browser bridge checks split into a separate pass |
-| GitHub Actions CI | PASS — every step on `d1855b4`, including the browser suite |
+| GitHub Actions CI | PASS — every step on `65c324a`, including the browser suite |
 
 ## Known issues
 

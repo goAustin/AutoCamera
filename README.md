@@ -53,7 +53,7 @@ port, which is why a rented host is reached through the SSH tunnel in track C.
 
 | | Default address | Set by | What you do there |
 |---|---|---|---|
-| **ComfyUI** | <http://127.0.0.1:8188> | `COMFY_PORT` | Load the H3 graph and press **Managed Run**. This is where you generate video |
+| **ComfyUI** | <http://127.0.0.1:8188> | `COMFY_PORT` | Load [`workflows/minimax-h3/editor.json`](workflows/minimax-h3/editor.json) and press **Managed Run**. This is where you generate video |
 | **Project Studio** | <http://127.0.0.1:5173> | `WEB_PORT` | Run history, play the clip, accept or reject. Sign in with the token in `DEV_AUTH_TOKEN` — `dev-token` by default |
 | **VideoOps API** | <http://127.0.0.1:3000> | `API_PORT` | `/health/ready`, `/v1/executor`, and the managed `POST /v1/runs` |
 
@@ -62,6 +62,12 @@ likely to have to change, because a prebuilt ComfyUI image already owns 8188 —
 rented host commonly ends up on 8189. Whatever you set it to replaces 8188
 everywhere below, including on *both* sides of the `-L` in the track C tunnel and
 in the browser address you open.
+
+`WEB_PORT` and `API_PORT` live in `.env` and are read by the services themselves.
+`COMFY_PORT` is different: it is read by the setup scripts, before `.env` is
+loaded, and its job is to write the `COMFY_*` values that the worker then uses.
+**Setting it in `.env` does nothing** — pass it to the script:
+`COMFY_PORT=8189 bash setup.sh`.
 
 In track A that ComfyUI port is the bundled simulator's shell, which serves the
 real pinned editor only after `pnpm comfy:frontend` and answers `503` until then.
@@ -222,13 +228,21 @@ evidence to export before teardown rather than as storage.
 Project Studio is a second process there, reached over an SSH tunnel:
 
 ```sh
-# on the host, alongside the API
-VITE_API_ORIGIN=http://127.0.0.1:3000 pnpm --filter @h3/web dev
+# on the host, alongside the API — the built bundle, not the dev server
+pnpm --filter @h3/web exec vite preview --host 127.0.0.1 --port 5173
 
 # from your own machine
-ssh -N -p <port> root@<host> \
+ssh -N -C -p <port> root@<host> \
   -L 5173:127.0.0.1:5173 -L 3000:127.0.0.1:3000 -L 8188:127.0.0.1:8188
 ```
+
+**Serve the build, not `pnpm --filter @h3/web dev`.** Vite's dev server sends
+every ES module as its own request — hundreds of them — and a tunnel costs most
+of a second per round trip, so the page never finishes and the stalled requests
+congest the tunnel for everything else. Measured on a rented host: 603 bytes of
+`index.html` took 110 seconds through a dev server whose own reply, on the host,
+took 3 milliseconds. The production build is three files and loads in about three
+seconds over the same tunnel. `-C` is worth having for the same reason.
 
 If you moved the executor with `COMFY_PORT`, forward that port on both sides of
 the `-L` instead — the ComfyUI address below changes with it.

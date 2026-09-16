@@ -219,6 +219,21 @@ example:
 
 Do not expose this listener directly to the public Internet.
 
+**8188 is a default, not a given.** Two things can take it before you do. A
+prebuilt ComfyUI image serves its own ComfyUI on 8188 behind a proxy bound to the
+IPv4 wildcard, which covers loopback, so the pinned executor cannot bind there at
+all — prefer a plain CUDA/PyTorch base image and install the pinned executor onto
+it. Where the port is unavailable anyway, `COMFY_PORT` moves the listener and the
+`COMFY_*` values together (`COMFY_PORT=8189 bash scripts/setup/gpu-rented.sh`),
+and the gateway upstreams in section 5 follow it.
+
+**Note the collision with section 5's numbering.** In the sketch below, `8189` is
+the *private worker vhost* in topology B — a gateway port in front of ComfyUI,
+not ComfyUI itself. It is also the first port people reach for when 8188 is
+taken. They are different things; if you use `COMFY_PORT=8189` under topology A,
+where no private vhost exists, nothing collides, but do not carry that number
+into a topology B gateway config expecting it to mean the same.
+
 ## 5. Split the private API route from the browser editor route
 
 Use an authenticated reverse proxy or service mesh. The private worker route
@@ -445,7 +460,10 @@ passes.
 3. Install the pinned executor (section 1) and the frontend bridge (section 2).
    Record `git rev-parse HEAD` for both pinned refs.
 4. Start the executor bound to the mesh interface (8.1) and start the gateway
-   with the section 5 route and method policy.
+   with the section 5 route and method policy. If the image already holds the
+   executor port, `COMFY_PORT` moves it; the setup scripts check the port first
+   and name the process holding it rather than waiting out a bind that cannot
+   succeed.
 5. Run the section 6 readiness checks from the control-plane host — not from
    the GPU host, so the check exercises the real network path. `/object_info`
    must contain every class in `requiredApiNodeClasses` from
