@@ -6,7 +6,7 @@
   border: 1px solid var(--line-strong);
   border-radius: 999px;
   color: var(--muted);
-  font-size: 0.68rem;
+  font-size: var(--text-label);
   font-weight: 800;
   letter-spacing: 0.04em;
   line-height: 1.1;

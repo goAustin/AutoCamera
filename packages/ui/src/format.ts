@@ -3,6 +3,7 @@ export function humanize(value: string): string {
   return value
     .replaceAll('_', ' ')
     .replaceAll('-', ' ')
+    .replaceAll('.', ' ')
     .replace(/\b\w/g, (character) => character.toUpperCase());
 }
 

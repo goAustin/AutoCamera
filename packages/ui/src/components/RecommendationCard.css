@@ -10,9 +10,8 @@
   display: grid;
   gap: 0.65rem;
   padding: 0.9rem;
-  border: 1px solid var(--line);
   border-radius: 0.8rem;
-  background: rgb(4 13 16 / 40%);
+  background: var(--surface-nested);
 }
 
 .recommendation-heading {
@@ -25,7 +24,7 @@
 .recommendation-card p {
   margin: 0;
   color: var(--muted);
-  font-size: 0.78rem;
+  font-size: var(--text-body);
   line-height: 1.5;
 }
 
@@ -34,5 +33,5 @@
   flex-wrap: wrap;
   gap: 0.7rem;
   color: var(--faint);
-  font-size: 0.7rem;
+  font-size: var(--text-label);
 }

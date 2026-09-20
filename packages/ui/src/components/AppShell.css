@@ -29,7 +29,7 @@
   border: 1px solid var(--mint);
   border-radius: 0.75rem;
   color: var(--mint);
-  font-size: 0.75rem;
+  font-size: var(--text-label);
   font-weight: 900;
   letter-spacing: -0.08em;
 }
@@ -40,13 +40,13 @@
 }
 
 .brand strong {
-  font-size: 0.95rem;
+  font-size: var(--text-lead);
   letter-spacing: -0.02em;
 }
 
 .brand small {
   color: var(--faint);
-  font-size: 0.68rem;
+  font-size: var(--text-micro);
   letter-spacing: 0.12em;
   text-transform: uppercase;
 }
@@ -60,7 +60,7 @@
 
 .header-mode {
   color: var(--faint);
-  font-size: 0.78rem;
+  font-size: var(--text-label);
   letter-spacing: 0.08em;
   text-transform: uppercase;
 }

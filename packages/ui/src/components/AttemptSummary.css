@@ -2,9 +2,8 @@
   display: grid;
   gap: 0.9rem;
   padding: 1rem;
-  border: 1px solid var(--line);
   border-radius: 0.9rem;
-  background: rgb(4 13 16 / 42%);
+  background: var(--surface-nested);
 }
 
 .attempt-heading {
@@ -21,14 +20,14 @@
 
 .attempt-heading h4 {
   margin: 0;
-  font-size: 1rem;
+  font-size: var(--text-subhead);
   letter-spacing: -0.04em;
 }
 
 .failure-copy {
   margin: 0;
   color: var(--coral);
-  font-size: 0.86rem;
+  font-size: var(--text-body);
   line-height: 1.55;
 }
 

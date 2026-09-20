@@ -32,8 +32,13 @@
   width: 0.55rem;
   height: 0.55rem;
   margin-top: 0.3rem;
-  border: 2px solid var(--mint);
+  border: 2px solid var(--line-strong);
   border-radius: 50%;
+}
+
+/* Newest first, so the first dot is the live edge of the run. */
+.timeline-list li:first-child .timeline-dot {
+  border-color: var(--mint);
 }
 
 .timeline-list strong,
@@ -44,14 +49,14 @@
 
 .timeline-list strong {
   color: var(--ink);
-  font-size: 0.78rem;
+  font-size: var(--text-body);
 }
 
 .timeline-list small,
 .timeline-detail {
   margin-top: 0.18rem;
   color: var(--faint);
-  font-size: 0.68rem;
+  font-size: var(--text-label);
   line-height: 1.4;
 }
 

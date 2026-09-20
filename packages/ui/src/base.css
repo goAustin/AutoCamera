@@ -36,7 +36,7 @@
 label,
 legend {
   color: var(--muted);
-  font-size: 0.78rem;
+  font-size: var(--text-small);
   font-weight: 700;
 }
 
@@ -74,9 +74,12 @@ textarea:focus {
 
 code {
   overflow: hidden;
-  color: var(--mint);
+  padding: 0.1rem 0.32rem;
+  border-radius: 0.3rem;
+  background: var(--surface-nested);
+  color: var(--muted);
   font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
-  font-size: 0.7rem;
+  font-size: var(--text-label);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -91,7 +94,7 @@ textarea:focus-visible {
 
 .muted {
   color: var(--faint);
-  font-size: 0.72rem;
+  font-size: var(--text-label);
 }
 
 .button-row {
@@ -101,10 +104,12 @@ textarea:focus-visible {
   gap: 0.6rem;
 }
 
+/* Structural labels are not accents. Mint is reserved for things you can
+   act on and things that succeeded; an eyebrow is neither. */
 .eyebrow,
 .section-kicker {
-  color: var(--mint);
-  font-size: 0.68rem;
+  color: var(--faint);
+  font-size: var(--text-label);
   font-weight: 800;
   letter-spacing: 0.16em;
   text-transform: uppercase;
@@ -116,7 +121,7 @@ textarea:focus-visible {
 
 .lede {
   color: var(--muted);
-  font-size: 1.03rem;
+  font-size: var(--text-lead);
   line-height: 1.65;
 }
 

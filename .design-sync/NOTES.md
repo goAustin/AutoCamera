@@ -62,6 +62,33 @@ Repo-specific things a future sync should know. Append, don't rewrite.
   whole string (`slice(-0)` is `slice(0)`), and the timeline connector used a
   fixed `height: 2.7rem` that broke whenever an event carried a detail line.
 
+## Look pass (2026-09-21)
+
+- **Every font-size in the system is a `--text-*` token.** There were 31
+  ad-hoc sizes across 17 distinct values crammed between 0.65rem and 1.15rem,
+  with a cliff up to a 4.8rem `h1` — no middle register and a floor below
+  comfortable reading. The ramp is eight steps off a 14px body. If you add a
+  size, add it to the ramp; don't inline one.
+- **Mint means interactive or positive. Nothing else.** It previously coloured
+  eyebrows, `code` spans, links, buttons, badges, the brand, timeline dots and
+  the progress fill at once, which is why the page read as noisy. Structural
+  labels are `--faint`; `code` is `--muted` on a `--surface-nested` tint; only
+  the newest timeline dot carries the accent.
+- **One border level.** `Panel` draws the frame; anything nested inside it
+  (`attempt-card`, `evaluation-panel`, `revision-item`, `recommendation-card`)
+  separates by `--surface-nested` tint instead. Borders that remain are
+  affordances (inputs, pills, the video frame) or semantic (notice, confirm).
+- **Never size a component grid with a viewport media query.** `FactList` and
+  `EvaluationPanel`'s check rows collapsed on `@media (max-width: 760px)`,
+  which is meaningless inside a 320px card — raising the label size made the
+  four-column grid collide immediately. Both now use `repeat(auto-fit,
+  minmax(...))` / flex-wrap so they respond to their own width. This is the
+  same reason the ComfyUI side panel needs a density mode rather than the
+  phone breakpoint.
+- `humanize()` now splits on `.` as well as `_` and `-`; durable event types
+  arrive dotted (`evaluation.completed`) and were rendering as
+  "Evaluation.Completed".
+
 ## Known render warns
 
 None. The final validate exits 0 with no warnings. If a warn appears on a

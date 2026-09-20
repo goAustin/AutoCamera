@@ -27,8 +27,11 @@ body {
   min-width: 320px;
   min-height: 100vh;
   background:
-    radial-gradient(circle at 8% 0%, rgb(53 130 116 / 18%), transparent 30rem),
-    radial-gradient(circle at 95% 35%, rgb(68 76 148 / 14%), transparent 34rem),
+    radial-gradient(
+      ellipse 80% 50% at 50% 0%,
+      rgb(53 130 116 / 10%),
+      transparent
+    ),
     var(--canvas);
 }
 
@@ -52,23 +55,23 @@ h4 {
 }
 
 h1 {
-  font-size: clamp(2.25rem, 5vw, 4.8rem);
-  line-height: 0.98;
+  font-size: var(--text-display);
+  line-height: 1.05;
   margin-bottom: 1rem;
 }
 
 h2 {
-  font-size: clamp(1.55rem, 3vw, 2.4rem);
+  font-size: var(--text-heading);
   margin-bottom: 0;
 }
 
 h3 {
-  font-size: 1.15rem;
+  font-size: var(--text-heading);
   margin-bottom: 0.85rem;
 }
 
 h4 {
-  font-size: 1rem;
+  font-size: var(--text-subhead);
   margin-bottom: 0;
 }
 
@@ -87,7 +90,7 @@ iframe:focus-visible {
   border: 1px solid rgb(246 203 123 / 45%);
   border-radius: 999px;
   color: var(--gold);
-  font-size: 0.72rem;
+  font-size: var(--text-label);
   font-weight: 700;
   white-space: nowrap;
 }
@@ -104,16 +107,16 @@ iframe:focus-visible {
 }
 
 .managed-panel h1 {
-  font-size: 1.45rem;
+  font-size: var(--text-title);
   margin-bottom: 0.4rem;
 }
 
 .managed-panel h2 {
-  font-size: 1.1rem;
+  font-size: var(--text-subhead);
 }
 
 .managed-panel h3 {
-  font-size: 0.95rem;
+  font-size: var(--text-lead);
   margin-bottom: 0.5rem;
 }
 
@@ -125,7 +128,7 @@ iframe:focus-visible {
 .managed-panel > .notice {
   margin-top: 0;
   padding: 0.55rem;
-  font-size: 0.72rem;
+  font-size: var(--text-small);
 }
 
 .managed-panel-header {
@@ -140,7 +143,7 @@ iframe:focus-visible {
 .managed-panel-lede {
   margin: 0;
   color: var(--muted);
-  font-size: 0.78rem;
+  font-size: var(--text-small);
   line-height: 1.5;
 }
 
@@ -167,7 +170,7 @@ iframe:focus-visible {
 
 .managed-empty p {
   color: var(--muted);
-  font-size: 0.78rem;
+  font-size: var(--text-small);
   line-height: 1.5;
 }
 
@@ -206,9 +209,9 @@ iframe:focus-visible {
   gap: 0.6rem;
   width: 100%;
   padding: 0.6rem 0.7rem;
-  border: 1px solid var(--line);
+  border: 1px solid transparent;
   border-radius: 0.7rem;
-  background: rgb(4 13 16 / 35%);
+  background: var(--surface-nested);
   color: inherit;
   cursor: pointer;
   text-align: left;
@@ -226,12 +229,12 @@ iframe:focus-visible {
 }
 
 .managed-run-item strong {
-  font-size: 0.74rem;
+  font-size: var(--text-small);
 }
 
 .managed-run-item small {
   color: var(--faint);
-  font-size: 0.65rem;
+  font-size: var(--text-label);
 }
 
 .managed-facts {
@@ -241,23 +244,24 @@ iframe:focus-visible {
 }
 
 .managed-facts > div {
-  display: flex;
-  justify-content: space-between;
-  gap: 0.75rem;
-  padding-bottom: 0.35rem;
+  display: grid;
+  gap: 0.15rem;
+  padding-bottom: 0.4rem;
   border-bottom: 1px solid var(--line);
 }
 
 .managed-facts dt {
   color: var(--faint);
-  font-size: 0.65rem;
+  font-size: var(--text-label);
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
 }
 
 .managed-facts dd {
   margin: 0;
   color: var(--ink);
-  font-size: 0.68rem;
-  text-align: right;
+  font-size: var(--text-small);
   overflow-wrap: anywhere;
 }
 
@@ -278,13 +282,13 @@ iframe:focus-visible {
 .managed-subsection textarea {
   min-height: 4rem;
   padding: 0.55rem;
-  font-size: 0.72rem;
+  font-size: var(--text-small);
 }
 
 .failure-line,
 .trace-line {
   margin-bottom: 0;
-  font-size: 0.7rem;
+  font-size: var(--text-label);
   overflow-wrap: anywhere;
 }
 
@@ -293,12 +297,12 @@ iframe:focus-visible {
 }
 
 .trace-line {
-  color: var(--mint);
+  color: var(--muted);
 }
 
 .live-chip {
-  color: var(--mint);
-  font-size: 0.62rem;
+  color: var(--faint);
+  font-size: var(--text-micro);
   font-weight: 800;
   letter-spacing: 0.08em;
   text-transform: uppercase;
@@ -311,11 +315,5 @@ iframe:focus-visible {
 
   .managed-panel-grid {
     grid-template-columns: minmax(190px, 0.8fr) minmax(0, 1.2fr);
-  }
-}
-
-@media (max-width: 520px) {
-  h1 {
-    font-size: 2.5rem;
   }
 }

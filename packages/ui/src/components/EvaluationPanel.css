@@ -2,9 +2,8 @@
   display: grid;
   gap: 0.8rem;
   padding: 0.9rem;
-  border: 1px solid var(--line);
   border-radius: 0.75rem;
-  background: rgb(255 255 255 / 2%);
+  background: var(--surface-nested);
 }
 
 .evaluation-heading {
@@ -19,25 +18,22 @@
   gap: 0.45rem;
 }
 
+/* Same reason as FactList: wrap on the row's own width, not the window's.
+   Name and verdict stay together; the detail drops to its own line when tight. */
 .check-row {
-  display: grid;
-  grid-template-columns: minmax(120px, 0.7fr) auto minmax(0, 1.5fr);
+  display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 0.6rem;
+  gap: 0.3rem 0.6rem;
   color: var(--muted);
-  font-size: 0.74rem;
+  font-size: var(--text-small);
+}
+
+.check-row > :first-child {
+  flex: 1 1 7rem;
 }
 
 .check-row small {
+  flex: 1 1 11rem;
   color: var(--faint);
-}
-
-@media (max-width: 760px) {
-  .check-row {
-    grid-template-columns: minmax(0, 1fr) auto;
-  }
-
-  .check-row small {
-    grid-column: 1 / -1;
-  }
 }

@@ -27,7 +27,7 @@
 .auth-card h1 {
   margin-top: 0;
   margin-bottom: 1rem;
-  font-size: clamp(2.25rem, 5vw, 4.8rem);
+  font-size: var(--text-display);
   line-height: 0.98;
   letter-spacing: -0.04em;
 }
@@ -43,5 +43,5 @@
 
 .field-error {
   color: var(--coral);
-  font-size: 0.78rem;
+  font-size: var(--text-small);
 }

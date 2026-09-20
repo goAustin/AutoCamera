@@ -10,9 +10,8 @@
   display: grid;
   gap: 0.6rem;
   padding: 0.85rem;
-  border: 1px solid var(--line);
   border-radius: 0.8rem;
-  background: rgb(4 13 16 / 35%);
+  background: var(--surface-nested);
 }
 
 .revision-item--selected {
@@ -32,7 +31,7 @@
   flex-wrap: wrap;
   gap: 0.7rem;
   color: var(--faint);
-  font-size: 0.7rem;
+  font-size: var(--text-label);
 }
 
 .validation-list {
@@ -41,6 +40,6 @@
   margin: 0;
   padding-left: 1.1rem;
   color: var(--coral);
-  font-size: 0.76rem;
+  font-size: var(--text-small);
   line-height: 1.4;
 }

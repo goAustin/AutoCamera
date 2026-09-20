@@ -14,6 +14,23 @@
   --coral: #ff987e;
   --gold: #f6cb7b;
   --shadow: 0 24px 80px rgb(0 0 0 / 28%);
+
+  /* Nested surfaces. A group inside a panel separates by tint, not by another
+     border — hairlines nested three deep read as noise at this density. */
+  --surface-nested: rgb(255 255 255 / 4%);
+  --surface-nested-strong: rgb(255 255 255 / 7%);
+
+  /* The type ramp. Eight steps from a 14px body on roughly a 1.2 scale.
+     Nothing in the system sets a font-size that is not one of these. */
+  --text-micro: 0.6875rem;
+  --text-label: 0.75rem;
+  --text-small: 0.8125rem;
+  --text-body: 0.875rem;
+  --text-lead: 1rem;
+  --text-subhead: 1.125rem;
+  --text-heading: 1.375rem;
+  --text-title: 1.75rem;
+  --text-display: clamp(2rem, 4vw, 3rem);
 }
 
 @keyframes spin {
