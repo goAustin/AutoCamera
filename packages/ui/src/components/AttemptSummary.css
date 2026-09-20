@@ -1,0 +1,53 @@
+.attempt-card {
+  display: grid;
+  gap: 0.9rem;
+  padding: 1rem;
+  border: 1px solid var(--line);
+  border-radius: 0.9rem;
+  background: rgb(4 13 16 / 42%);
+}
+
+.attempt-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.attempt-heading .section-kicker {
+  display: block;
+  margin-bottom: 0.35rem;
+}
+
+.attempt-heading h4 {
+  margin: 0;
+  font-size: 1rem;
+  letter-spacing: -0.04em;
+}
+
+.failure-copy {
+  margin: 0;
+  color: var(--coral);
+  font-size: 0.86rem;
+  line-height: 1.55;
+}
+
+.attempt-actions {
+  justify-content: flex-end;
+}
+
+.inline-form {
+  display: grid;
+  gap: 0.62rem;
+  max-width: 360px;
+  padding: 0.8rem;
+  border: 1px solid rgb(255 152 126 / 30%);
+  border-radius: 0.75rem;
+  background: rgb(255 152 126 / 5%);
+}
+
+@media (max-width: 520px) {
+  .attempt-actions .button {
+    flex: 1 1 auto;
+  }
+}

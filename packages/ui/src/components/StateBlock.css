@@ -1,0 +1,28 @@
+.loading-state,
+.empty-state {
+  display: grid;
+  place-items: center;
+  gap: 0.45rem;
+  min-height: 8rem;
+  color: var(--muted);
+  text-align: center;
+}
+
+.empty-state strong {
+  color: var(--ink);
+}
+
+.empty-state span {
+  max-width: 34ch;
+  font-size: 0.78rem;
+  line-height: 1.45;
+}
+
+.spinner {
+  width: 1rem;
+  height: 1rem;
+  border: 2px solid rgb(139 224 195 / 25%);
+  border-top-color: var(--mint);
+  border-radius: 50%;
+  animation: spin 850ms linear infinite;
+}

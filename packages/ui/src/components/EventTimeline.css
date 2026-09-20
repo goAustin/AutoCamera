@@ -1,0 +1,60 @@
+.timeline-list {
+  display: grid;
+  gap: 0;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.timeline-list li {
+  position: relative;
+  display: grid;
+  grid-template-columns: 1rem minmax(0, 1fr);
+  gap: 0.7rem;
+  min-height: 3.2rem;
+}
+
+/* The connector spans whatever height the row turns out to be. A fixed
+   height breaks the trail as soon as an event carries a detail line. */
+.timeline-list li:not(:last-child)::before {
+  position: absolute;
+  top: 0.85rem;
+  left: 0.25rem;
+  width: 1px;
+  height: calc(100% - 0.85rem);
+  background: var(--line-strong);
+  content: "";
+}
+
+.timeline-dot {
+  position: relative;
+  display: block;
+  width: 0.55rem;
+  height: 0.55rem;
+  margin-top: 0.3rem;
+  border: 2px solid var(--mint);
+  border-radius: 50%;
+}
+
+.timeline-list strong,
+.timeline-list small,
+.timeline-detail {
+  display: block;
+}
+
+.timeline-list strong {
+  color: var(--ink);
+  font-size: 0.78rem;
+}
+
+.timeline-list small,
+.timeline-detail {
+  margin-top: 0.18rem;
+  color: var(--faint);
+  font-size: 0.68rem;
+  line-height: 1.4;
+}
+
+.timeline-detail {
+  color: var(--muted);
+}

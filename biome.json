@@ -9,7 +9,10 @@
       "!**/.data",
       "!**/.git",
       "!**/test-results",
-      "!**/playwright-report"
+      "!**/playwright-report",
+      "!**/.ds-sync",
+      "!**/ds-bundle",
+      "!**/.design-sync"
     ]
   },
   "formatter": {

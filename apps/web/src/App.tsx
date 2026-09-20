@@ -1,5 +1,4 @@
 import {
-  type FormEvent,
   type ReactElement,
   type ReactNode,
   useCallback,
@@ -10,6 +9,29 @@ import {
 } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Link, Navigate, Route, Routes } from 'react-router-dom';
+import {
+  AppShell,
+  ArtifactPlayer,
+  AttemptSummary,
+  Button,
+  ConfirmPanel,
+  EmptyState,
+  ErrorNotice as UiErrorNotice,
+  EvaluationPanel,
+  type EvaluationView,
+  EventTimeline as UiEventTimeline,
+  formatDate,
+  formatMoney,
+  humanize,
+  LoadingState,
+  Notice,
+  RecommendationList,
+  type RecommendationView,
+  RevisionHistory,
+  StatusBadge,
+  type TimelineEvent,
+  TokenGate,
+} from '@h3/ui';
 import {
   acceptAttempt,
   applyRecommendation,
@@ -85,32 +107,6 @@ function forgetToken(): void {
   }
 }
 
-function humanize(value: string): string {
-  return value
-    .replaceAll('_', ' ')
-    .replaceAll('-', ' ')
-    .replace(/\b\w/g, (character) => character.toUpperCase());
-}
-
-function formatDate(value: string): string {
-  const date = new Date(value);
-  return Number.isFinite(date.getTime())
-    ? new Intl.DateTimeFormat(undefined, {
-        dateStyle: 'medium',
-        timeStyle: 'short',
-      }).format(date)
-    : value;
-}
-
-function formatDuration(value: number): string {
-  return `${value.toFixed(value % 1 === 0 ? 0 : 2)}s`;
-}
-
-function formatMoney(value: string | number): string {
-  const text = typeof value === 'number' ? value.toFixed(2) : value;
-  return `$${text}`;
-}
-
 function errorText(error: unknown): string {
   if (error instanceof ApiError) {
     return `${error.message}${error.code ? ` (${error.code})` : ''}`;
@@ -123,63 +119,35 @@ function errorTrace(error: unknown): string | undefined {
   return error instanceof ApiError ? error.traceId : undefined;
 }
 
-function statusClass(status: string): string {
-  if (
-    status === 'accepted' ||
-    status === 'completed' ||
-    status === 'validated' ||
-    status === 'passed' ||
-    status === 'ok'
-  ) {
-    return 'status-badge status-badge--positive';
+function progressForAttempt(
+  events: readonly ProjectEvent[],
+  attemptId: string,
+): { readonly value: number; readonly max: number } | undefined {
+  let current: { readonly value: number; readonly max: number } | undefined;
+  for (const event of events) {
+    if (event.attemptId !== attemptId) continue;
+    const value = event.payload.value;
+    const max = event.payload.max;
+    if (typeof value === 'number' && typeof max === 'number' && max > 0)
+      current = { value, max };
   }
-  if (
-    status === 'failed' ||
-    status === 'timed_out' ||
-    status === 'invalid' ||
-    status === 'critical' ||
-    status === 'needs_attention'
-  ) {
-    return 'status-badge status-badge--negative';
-  }
-  if (
-    status === 'queued' ||
-    status === 'running' ||
-    status === 'generating' ||
-    status === 'planning' ||
-    status === 'evaluating'
-  ) {
-    return 'status-badge status-badge--active';
-  }
-  return 'status-badge';
+  return current;
 }
 
-function StatusBadge({ status }: { readonly status: string }): ReactElement {
-  return <span className={statusClass(status)}>{humanize(status)}</span>;
-}
-
+/** Adapts an unknown thrown value onto the design system's error presentation. */
 function ErrorNotice({
   error,
   onRetry,
 }: {
   readonly error: unknown;
-  readonly onRetry?: () => void;
+  readonly onRetry?: (() => void) | undefined;
 }): ReactElement {
-  const traceId = errorTrace(error);
   return (
-    <div className="notice notice--error" role="alert">
-      <strong>{errorText(error)}</strong>
-      {traceId && <span>Trace {traceId}</span>}
-      {onRetry && (
-        <button
-          className="button button--quiet"
-          type="button"
-          onClick={onRetry}
-        >
-          Try again
-        </button>
-      )}
-    </div>
+    <UiErrorNotice
+      message={errorText(error)}
+      traceId={errorTrace(error)}
+      onRetry={onRetry}
+    />
   );
 }
 
@@ -188,315 +156,14 @@ function InfoNotice({
 }: {
   readonly children: ReactNode;
 }): ReactElement {
-  return <div className="notice notice--info">{children}</div>;
+  return <Notice variant="info">{children}</Notice>;
 }
 
-function ConfirmPanel({
-  title,
-  detail,
-  confirmLabel,
-  onConfirm,
-  onCancel,
-  busy = false,
-}: {
-  readonly title: string;
-  readonly detail: string;
-  readonly confirmLabel: string;
-  readonly onConfirm: () => void;
-  readonly onCancel: () => void;
-  readonly busy?: boolean;
-}): ReactElement {
-  return (
-    <div className="confirm-panel" role="alertdialog" aria-label={title}>
-      <strong>{title}</strong>
-      <p>{detail}</p>
-      <div className="button-row">
-        <button
-          className="button button--quiet"
-          type="button"
-          onClick={onCancel}
-          disabled={busy}
-        >
-          Cancel
-        </button>
-        <button
-          className="button button--primary"
-          type="button"
-          onClick={onConfirm}
-          disabled={busy}
-        >
-          {busy ? 'Working…' : confirmLabel}
-        </button>
-      </div>
-    </div>
-  );
-}
-
-function TokenGate({
-  onAuthenticated,
-  embedded = false,
-}: {
-  readonly onAuthenticated: (token: string) => void;
-  readonly embedded?: boolean;
-}): ReactElement {
-  const [value, setValue] = useState('');
-  const [error, setError] = useState<string | undefined>();
-  const submit = (event: FormEvent<HTMLFormElement>): void => {
-    event.preventDefault();
-    const token = value.trim();
-    if (!token) {
-      setError('Enter the local development bearer token to continue.');
-      return;
-    }
-    rememberToken(token);
-    onAuthenticated(token);
-  };
-
-  return (
-    <main
-      className={embedded ? 'auth-shell auth-shell--embedded' : 'auth-shell'}
-    >
-      <section className="auth-card" aria-labelledby="auth-title">
-        <p className="eyebrow">
-          {embedded
-            ? 'VIDEOOPS MANAGED RUN PANEL'
-            : 'AUTHENTICATED PROJECT STUDIO'}
-        </p>
-        <h1 id="auth-title">
-          {embedded ? 'Connect this panel.' : 'Connect this studio.'}
-        </h1>
-        <p className="lede">
-          This local studio uses a development bearer token. It is held only in
-          this Studio-origin browser session and is never passed to the ComfyUI
-          origin.
-        </p>
-        <form className="stack-form" onSubmit={submit}>
-          <label htmlFor="dev-token">Development token</label>
-          <input
-            id="dev-token"
-            type="password"
-            autoComplete="off"
-            value={value}
-            onChange={(event) => setValue(event.target.value)}
-            placeholder="DEV_AUTH_TOKEN"
-            aria-describedby={error ? 'token-error' : undefined}
-          />
-          {error && (
-            <span id="token-error" className="field-error">
-              {error}
-            </span>
-          )}
-          <button className="button button--primary" type="submit">
-            {embedded ? 'Connect VideoOps' : 'Enter Project Studio'}
-          </button>
-        </form>
-      </section>
-    </main>
-  );
-}
-
-function AppShell({
-  onSignOut,
-  children,
-}: {
-  readonly onSignOut: () => void;
-  readonly children: ReactElement;
-}): ReactElement {
-  return (
-    <div className="app-frame">
-      <header className="app-header">
-        <Link className="brand" to="/" aria-label="H3 VideoOps home">
-          <span className="brand-mark" aria-hidden="true">
-            H3
-          </span>
-          <span>
-            <strong>VideoOps</strong>
-            <small>Project Studio</small>
-          </span>
-        </Link>
-        <div className="header-actions">
-          <span className="header-mode">Local development</span>
-          <button
-            className="button button--quiet"
-            type="button"
-            onClick={onSignOut}
-          >
-            Sign out
-          </button>
-        </div>
-      </header>
-      {children}
-    </div>
-  );
-}
-
-function LoadingState({ label }: { readonly label: string }): ReactElement {
-  return (
-    <div className="loading-state" role="status">
-      <span className="spinner" aria-hidden="true" />
-      {label}
-    </div>
-  );
-}
-
-function EmptyState({
-  title,
-  detail,
-}: {
-  readonly title: string;
-  readonly detail: string;
-}): ReactElement {
-  return (
-    <div className="empty-state">
-      <strong>{title}</strong>
-      <span>{detail}</span>
-    </div>
-  );
-}
-
-function RevisionHistory({
-  revisions,
-  selectedRevisionId,
-  onUse,
-  onValidate,
-  validatingId,
-}: {
-  readonly revisions: readonly Omit<WorkflowRevision, 'shotId'>[];
-  readonly selectedRevisionId?: string | undefined;
-  readonly onUse?: (revision: Omit<WorkflowRevision, 'shotId'>) => void;
-  readonly onValidate: (revision: Omit<WorkflowRevision, 'shotId'>) => void;
-  readonly validatingId?: string | undefined;
-}): ReactElement {
-  return (
-    <section className="panel" aria-labelledby="revision-history-title">
-      <div className="panel-heading">
-        <div>
-          <span className="section-kicker">IMMUTABLE HISTORY</span>
-          <h3 id="revision-history-title">Workflow revisions</h3>
-        </div>
-        <span className="count-badge">{revisions.length}</span>
-      </div>
-      {revisions.length === 0 && (
-        <EmptyState
-          title="No revisions yet"
-          detail="Create a revision after saving or exporting a draft."
-        />
-      )}
-      {revisions.length > 0 && (
-        <ol className="revision-list">
-          {revisions.map((revision) => (
-            <li
-              className={
-                revision.id === selectedRevisionId
-                  ? 'revision-item revision-item--selected'
-                  : 'revision-item'
-              }
-              key={revision.id}
-            >
-              <div className="revision-heading">
-                <strong>Revision {revision.revisionNumber}</strong>
-                <StatusBadge status={revision.validationStatus} />
-              </div>
-              <div className="revision-meta">
-                <span>{revision.source}</span>
-                <span>{formatDate(revision.createdAt)}</span>
-              </div>
-              <code title={revision.executionHash}>
-                {revision.executionHash.slice(0, 16)}…
-              </code>
-              {revision.parentRevisionId && (
-                <span className="muted">
-                  Parent {revision.parentRevisionId.slice(0, 8)}…
-                </span>
-              )}
-              {revision.validationErrors.length > 0 && (
-                <ul className="validation-list">
-                  {revision.validationErrors.map((issue) => (
-                    <li key={`${issue.code}-${issue.message}`}>
-                      <strong>{issue.code}</strong> {issue.message}
-                    </li>
-                  ))}
-                </ul>
-              )}
-              <div className="button-row">
-                {onUse && (
-                  <button
-                    className="button button--quiet"
-                    type="button"
-                    onClick={() => onUse(revision)}
-                  >
-                    Use revision
-                  </button>
-                )}
-                {revision.validationStatus !== 'validated' && (
-                  <button
-                    className="button button--quiet"
-                    type="button"
-                    onClick={() => onValidate(revision)}
-                    disabled={validatingId === revision.id}
-                  >
-                    {validatingId === revision.id
-                      ? 'Validating…'
-                      : 'Validate again'}
-                  </button>
-                )}
-              </div>
-            </li>
-          ))}
-        </ol>
-      )}
-    </section>
-  );
-}
-
-function EvaluationPanel({
-  evaluation,
-}: {
-  readonly evaluation: Evaluation | undefined;
-}): ReactElement {
-  if (!evaluation)
-    return (
-      <InfoNotice>
-        Technical evaluation is not available yet. The worker will add it after
-        artifact ingestion.
-      </InfoNotice>
-    );
-  return (
-    <div className="evaluation-panel">
-      <div className="evaluation-heading">
-        <strong>Technical evaluation</strong>
-        <StatusBadge status={evaluation.status} />
-      </div>
-      <div className="check-grid">
-        {Object.entries(evaluation.checks).map(([name, check]) => (
-          <div className="check-row" key={name}>
-            <span>{humanize(name)}</span>
-            <StatusBadge status={check.status} />
-            <small>{check.detail}</small>
-          </div>
-        ))}
-      </div>
-      <dl className="compact-details compact-details--horizontal">
-        {Object.entries(evaluation.details)
-          .filter(([, value]) =>
-            ['string', 'number', 'boolean'].includes(typeof value),
-          )
-          .map(([name, value]) => (
-            <div key={name}>
-              <dt>{humanize(name)}</dt>
-              <dd>{String(value)}</dd>
-            </div>
-          ))}
-      </dl>
-      <small className="muted">
-        Evaluator {evaluation.evaluatorVersion} ·{' '}
-        {formatDate(evaluation.evaluatedAt)}
-      </small>
-    </div>
-  );
-}
-
-function ArtifactPlayer({
+/**
+ * Fetches the artifact with the Studio-origin bearer token and hands the
+ * resulting object URL to the player. The token never leaves this layer.
+ */
+function AuthorizedArtifactPlayer({
   token,
   artifactId,
 }: {
@@ -526,26 +193,34 @@ function ArtifactPlayer({
   }, [artifactId, token]);
   if (error) return <ErrorNotice error={error} />;
   if (!source) return <LoadingState label="Loading authorized artifact…" />;
-  return (
-    <video className="artifact-player" controls preload="metadata" src={source}>
-      <track kind="captions" />
-    </video>
-  );
+  return <ArtifactPlayer src={source} />;
 }
 
-function progressForAttempt(
-  events: readonly ProjectEvent[],
-  attemptId: string,
-): { readonly value: number; readonly max: number } | undefined {
-  let current: { readonly value: number; readonly max: number } | undefined;
-  for (const event of events) {
-    if (event.attemptId !== attemptId) continue;
-    const value = event.payload.value;
-    const max = event.payload.max;
-    if (typeof value === 'number' && typeof max === 'number' && max > 0)
-      current = { value, max };
+/**
+ * Narrows an API evaluation onto the presentational shape. Non-primitive
+ * detail values are dropped here rather than inside the design system.
+ */
+function toEvaluationView(
+  evaluation: Evaluation | undefined,
+): EvaluationView | undefined {
+  if (!evaluation) return undefined;
+  const details: Record<string, string | number | boolean> = {};
+  for (const [key, value] of Object.entries(evaluation.details)) {
+    if (
+      typeof value === 'string' ||
+      typeof value === 'number' ||
+      typeof value === 'boolean'
+    ) {
+      details[key] = value;
+    }
   }
-  return current;
+  return {
+    status: evaluation.status,
+    checks: evaluation.checks,
+    details,
+    evaluatorVersion: evaluation.evaluatorVersion,
+    evaluatedAt: evaluation.evaluatedAt,
+  };
 }
 
 function AttemptCard({
@@ -600,76 +275,16 @@ function AttemptCard({
     },
   });
   const progress = progressForAttempt(events, attempt.id);
-  const progressPercent = progress
-    ? Math.min(100, Math.max(0, (progress.value / progress.max) * 100))
-    : undefined;
   const uncertain = attempt.failureCode === 'COMFY_SUBMISSION_UNCERTAIN';
   const evaluation = detail.evaluation;
+
   return (
-    <article className="attempt-card" aria-labelledby={`attempt-${attempt.id}`}>
-      <div className="attempt-heading">
-        <div>
-          <span className="section-kicker">ATTEMPT</span>
-          <h4 id={`attempt-${attempt.id}`}>{attempt.id.slice(0, 12)}…</h4>
-        </div>
-        <StatusBadge status={attempt.status} />
-      </div>
-      <dl className="attempt-facts">
-        <div>
-          <dt>Queued</dt>
-          <dd>{formatDate(attempt.queuedAt)}</dd>
-        </div>
-        <div>
-          <dt>Profile hash</dt>
-          <dd>
-            <code>{attempt.workflowHash.slice(0, 12)}…</code>
-          </dd>
-        </div>
-        <div>
-          <dt>Parameters</dt>
-          <dd>
-            {attempt.requestedWidth}×{attempt.requestedHeight} ·{' '}
-            {formatDuration(attempt.requestedDurationSeconds)} · seed{' '}
-            {attempt.seed}
-          </dd>
-        </div>
-        <div>
-          <dt>Cost</dt>
-          <dd>{formatMoney(attempt.estimatedCostUsd)}</dd>
-        </div>
-        {attempt.sourceAttemptId && (
-          <div>
-            <dt>Derived from</dt>
-            <dd>{attempt.sourceAttemptId.slice(0, 12)}…</dd>
-          </div>
-        )}
-        {attempt.failureCode && (
-          <div>
-            <dt>Failure</dt>
-            <dd>{attempt.failureCode}</dd>
-          </div>
-        )}
-      </dl>
-      {progressPercent !== undefined && (
-        <div
-          className="progress-block"
-          role="progressbar"
-          aria-label={`Progress ${Math.round(progressPercent)} percent`}
-          aria-valuemin={0}
-          aria-valuemax={100}
-          aria-valuenow={Math.round(progressPercent)}
-        >
-          <div className="progress-track">
-            <span style={{ width: `${progressPercent}%` }} />
-          </div>
-          <span>{Math.round(progressPercent)}% · worker event stream</span>
-        </div>
-      )}
-      {attempt.failureMessage && (
-        <p className="failure-copy">{attempt.failureMessage}</p>
-      )}
+    <AttemptSummary attempt={attempt} progress={progress}>
       {attempt.artifactId && (
-        <ArtifactPlayer token={token} artifactId={attempt.artifactId} />
+        <AuthorizedArtifactPlayer
+          token={token}
+          artifactId={attempt.artifactId}
+        />
       )}
       {detailQuery.isError && (
         <ErrorNotice
@@ -677,7 +292,7 @@ function AttemptCard({
           onRetry={() => void detailQuery.refetch()}
         />
       )}
-      <EvaluationPanel evaluation={evaluation} />
+      <EvaluationPanel evaluation={toEvaluationView(evaluation)} />
       {reviewMutation.isError && <ErrorNotice error={reviewMutation.error} />}
       {retryMutation.isError && <ErrorNotice error={retryMutation.error} />}
       {retryOpen && (
@@ -717,58 +332,47 @@ function AttemptCard({
             required
           />
           <div className="button-row">
-            <button
-              className="button button--quiet"
-              type="button"
-              onClick={() => setRejectOpen(false)}
-            >
-              Cancel
-            </button>
-            <button
-              className="button button--danger"
+            <Button onClick={() => setRejectOpen(false)}>Cancel</Button>
+            <Button
+              variant="danger"
               type="submit"
               disabled={reviewMutation.isPending}
             >
               Reject attempt
-            </button>
+            </Button>
           </div>
         </form>
       )}
       <div className="button-row attempt-actions">
         {attempt.status === 'awaiting_review' && (
           <>
-            <button
-              className="button button--primary"
-              type="button"
-              onClick={() => reviewMutation.mutate('accept')}
+            <Button
+              variant="primary"
               disabled={
                 reviewMutation.isPending || evaluation?.status !== 'passed'
               }
+              onClick={() => reviewMutation.mutate('accept')}
             >
               Accept passing attempt
-            </button>
-            <button
-              className="button button--quiet"
-              type="button"
-              onClick={() => setRejectOpen(true)}
+            </Button>
+            <Button
               disabled={reviewMutation.isPending}
+              onClick={() => setRejectOpen(true)}
             >
               Reject
-            </button>
+            </Button>
           </>
         )}
         {RETRYABLE_ATTEMPT_STATUSES.has(attempt.status) && (
-          <button
-            className="button button--quiet"
-            type="button"
-            onClick={() => setRetryOpen(true)}
+          <Button
             disabled={retryMutation.isPending}
+            onClick={() => setRetryOpen(true)}
           >
             Retry with confirmation
-          </button>
+          </Button>
         )}
       </div>
-    </article>
+    </AttemptSummary>
   );
 }
 
@@ -810,39 +414,40 @@ function RecommendationPanel({
   const pending = recommendations.filter(
     (recommendation) => recommendation.status === 'pending',
   );
+  const byId = new Map(pending.map((item) => [item.id, item]));
+  const views: RecommendationView[] = pending.map((recommendation) => ({
+    id: recommendation.id,
+    severity: recommendation.severity,
+    title: recommendation.title,
+    detail: recommendation.detail,
+    recommendationCode: recommendation.recommendationCode,
+    proposedAction: humanize(recommendation.proposedActionType),
+  }));
+
   return (
-    <section className="panel" aria-labelledby="recommendations-title">
-      <div className="panel-heading">
-        <div>
-          <span className="section-kicker">OPERATIONS / PI</span>
-          <h3 id="recommendations-title">Recommendations</h3>
-        </div>
-        <span className="count-badge">{pending.length}</span>
-      </div>
-      <p className="panel-intro">
-        Pi receives sanitized VideoOps evidence and proposes bounded actions. A
-        human must apply or dismiss each recommendation.
-      </p>
-      {pending.length === 0 && (
-        <EmptyState
-          title="No pending recommendations"
-          detail="Operational signals will appear here when the durable event loop needs attention."
-        />
-      )}
-      <ul className="recommendation-list">
-        {pending.map((recommendation) => (
-          <li className="recommendation-card" key={recommendation.id}>
-            <div className="recommendation-heading">
-              <StatusBadge status={recommendation.severity} />
-              <strong>{recommendation.title}</strong>
-            </div>
-            <p>{recommendation.detail}</p>
-            <div className="recommendation-meta">
-              <span>{recommendation.recommendationCode}</span>
-              <span>Action: {humanize(recommendation.proposedActionType)}</span>
-            </div>
-            {confirmId === recommendation.id &&
-              recommendation.proposedActionType === 'retry_attempt' && (
+    <RecommendationList
+      recommendations={views}
+      isApplying={() => applyMutation.isPending}
+      isDismissing={() => dismissMutation.isPending}
+      onApply={(view) => {
+        const recommendation = byId.get(view.id);
+        if (!recommendation) return;
+        if (recommendation.proposedActionType === 'retry_attempt') {
+          setConfirmId(recommendation.id);
+          return;
+        }
+        applyMutation.mutate(recommendation);
+      }}
+      onDismiss={(view) => {
+        const recommendation = byId.get(view.id);
+        if (recommendation) dismissMutation.mutate(recommendation);
+      }}
+      renderExtra={(view) => {
+        const recommendation = byId.get(view.id);
+        return (
+          <>
+            {confirmId === view.id &&
+              recommendation?.proposedActionType === 'retry_attempt' && (
                 <ConfirmPanel
                   title="Apply a budget-spending recommendation?"
                   detail="This human-approved action will create a derived retry after the server rechecks scope, limits, budget, workflow validation, and executor capability."
@@ -858,107 +463,67 @@ function RecommendationPanel({
             {dismissMutation.isError && (
               <ErrorNotice error={dismissMutation.error} />
             )}
-            <div className="button-row">
-              <button
-                className="button button--primary"
-                type="button"
-                onClick={() =>
-                  recommendation.proposedActionType === 'retry_attempt'
-                    ? setConfirmId(recommendation.id)
-                    : applyMutation.mutate(recommendation)
-                }
-                disabled={applyMutation.isPending}
-              >
-                Apply recommendation
-              </button>
-              <button
-                className="button button--quiet"
-                type="button"
-                onClick={() => dismissMutation.mutate(recommendation)}
-                disabled={dismissMutation.isPending}
-              >
-                Dismiss
-              </button>
-            </div>
-          </li>
-        ))}
-      </ul>
-    </section>
+          </>
+        );
+      }}
+    />
   );
 }
+
+/**
+ * Payload keys safe to render on the timeline. Anything outside this set is
+ * dropped before the event reaches the design system, which renders whatever
+ * string it is handed.
+ */
+const TIMELINE_SAFE_PAYLOAD_KEYS = new Set([
+  'status',
+  'code',
+  'recoverable',
+  'value',
+  'max',
+  'artifactId',
+  'evaluationId',
+  'reasonCode',
+  'workflowRevisionId',
+  'sourceAttemptId',
+  'estimatedCostMicrousd',
+  'acceptedShotCount',
+  'shotCount',
+  'ordinal',
+]);
 
 function EventTimeline({
   events,
 }: {
   readonly events: readonly ProjectEvent[];
 }): ReactElement {
-  const safePayloadKeys = new Set([
-    'status',
-    'code',
-    'recoverable',
-    'value',
-    'max',
-    'artifactId',
-    'evaluationId',
-    'reasonCode',
-    'workflowRevisionId',
-    'sourceAttemptId',
-    'estimatedCostMicrousd',
-    'acceptedShotCount',
-    'shotCount',
-    'ordinal',
-  ]);
-  const recent = events.slice(-24).reverse();
+  const recent: TimelineEvent[] = events
+    .slice(-24)
+    .reverse()
+    .map((event) => {
+      const details = Object.entries(event.payload)
+        .filter(
+          ([key, value]) =>
+            TIMELINE_SAFE_PAYLOAD_KEYS.has(key) &&
+            ['string', 'number', 'boolean'].includes(typeof value),
+        )
+        .map(([key, value]) => `${humanize(key)}: ${String(value)}`)
+        .join(' · ');
+      return {
+        id: `${event.id}-${event.eventSequence ?? ''}`,
+        title: humanize(event.type),
+        timestamp: event.occurredAt,
+        sequence: event.eventSequence,
+        detail: details || undefined,
+      };
+    });
+
   return (
-    <section className="panel" aria-labelledby="timeline-title">
-      <div className="panel-heading">
-        <div>
-          <span className="section-kicker">DURABLE EVENTS / SSE</span>
-          <h3 id="timeline-title">Project timeline</h3>
-        </div>
-        <span className="count-badge">{events.length}</span>
-      </div>
-      <p className="panel-intro">
-        The stream is an update signal; refresh recovery always rebuilds from
-        REST state.
-      </p>
-      {recent.length === 0 && (
-        <EmptyState
-          title="Timeline is quiet"
-          detail="Project and worker events will be recorded here."
-        />
-      )}
-      <ol className="timeline-list">
-        {recent.map((event) => {
-          const details = Object.entries(event.payload).filter(
-            ([key, value]) =>
-              safePayloadKeys.has(key) &&
-              ['string', 'number', 'boolean'].includes(typeof value),
-          );
-          return (
-            <li key={`${event.id}-${event.eventSequence ?? ''}`}>
-              <span className="timeline-dot" aria-hidden="true" />
-              <div>
-                <strong>{humanize(event.type)}</strong>
-                <small>
-                  {formatDate(event.occurredAt)}
-                  {event.eventSequence ? ` · #${event.eventSequence}` : ''}
-                </small>
-                {details.length > 0 && (
-                  <span className="timeline-detail">
-                    {details
-                      .map(
-                        ([key, value]) => `${humanize(key)}: ${String(value)}`,
-                      )
-                      .join(' · ')}
-                  </span>
-                )}
-              </div>
-            </li>
-          );
-        })}
-      </ol>
-    </section>
+    <UiEventTimeline
+      events={recent}
+      totalCount={events.length}
+      intro="The stream is an update signal; refresh recovery always rebuilds from REST state."
+    />
   );
 }
 
@@ -1863,7 +1428,10 @@ export function App(): ReactElement {
     return (
       <TokenGate
         embedded={managedContext !== null}
-        onAuthenticated={setToken}
+        onSubmit={(value) => {
+          rememberToken(value);
+          setToken(value);
+        }}
       />
     );
   const signOut = (): void => {
@@ -1880,7 +1448,14 @@ export function App(): ReactElement {
       />
     );
   return (
-    <AppShell onSignOut={signOut}>
+    <AppShell
+      onSignOut={signOut}
+      renderHomeLink={(content) => (
+        <Link className="brand" to="/" aria-label="H3 VideoOps home">
+          {content}
+        </Link>
+      )}
+    >
       <Routes>
         <Route path="/" element={<StandaloneRunPage token={token} />} />
         <Route path="*" element={<Navigate to="/" replace />} />

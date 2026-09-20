@@ -1,0 +1,31 @@
+{
+  "pkg": "@h3/ui",
+  "globalName": "VideoOpsUI",
+  "projectId": "727546cc-f957-41ef-8cf7-9897cbdc0777",
+  "shape": "package",
+  "buildCmd": "pnpm --filter @h3/ui build",
+  "cssEntry": "dist/styles.css",
+  "componentSrcMap": {
+    "ErrorNotice": "src/components/Notice.tsx",
+    "EmptyState": "src/components/StateBlock.tsx",
+    "LoadingState": "src/components/StateBlock.tsx",
+    "RecommendationList": "src/components/RecommendationCard.tsx"
+  },
+  "readmeHeader": ".design-sync/conventions.md",
+  "overrides": {
+    "AppShell": {
+      "cardMode": "single",
+      "primaryStory": "Studio",
+      "viewport": "1280x520"
+    },
+    "TokenGate": {
+      "cardMode": "single",
+      "primaryStory": "Studio",
+      "viewport": "1000x760"
+    },
+    "ArtifactPlayer": {
+      "cardMode": "single",
+      "primaryStory": "Generated"
+    }
+  }
+}

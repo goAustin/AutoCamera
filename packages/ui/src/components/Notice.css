@@ -1,0 +1,27 @@
+.notice {
+  display: grid;
+  gap: 0.25rem;
+  margin-top: 0.75rem;
+  padding: 0.8rem 0.9rem;
+  border: 1px solid var(--line);
+  border-radius: 0.7rem;
+  font-size: 0.78rem;
+  line-height: 1.45;
+}
+
+.notice--info {
+  border-color: rgb(139 224 195 / 26%);
+  background: rgb(139 224 195 / 5%);
+  color: var(--muted);
+}
+
+.notice--error {
+  border-color: rgb(255 152 126 / 38%);
+  background: rgb(255 152 126 / 6%);
+  color: var(--coral);
+}
+
+.notice .button {
+  justify-self: start;
+  margin-top: 0.2rem;
+}

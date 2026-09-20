@@ -9,6 +9,7 @@
     "test": "vitest run --config vitest.config.ts"
   },
   "dependencies": {
+    "@h3/ui": "workspace:*",
     "@tanstack/react-query": "5.102.8",
     "react": "19.2.8",
     "react-dom": "19.2.8",

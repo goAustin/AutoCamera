@@ -1,0 +1,8 @@
+.artifact-player {
+  display: block;
+  width: min(100%, 720px);
+  max-height: 420px;
+  border: 1px solid var(--line-strong);
+  border-radius: 0.75rem;
+  background: #000;
+}

@@ -1,0 +1,23 @@
+/* VideoOps design tokens. Every colour, line and shadow in the system
+   resolves to one of these — components never hard-code a hex value. */
+:root {
+  --ink: #eef4f2;
+  --muted: #9cafad;
+  --faint: #6f8583;
+  --line: rgb(178 205 197 / 15%);
+  --line-strong: rgb(178 205 197 / 28%);
+  --panel: rgb(16 31 34 / 92%);
+  --panel-soft: rgb(10 22 25 / 86%);
+  --canvas: #071014;
+  --mint: #8be0c3;
+  --mint-deep: #276f63;
+  --coral: #ff987e;
+  --gold: #f6cb7b;
+  --shadow: 0 24px 80px rgb(0 0 0 / 28%);
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}

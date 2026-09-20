@@ -1,0 +1,20 @@
+/* The VideoOps design system entry point.
+   Everything the components need is reachable from this file's import
+   closure — a consumer that links only this stylesheet is fully styled. */
+@import "./base.css";
+@import "./components/AppShell.css";
+@import "./components/ArtifactPlayer.css";
+@import "./components/AttemptSummary.css";
+@import "./components/Button.css";
+@import "./components/ConfirmPanel.css";
+@import "./components/EvaluationPanel.css";
+@import "./components/EventTimeline.css";
+@import "./components/FactList.css";
+@import "./components/Notice.css";
+@import "./components/Panel.css";
+@import "./components/ProgressBar.css";
+@import "./components/RecommendationCard.css";
+@import "./components/RevisionHistory.css";
+@import "./components/StateBlock.css";
+@import "./components/StatusBadge.css";
+@import "./components/TokenGate.css";
