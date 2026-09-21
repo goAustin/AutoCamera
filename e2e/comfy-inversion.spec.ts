@@ -247,8 +247,12 @@ test.describe('ComfyUI plugin inversion', () => {
     await expect(
       panel.getByRole('button', { name: 'Pin keeper' }),
     ).toBeVisible();
+    // The redesigned run view states the status twice -- once in the sticky
+    // header, once on the attempt itself -- so scope to the attempt card, the
+    // same way the standalone run-view specs do.
+    const attemptCard = panel.locator('.attempt-card');
     await expect(
-      panel.getByText('Awaiting Review', { exact: true }),
+      attemptCard.getByText('Awaiting Review', { exact: true }),
     ).toBeVisible({
       timeout: 30_000,
     });
@@ -269,7 +273,14 @@ test.describe('ComfyUI plugin inversion', () => {
       .getByLabel('Review note')
       .fill('Managed panel review evidence.');
     await panel.getByRole('button', { name: 'Accept annotation' }).click();
-    await expect(panel.getByText('Accepted', { exact: true })).toBeVisible();
+    // The annotation decision is run-level: it lands in the Run panel's
+    // "Review" fact, not on the attempt's status badge.
+    await expect(
+      panel
+        .locator('.fact-list > div')
+        .filter({ hasText: 'Review' })
+        .getByText('Accepted', { exact: true }),
+    ).toBeVisible();
     await panel
       .getByRole('button', { name: 'Load revision in ComfyUI' })
       .click();

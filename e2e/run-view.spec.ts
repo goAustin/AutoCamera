@@ -245,7 +245,9 @@ test.describe('RunView, ported from project-studio.spec.ts', () => {
     // Accept / Reject / Derive retry live in the sticky header now, not
     // inside the attempt card; the reject reason form is a body sibling.
     const detail = selectedRunDetail(page);
-    await detail.getByRole('button', { name: 'Reject' }).click();
+    // Exact: the run-level "Reject annotation" button shares this region
+    // since the redesign moved the attempt actions into the run header.
+    await detail.getByRole('button', { name: 'Reject', exact: true }).click();
     await detail.getByLabel('Review reason code').fill('TOO_DARK');
     await detail.getByRole('button', { name: 'Reject attempt' }).click();
     await expect(card.getByText('Rejected', { exact: true })).toBeVisible();

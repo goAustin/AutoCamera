@@ -91,7 +91,7 @@ origin cannot read the Studio iframe document.
 | Filename | Capture command | Evidence level | What is shown | Secret review |
 |---|---|---|---|---|
 | `assets/screenshots/comfy-frontend/04-videoops-sidebar.png` | `CAPTURE_EVIDENCE=1 pnpm test:e2e e2e/comfy-inversion.spec.ts` | `offline-fake` | ComfyUI graph canvas with the Studio-origin VideoOps sidebar, H3 empty state, and managed-mode badge | Playwright asserts Comfy storage/global credential absence, cross-origin protection, and credential-free iframe URL |
-| `assets/screenshots/comfy-frontend/05-videoops-managed-run.png` | `CAPTURE_EVIDENCE=1 pnpm test:e2e e2e/comfy-inversion.spec.ts` | `offline-fake` | One validated managed run in the sidebar with progress/evaluation and revision controls | same token-isolation assertions; no direct executor submission |
+| `assets/screenshots/comfy-frontend/05-videoops-managed-run.png` | `CAPTURE_EVIDENCE=1 pnpm test:e2e e2e/comfy-inversion.spec.ts` | `offline-fake` | One managed run in the sidebar, grouped under "Needs review" and selected, with the run header's accept/reject actions and the progress stepper in view; evaluation detail and the revision controls sit below the panel fold | same token-isolation assertions; no direct executor submission |
 
 Recorded gate values: `storageHasCredential: false`,
 `globalsHaveCredential: false`, `crossOriginProtected: true`, browser
