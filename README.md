@@ -475,6 +475,7 @@ state.
 - `apps/web` — React/Vite Project Studio
 - `apps/api` — Fastify API, durable worker, Pi operator adapter
 - `apps/fake-comfy` — deterministic ComfyUI HTTP/WebSocket simulator
+- `packages/ui` — presentational component library and design tokens
 - `packages/db` — PostgreSQL schema, migrations, repositories, leases
 - `packages/workflow-compiler` — H3 profile, canonical hashing, validation
 - `packages/comfy-client` — fake and authenticated HTTP/WebSocket contracts

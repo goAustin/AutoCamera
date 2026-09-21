@@ -12,7 +12,8 @@
       "!**/playwright-report",
       "!**/.ds-sync",
       "!**/ds-bundle",
-      "!**/.design-sync"
+      "!**/.design-sync",
+      "!**/docs"
     ]
   },
   "formatter": {

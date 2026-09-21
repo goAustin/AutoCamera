@@ -1,5 +1,70 @@
 # Changelog
 
+## The components were never a library, and nothing was ranked
+
+Eighteen components lived as unexported local functions inside an 1890-line
+`App.tsx`, so there was nothing to hand a design tool and nothing that could be
+restyled as a set. They are now `packages/ui` -- props in, markup out -- and
+`App.tsx` keeps only the wiring: react-query, the bearer token, and the two
+redaction allowlists that decide what a timeline row or an evaluation detail may
+show. Splitting them exposed the defect the single file had been hiding: the
+tokens were declared in the library but applied by the app's own `:root` and
+`body` rules, so the library styled nothing on its own -- previews rendered as
+browser-default black serif text. The ground now lives in the library, on
+`.videoops-surface`, which `AppShell` and `TokenGate` carry and
+`.design-sync/conventions.md` documents as mandatory.
+
+- **Graphite and amber replace the teal system.** A redesign approved in Claude
+  Design replaces the palette wholesale rather than tuning it: canvas drops the
+  teal cast (`#071014` -> `#141414`), amber (`--acc`) becomes the single action
+  and in-flight colour, and mint -- now `--pass` -- means passed, accepted or
+  validated and nothing else. Coral becomes `--fail`, gold folds into `--acc`,
+  `--panel2` replaces `--surface-nested`, card radius drops to 8px and base size
+  to 13.5px. Monospace is new and load-bearing: every id, hash, seed, timestamp
+  and byte count sets `--mono`, which is most of what makes this read as an
+  operations console rather than a form.
+- **Thirty-one ad-hoc font sizes became eight `--text-*` tokens.** Seventeen
+  distinct values were crammed between 0.65rem and 1.15rem with a cliff up to a
+  4.8rem `h1`, so the ramp had no middle register and fact labels sat at 10.4px.
+  Every size is now a token off a readable floor, and the page title sits a step
+  above section headings again.
+- **The run view is a console, not a 2700px scroll to reach the buttons.** The
+  rail is 288px, sticky and full-height, grouping runs under "Needs review - N",
+  "Running - N" and "Recent - N" behind filter tabs, all derived from the
+  `run.status` the API already returns. The detail column gained a sticky header
+  carrying the run's name and Accept / Reject / Derive retry, which required
+  splitting `AttemptCard` into a shared `useAttemptWorkspace` hook plus three
+  consumers so the header and the body agree on one pending state. A progress
+  stepper (Queued -> Submitted -> Generated -> Evaluated -> Review) reads its
+  position off real event types, so a failed attempt shows the furthest
+  milestone it actually reached instead of snapping back to the start.
+- **No raw identifier headlines a screen.** Runs are titled by `project.title`
+  and an attempt reads "Generation attempt", with the id on a mono meta line
+  underneath. `shortId(id, 12, 0)` had been returning the whole string --
+  `slice(-0)` is `slice(0)` -- so headings read `01a072c3-880` followed by the
+  full id.
+- **Bugs the restyling surfaced.** An evaluation carrying a verdict but no
+  individual checks rendered its check grid anyway, leaving a hollow band; the
+  timeline connector assumed a fixed 2.7rem row and broke apart on any event
+  with a detail line; `FactList` and the evaluation checks responded to a
+  viewport media query rather than their own width, so they collided inside a
+  320px card; and `humanize` never split on a dot, so durable event types
+  rendered as `Evaluation.Completed`.
+- **Inter is gone from the font stack.** The repo has never shipped a webfont --
+  no `@font-face`, no font files, no CDN link -- so naming Inter only guaranteed
+  a substitute.
+- **Two honest substitutions where the mock data outran the API.**
+  `ProgressBar`'s caption reads "14 / 20 steps", not frames, because the
+  progress event is ComfyUI's KSampler step count and nothing in the domain
+  calls it frames; and the rail's "3 attempts - 6m" is derived from `events`,
+  because `RunRecord` carries one attempt and no count. There is no worker-pool
+  identity on the wire, so it is absent rather than faked.
+- `.design-sync/` holds the sync's durable state -- config, notes, conventions,
+  and one authored preview per component; all nineteen render and are graded.
+  All seven evidence screenshots were regenerated against the new layout, and
+  both browser specs were updated to the real DOM after `ArtifactPlayer`'s class
+  name moved from the `<video>` to a wrapper div for its custom controls.
+
 ## A second real generation, on hardware the first one never touched
 
 2026-09-15, a rented RTX PRO 5000 Blackwell running `torch 2.10.0+cu130`

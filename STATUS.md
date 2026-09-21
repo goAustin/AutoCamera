@@ -97,12 +97,12 @@ read as evidence of it. Capture provenance is recorded in
 | ComfyUI browser gateway | PASS — 7/7, queue mutation denied at the gateway |
 | Token isolation | PASS — `storageHasCredential: false`, `globalsHaveCredential: false`, `crossOriginProtected: true` |
 | Documentation and provenance | PASS — 12 captures accounted for |
-| Secret scan | PASS — 199 tracked files inspected |
+| Secret scan | PASS — 262 tracked files inspected |
 | Live ComfyUI contract | PASS — against the pinned remote executor on a rented RTX 5090, 2026-09-13 |
 | Real H3 GPU smoke | PASS — accepted attempt at profile defaults through `POST /v1/runs`, 2026-09-13 |
 | Real H3 GPU smoke, reproduced | PASS — 2026-09-15, RTX PRO 5000 Blackwell, provisioned by `scripts/setup/gpu-rented.sh` from a clean clone; identical capability fingerprint and workflow hash; attempt `awaiting_review`, evaluation passed |
 | Phase 8 gate row 2.11 | NOT RUN — browser bridge checks split into a separate pass |
-| GitHub Actions CI | PASS — every step on `65c324a`, including the browser suite |
+| GitHub Actions CI | PASS — every step on `65c324a`, including the browser suite; the `packages/ui` redesign commits after it have not yet run in CI |
 
 ## Known issues
 
