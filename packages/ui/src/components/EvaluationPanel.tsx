@@ -19,6 +19,7 @@ export function EvaluationPanel({
 }: EvaluationPanelProps): ReactElement {
   if (!evaluation) return <Notice variant="info">{pendingMessage}</Notice>;
 
+  const checks = Object.entries(evaluation.checks);
   const details = Object.entries(evaluation.details).map(([name, value]) => ({
     label: humanize(name),
     value: String(value),
@@ -35,18 +36,20 @@ export function EvaluationPanel({
           {humanize(evaluation.status)}
         </span>
       </div>
-      <div className="check-grid">
-        {Object.entries(evaluation.checks).map(([name, check]) => (
-          <div className="check-row" key={name}>
-            <span
-              className={`check-dot check-dot--${toneForStatus(check.status)}`}
-              aria-hidden="true"
-            />
-            <span className="check-label">{humanize(name)}</span>
-            <span className="check-value">{check.detail}</span>
-          </div>
-        ))}
-      </div>
+      {checks.length > 0 && (
+        <div className="check-grid">
+          {checks.map(([name, check]) => (
+            <div className="check-row" key={name}>
+              <span
+                className={`check-dot check-dot--${toneForStatus(check.status)}`}
+                aria-hidden="true"
+              />
+              <span className="check-label">{humanize(name)}</span>
+              <span className="check-value">{check.detail}</span>
+            </div>
+          ))}
+        </div>
+      )}
       {details.length > 0 && <FactList facts={details} columns={3} />}
       <div className="evaluation-footer">
         Evaluator {evaluation.evaluatorVersion} ·{' '}
