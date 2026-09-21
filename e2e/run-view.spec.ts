@@ -2,7 +2,8 @@ import { expect, test, type Page } from '@playwright/test';
 
 // Coverage for `RunView`, mounted standalone at `/` via `StandaloneRunPage`
 // with no ComfyUI origin present at all. `apps/web/src/App.tsx` carries the
-// same recovery-path components (`AttemptCard`, `ArtifactPlayer`,
+// same recovery-path components (`RunDetailColumn` and its
+// `AttemptActionBar` / `AttemptGates` / `AttemptDetail` parts, `ArtifactPlayer`,
 // `RecommendationPanel`, `RevisionHistory`, `EvaluationPanel`,
 // `EventTimeline`, `ConfirmPanel`) that the legacy Studio in the
 // now-deleted `project-studio.spec.ts` used to exercise; this file ports
@@ -25,9 +26,9 @@ function uniqueName(prefix: string): string {
   return `${prefix} ${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-// Mirrors `apps/web/src/App.tsx`'s `shortRunId`, which is what the run list
-// renders for each entry -- there is no other stable, visible handle to
-// select a specific run once more than one exists.
+// Mirrors `@h3/ui`'s `shortId` at its default head/tail, which is what the
+// rail and the run header render for every entry -- there is no other
+// stable, visible handle to select a specific run once more than one exists.
 function shortId(value: string): string {
   return `${value.slice(0, 8)}…${value.slice(-4)}`;
 }
@@ -162,15 +163,17 @@ async function enterRunView(page: Page): Promise<void> {
 }
 
 function selectedRunDetail(page: Page) {
-  return page.locator('section[aria-labelledby="managed-detail-title"]');
+  return page.locator('[aria-label="Selected run"]');
 }
 
 async function selectRun(page: Page, runId: string): Promise<void> {
   await expect(
-    page.locator('.managed-run-item', { hasText: shortId(runId) }),
+    page.locator('.run-rail-item', { hasText: shortId(runId) }),
   ).toBeVisible({ timeout: 30_000 });
-  await page.locator('.managed-run-item', { hasText: shortId(runId) }).click();
-  await expect(selectedRunDetail(page).getByText(runId)).toBeVisible({
+  await page.locator('.run-rail-item', { hasText: shortId(runId) }).click();
+  // The run's own id is never headlined raw (see conventions.md) — the
+  // header shows the same shortened form the rail row does.
+  await expect(selectedRunDetail(page).getByText(shortId(runId))).toBeVisible({
     timeout: 30_000,
   });
 }
@@ -197,18 +200,24 @@ test.describe('RunView, ported from project-studio.spec.ts', () => {
     await expect(card.getByText('Passed', { exact: true })).toBeVisible({
       timeout: 30_000,
     });
-    await expect(card.locator('video.artifact-player')).toBeVisible();
+    await expect(
+      card.locator('video[aria-label="Generated artifact"]'),
+    ).toBeVisible();
 
-    await card.getByRole('button', { name: 'Accept passing attempt' }).click();
+    await selectedRunDetail(page)
+      .getByRole('button', { name: 'Accept passing attempt' })
+      .click();
     await expect(card.getByText('Accepted', { exact: true })).toBeVisible();
 
     await page.reload();
     await expect(
       page.getByRole('heading', { name: 'Run history' }),
     ).toBeVisible();
-    await expect(selectedRunDetail(page).getByText(runId)).toBeVisible({
-      timeout: 30_000,
-    });
+    await expect(selectedRunDetail(page).getByText(shortId(runId))).toBeVisible(
+      {
+        timeout: 30_000,
+      },
+    );
     await expect(
       selectedRunDetail(page)
         .locator('.attempt-card')
@@ -233,12 +242,15 @@ test.describe('RunView, ported from project-studio.spec.ts', () => {
       timeout: 30_000,
     });
 
-    await card.getByRole('button', { name: 'Reject' }).click();
-    await card.getByLabel('Review reason code').fill('TOO_DARK');
-    await card.getByRole('button', { name: 'Reject attempt' }).click();
+    // Accept / Reject / Derive retry live in the sticky header now, not
+    // inside the attempt card; the reject reason form is a body sibling.
+    const detail = selectedRunDetail(page);
+    await detail.getByRole('button', { name: 'Reject' }).click();
+    await detail.getByLabel('Review reason code').fill('TOO_DARK');
+    await detail.getByRole('button', { name: 'Reject attempt' }).click();
     await expect(card.getByText('Rejected', { exact: true })).toBeVisible();
 
-    await card.getByRole('button', { name: 'Retry with confirmation' }).click();
+    await detail.getByRole('button', { name: 'Derive retry' }).click();
     await expect(
       page.getByRole('alertdialog', {
         name: 'Spend budget on a derived retry?',
@@ -255,7 +267,7 @@ test.describe('RunView, ported from project-studio.spec.ts', () => {
     await expect(retryCard.getByText('Passed', { exact: true })).toBeVisible({
       timeout: 30_000,
     });
-    await retryCard
+    await selectedRunDetail(page)
       .getByRole('button', { name: 'Accept passing attempt' })
       .click();
     await expect(
@@ -307,8 +319,10 @@ test.describe('RunView, ported from project-studio.spec.ts', () => {
     expect(afterCount).toBe(beforeCount);
 
     await enterRunView(page);
+    // The rail is a landmark (`aria-label="Run history"`), not a heading --
+    // the grouped/tabbed rail has no single "History" heading any more.
     await expect(
-      page.getByRole('heading', { name: 'History', exact: true }),
+      page.getByRole('complementary', { name: 'Run history' }),
     ).toBeVisible();
   });
 
@@ -327,7 +341,9 @@ test.describe('RunView, ported from project-studio.spec.ts', () => {
     });
     await expect(card.getByText('COMFY_EXECUTION_FAILED')).toBeVisible();
 
-    await card.getByRole('button', { name: 'Retry with confirmation' }).click();
+    await selectedRunDetail(page)
+      .getByRole('button', { name: 'Derive retry' })
+      .click();
     await expect(
       page.getByRole('alertdialog', {
         name: 'Spend budget on a derived retry?',
@@ -344,7 +360,7 @@ test.describe('RunView, ported from project-studio.spec.ts', () => {
     await expect(retryCard.getByText('Passed', { exact: true })).toBeVisible({
       timeout: 30_000,
     });
-    await retryCard
+    await selectedRunDetail(page)
       .getByRole('button', { name: 'Accept passing attempt' })
       .click();
     await expect(
@@ -388,7 +404,7 @@ test.describe('StandaloneRunPage with no ComfyUI origin present', () => {
     // Lists runs: all three just-seeded runs are reachable from the list.
     for (const runId of [playableRunId, manualRetryRunId, findingRunId]) {
       await expect(
-        page.locator('.managed-run-item', { hasText: shortId(runId) }),
+        page.locator('.run-rail-item', { hasText: shortId(runId) }),
       ).toBeVisible({ timeout: 30_000 });
     }
 
@@ -398,7 +414,9 @@ test.describe('StandaloneRunPage with no ComfyUI origin present', () => {
     await expect(
       playableCard.getByText('Awaiting Review', { exact: true }),
     ).toBeVisible({ timeout: 30_000 });
-    await expect(playableCard.locator('video.artifact-player')).toBeVisible();
+    await expect(
+      playableCard.locator('video[aria-label="Generated artifact"]'),
+    ).toBeVisible();
 
     // Retries a timed_out attempt.
     await selectRun(page, manualRetryRunId);
@@ -407,8 +425,8 @@ test.describe('StandaloneRunPage with no ComfyUI origin present', () => {
       timedOutCard.getByText('Timed Out', { exact: true }),
     ).toBeVisible({ timeout: 30_000 });
     await expect(timedOutCard.getByText('GENERATION_TIMEOUT')).toBeVisible();
-    await timedOutCard
-      .getByRole('button', { name: 'Retry with confirmation' })
+    await selectedRunDetail(page)
+      .getByRole('button', { name: 'Derive retry' })
       .click();
     await expect(
       page.getByRole('alertdialog', {

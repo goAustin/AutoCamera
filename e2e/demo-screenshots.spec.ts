@@ -149,15 +149,17 @@ async function enterRunView(page: Page): Promise<void> {
 }
 
 function selectedRunDetail(page: Page) {
-  return page.locator('section[aria-labelledby="managed-detail-title"]');
+  return page.locator('[aria-label="Selected run"]');
 }
 
 async function selectRun(page: Page, runId: string): Promise<void> {
   await expect(
-    page.locator('.managed-run-item', { hasText: shortId(runId) }),
+    page.locator('.run-rail-item', { hasText: shortId(runId) }),
   ).toBeVisible({ timeout: 30_000 });
-  await page.locator('.managed-run-item', { hasText: shortId(runId) }).click();
-  await expect(selectedRunDetail(page).getByText(runId)).toBeVisible({
+  await page.locator('.run-rail-item', { hasText: shortId(runId) }).click();
+  // The run's own id is never headlined raw (see conventions.md) — the
+  // header shows the same shortened form the rail row does.
+  await expect(selectedRunDetail(page).getByText(shortId(runId))).toBeVisible({
     timeout: 30_000,
   });
 }
@@ -174,7 +176,7 @@ test('captures the deterministic offline release evidence set', async ({
   const historyRunId = historyAttempt.id as string;
   await enterRunView(page);
   await expect(
-    page.locator('.managed-run-item', { hasText: shortId(historyRunId) }),
+    page.locator('.run-rail-item', { hasText: shortId(historyRunId) }),
   ).toBeVisible({ timeout: 30_000 });
   await capture(page, '01-run-history.png');
 
@@ -195,14 +197,17 @@ test('captures the deterministic offline release evidence set', async ({
   await expect(historyCard.getByText('Passed', { exact: true })).toBeVisible({
     timeout: 30_000,
   });
-  await expect(historyCard.locator('video.artifact-player')).toBeVisible();
   await expect(
-    selectedRunDetail(page).getByText('Trace ID', { exact: false }),
+    historyCard.locator('video[aria-label="Generated artifact"]'),
+  ).toBeVisible();
+  await expect(
+    selectedRunDetail(page).getByText('Trace', { exact: false }),
   ).toBeVisible();
   await capture(page, '02-artifact-review.png');
 
-  // 03: the run after a human accepts the passing attempt.
-  await historyCard
+  // 03: the run after a human accepts the passing attempt. Accept / Reject /
+  // Derive retry now live in the sticky header, not inside the attempt card.
+  await selectedRunDetail(page)
     .getByRole('button', { name: 'Accept passing attempt' })
     .click();
   await expect(
@@ -224,8 +229,8 @@ test('captures the deterministic offline release evidence set', async ({
     timeout: 30_000,
   });
   await expect(failureCard.getByText('COMFY_EXECUTION_FAILED')).toBeVisible();
-  await failureCard
-    .getByRole('button', { name: 'Retry with confirmation' })
+  await selectedRunDetail(page)
+    .getByRole('button', { name: 'Derive retry' })
     .click();
   await expect(
     page.getByRole('alertdialog', {
@@ -247,7 +252,7 @@ test('captures the deterministic offline release evidence set', async ({
     timeout: 30_000,
   });
   await capture(page, '05-retry-derived.png');
-  await retryCard
+  await selectedRunDetail(page)
     .getByRole('button', { name: 'Accept passing attempt' })
     .click();
   await expect(retryCard.getByText('Accepted', { exact: true })).toBeVisible();
@@ -285,7 +290,7 @@ test('captures the deterministic offline release evidence set', async ({
   ).toBeVisible();
   for (const runId of [historyRunId, retryRunId, findingRunId]) {
     await expect(
-      page.locator('.managed-run-item', { hasText: shortId(runId) }),
+      page.locator('.run-rail-item', { hasText: shortId(runId) }),
     ).toBeVisible({ timeout: 30_000 });
   }
   await capture(page, '07-run-history-complete.png');

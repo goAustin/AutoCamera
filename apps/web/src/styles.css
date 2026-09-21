@@ -26,13 +26,7 @@ body {
   margin: 0;
   min-width: 320px;
   min-height: 100vh;
-  background:
-    radial-gradient(
-      ellipse 80% 50% at 50% 0%,
-      rgb(53 130 116 / 10%),
-      transparent
-    ),
-    var(--canvas);
+  background: var(--canvas);
 }
 
 a {
@@ -51,13 +45,13 @@ h1,
 h2,
 h3,
 h4 {
-  letter-spacing: -0.04em;
+  letter-spacing: -0.01em;
 }
 
 h1 {
-  font-size: var(--text-display);
-  line-height: 1.05;
-  margin-bottom: 1rem;
+  font-size: var(--text-title);
+  line-height: 1.15;
+  margin-bottom: 0.5rem;
 }
 
 h2 {
@@ -66,18 +60,33 @@ h2 {
 }
 
 h3 {
-  font-size: var(--text-heading);
-  margin-bottom: 0.85rem;
+  font-size: var(--text-lead);
+  font-weight: 600;
+  margin-bottom: 0.6rem;
 }
 
 h4 {
-  font-size: var(--text-subhead);
+  font-size: var(--text-lead);
   margin-bottom: 0;
 }
 
 iframe:focus-visible {
-  outline: 3px solid var(--gold);
-  outline-offset: 3px;
+  outline: 2px solid var(--acc);
+  outline-offset: 2px;
+}
+
+/* Structural labels are not the accent — see packages/ui/src/base.css. */
+.eyebrow,
+.section-kicker {
+  color: var(--faint);
+  font-size: var(--text-micro);
+  font-weight: 700;
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+}
+
+.eyebrow {
+  margin-bottom: 0.5rem;
 }
 
 /* The ComfyUI side panel. */
@@ -85,19 +94,20 @@ iframe:focus-visible {
 .bridge-status {
   display: inline-flex;
   align-items: center;
-  min-height: 1.7rem;
-  padding: 0.2rem 0.55rem;
-  border: 1px solid rgb(246 203 123 / 45%);
+  padding: 2px 9px;
+  border: 1px solid var(--acc-mid);
   border-radius: 999px;
-  color: var(--gold);
+  background: var(--acc-soft);
+  color: var(--acc);
   font-size: var(--text-label);
-  font-weight: 700;
+  font-weight: 600;
   white-space: nowrap;
 }
 
 .bridge-status--ready {
-  border-color: rgb(139 224 195 / 40%);
-  color: var(--mint);
+  border-color: var(--pass-mid);
+  background: var(--pass-soft);
+  color: var(--pass);
 }
 
 .managed-panel {
@@ -115,20 +125,12 @@ iframe:focus-visible {
   font-size: var(--text-subhead);
 }
 
-.managed-panel h3 {
-  font-size: var(--text-lead);
-  margin-bottom: 0.5rem;
-}
-
 .managed-panel .panel {
   padding: 0.85rem;
-  border-radius: 0.9rem;
 }
 
 .managed-panel > .notice {
   margin-top: 0;
-  padding: 0.55rem;
-  font-size: var(--text-small);
 }
 
 .managed-panel-header {
@@ -150,16 +152,17 @@ iframe:focus-visible {
 .managed-panel-actions {
   display: flex;
   flex-wrap: wrap;
+  align-items: center;
   gap: 0.5rem;
-}
-
-.managed-panel-actions .button {
-  flex: 1 1 auto;
 }
 
 .managed-empty {
   display: grid;
   gap: 0.5rem;
+  padding: 1.25rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
   text-align: center;
 }
 
@@ -178,142 +181,331 @@ iframe:focus-visible {
   justify-self: center;
 }
 
-.managed-panel-grid {
+/* The run console: a sticky, full-height rail beside a scrolling main
+   column. Replaces the old two-column grid, which gave the rail a fixed
+   fraction of the width and left it ~95% empty next to a 2700px scroll. */
+.run-console {
   display: grid;
-  gap: 0.8rem;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0;
+  align-items: start;
 }
 
-.managed-history,
-.managed-detail {
-  align-self: start;
+@media (min-width: 760px) {
+  .run-console {
+    grid-template-columns: 288px minmax(0, 1fr);
+  }
+
+  .run-rail {
+    position: sticky;
+    top: 0;
+    height: 100vh;
+  }
 }
 
-.managed-history .panel-heading,
-.managed-detail .panel-heading,
-.managed-subsection .panel-heading {
-  margin-bottom: 0.8rem;
+.run-rail {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-right: 1px solid var(--line);
+  background: var(--panel-rail);
 }
 
-.managed-run-list {
+.run-rail-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  padding: 0.7rem 0.7rem 0.6rem;
+  border-bottom: var(--sep);
+}
+
+.run-rail-tab {
+  border: 1px solid transparent;
+  border-radius: 5px;
+  padding: 3px 8px;
+  background: transparent;
+  color: var(--faint);
+  cursor: pointer;
+  font: inherit;
+  font-size: var(--text-label);
+  font-weight: 600;
+}
+
+.run-rail-tab:hover {
+  color: var(--ink);
+}
+
+.run-rail-tab--active {
+  border-color: var(--line-strong);
+  background: var(--panel2);
+  color: var(--ink);
+}
+
+.run-rail-scroll {
+  overflow-y: auto;
+  flex: 1 1 auto;
+  padding: 0.7rem;
+}
+
+.run-rail-group + .run-rail-group {
+  margin-top: 1rem;
+}
+
+.run-rail-group-label {
+  margin: 0 0 0.5rem;
+  color: var(--faint);
+  font-size: var(--text-micro);
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.run-rail-list {
   display: grid;
-  gap: 0.45rem;
+  gap: 0.3rem;
   margin: 0;
   padding: 0;
   list-style: none;
 }
 
-.managed-run-item {
-  display: flex;
+.run-rail-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
-  justify-content: space-between;
-  gap: 0.6rem;
+  gap: 0.15rem 0.6rem;
   width: 100%;
-  padding: 0.6rem 0.7rem;
-  border: 1px solid transparent;
-  border-radius: 0.7rem;
-  background: var(--surface-nested);
+  border: none;
+  border-radius: 6px;
+  padding: 0.55rem 0.65rem;
+  background: transparent;
   color: inherit;
   cursor: pointer;
   text-align: left;
 }
 
-.managed-run-item:hover,
-.managed-run-item--selected {
-  border-color: rgb(139 224 195 / 55%);
-  background: rgb(139 224 195 / 7%);
+.run-rail-item:hover {
+  background: var(--panel2);
 }
 
-.managed-run-item strong,
-.managed-run-item small {
-  display: block;
+.run-rail-item--selected {
+  background: var(--panel2);
+  box-shadow: inset 2px 0 0 var(--acc);
 }
 
-.managed-run-item strong {
+.run-rail-item-title {
+  grid-column: 1;
+  overflow: hidden;
   font-size: var(--text-small);
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.managed-run-item small {
+.run-rail-item-meta {
+  grid-column: 1;
+  overflow: hidden;
   color: var(--faint);
+  font-family: var(--mono);
   font-size: var(--text-label);
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.managed-facts {
+.run-rail-item .status-badge {
+  grid-column: 2;
+  grid-row: 1 / 3;
+}
+
+.run-main {
+  min-width: 0;
+  padding: 0 1rem 2rem;
+}
+
+.run-main-empty {
+  padding-top: 1.5rem;
+}
+
+/* The sticky header: mono meta line, the run's name, a state sentence, and
+   the primary actions — no longer at the bottom of a long scroll. */
+.run-header {
+  position: sticky;
+  top: 0;
+  z-index: 1;
   display: grid;
-  gap: 0.45rem;
-  margin: 0 0 0.7rem;
+  gap: 0.35rem;
+  padding: 1rem 0 0.9rem;
+  background: var(--canvas);
+  border-bottom: var(--sep);
 }
 
-.managed-facts > div {
-  display: grid;
-  gap: 0.15rem;
-  padding-bottom: 0.4rem;
-  border-bottom: 1px solid var(--line);
-}
-
-.managed-facts dt {
-  color: var(--faint);
-  font-size: var(--text-label);
-  font-weight: 800;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-}
-
-.managed-facts dd {
+.run-header-meta {
   margin: 0;
-  color: var(--ink);
-  font-size: var(--text-small);
-  overflow-wrap: anywhere;
-}
-
-.managed-subsection {
-  display: grid;
-  gap: 0.5rem;
-  margin-top: 0.8rem;
-  padding-top: 0.7rem;
-  border-top: 1px solid var(--line);
-}
-
-.managed-subsection progress {
-  width: 100%;
-  height: 0.45rem;
-  accent-color: var(--mint);
-}
-
-.managed-subsection textarea {
-  min-height: 4rem;
-  padding: 0.55rem;
-  font-size: var(--text-small);
-}
-
-.failure-line,
-.trace-line {
-  margin-bottom: 0;
+  color: var(--faint);
+  font-family: var(--mono);
   font-size: var(--text-label);
-  overflow-wrap: anywhere;
 }
 
-.failure-line {
-  color: var(--coral);
+.run-header-top {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.6rem;
 }
 
-.trace-line {
+.run-header-top h1 {
+  margin: 0;
+  font-size: var(--text-title);
+}
+
+.run-header-state {
+  margin: 0;
+  color: var(--muted);
+  font-size: var(--text-body);
+}
+
+.run-header-actions {
+  margin-top: 0.4rem;
+}
+
+.run-body {
+  display: grid;
+  gap: 1rem;
+  padding-top: 1rem;
+}
+
+.run-body .panel {
+  padding: 1rem;
+}
+
+/* The progress stepper: Queued → Submitted → Generated → Evaluated →
+   Review, the current node ringed in amber. Derived from real attempt
+   status and events (see `stepIndexForRun`), not a fixed assumption. */
+.run-stepper {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.run-step {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding-right: 1rem;
+  color: var(--faint);
+  font-size: var(--text-small);
+}
+
+.run-step:not(:last-child)::after {
+  content: "";
+  width: 1.4rem;
+  height: 1px;
+  margin: 0 0.6rem 0 0;
+  background: var(--line-strong);
+}
+
+.run-step-dot {
+  width: 8px;
+  height: 8px;
+  border: 2px solid var(--line-strong);
+  border-radius: 50%;
+  background: var(--canvas);
+}
+
+.run-step--done .run-step-dot {
+  border-color: var(--done);
+  background: var(--done);
+}
+
+.run-step--done .run-step-label {
   color: var(--muted);
 }
 
-.live-chip {
+.run-step--current .run-step-dot {
+  border-color: var(--acc);
+  background: var(--canvas);
+  box-shadow: 0 0 0 3px var(--acc-soft);
+}
+
+.run-step--current .run-step-label {
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.run-step--failed .run-step-dot {
+  border-color: var(--fail);
+  background: var(--fail);
+}
+
+.run-step--failed .run-step-label {
+  color: var(--fail);
+  font-weight: 600;
+}
+
+/* The latest attempt's poster beside its evaluation checks — most of the
+   fix for what used to be an endless single-column scroll. */
+.attempt-media-grid {
+  display: grid;
+  gap: 1rem;
+  align-items: start;
+}
+
+@media (min-width: 640px) {
+  .attempt-media-grid {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  }
+}
+
+.attempt-compact-list {
+  display: grid;
+  gap: 0;
+  margin: 0.9rem 0 0;
+  padding: 0.6rem 0 0;
+  border-top: var(--sep);
+  list-style: none;
+}
+
+.attempt-compact-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  padding: 0.4rem 0;
+}
+
+.attempt-compact-row code {
+  background: none;
+  padding: 0;
+}
+
+.attempt-compact-meta {
   color: var(--faint);
-  font-size: var(--text-micro);
-  font-weight: 800;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
+  font-family: var(--mono);
+  font-size: var(--text-label);
+}
+
+.inline-form {
+  display: grid;
+  gap: 0.62rem;
+  max-width: 360px;
+  padding: 0.8rem;
+  border: 1px solid var(--fail-mid);
+  border-radius: 6px;
+  background: var(--fail-soft);
+}
+
+.trace-line {
+  margin: 0;
+  color: var(--faint);
+  font-family: var(--mono);
+  font-size: var(--text-label);
+  overflow-wrap: anywhere;
 }
 
 @media (min-width: 760px) {
   .managed-panel {
     padding: 1rem;
-  }
-
-  .managed-panel-grid {
-    grid-template-columns: minmax(190px, 0.8fr) minmax(0, 1.2fr);
   }
 }
