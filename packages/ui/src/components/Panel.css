@@ -1,7 +1,7 @@
 .panel {
-  padding: clamp(1.15rem, 2.5vw, 1.75rem);
+  padding: 1.25rem;
   border: 1px solid var(--line);
-  border-radius: 1.2rem;
+  border-radius: 8px;
   background: var(--panel);
   box-shadow: var(--shadow);
 }
@@ -11,38 +11,50 @@
   align-items: flex-start;
   justify-content: space-between;
   gap: 1rem;
-  margin-bottom: 1.25rem;
+  margin-bottom: 0.85rem;
 }
 
 .panel-heading .section-kicker {
   display: block;
-  margin-bottom: 0.5rem;
+  margin-bottom: 0.4rem;
+  font-size: var(--text-micro);
+  letter-spacing: 0.13em;
 }
 
 .panel-heading h3 {
   margin: 0;
-  font-size: var(--text-heading);
-  letter-spacing: -0.04em;
+  font-size: var(--text-lead);
+  font-weight: 600;
+  letter-spacing: -0.01em;
 }
 
 .count-badge {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-width: 1.7rem;
-  min-height: 1.7rem;
-  padding: 0.2rem 0.55rem;
-  border: 1px solid var(--line-strong);
-  border-radius: 999px;
+  min-width: 1.5rem;
+  padding: 2px 7px;
+  border-radius: 5px;
+  background: var(--panel2);
   color: var(--muted);
+  font-family: var(--mono);
   font-size: var(--text-label);
-  font-weight: 700;
+  font-weight: 600;
   white-space: nowrap;
 }
 
 .panel-intro {
-  margin: 0 0 1rem;
+  margin: 0 0 0.9rem;
   color: var(--muted);
   font-size: var(--text-body);
   line-height: 1.55;
+}
+
+.panel-body {
+  padding-top: 0.9rem;
+  border-top: var(--sep);
+}
+
+.panel-body:empty {
+  display: none;
 }

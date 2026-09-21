@@ -49,10 +49,21 @@ export function TokenGate({
           this Studio-origin browser session and is never passed to the ComfyUI
           origin.
         </p>
-        <form className="stack-form" onSubmit={submit}>
-          <label htmlFor="dev-token">Development token</label>
+        <form
+          className={
+            embedded ? 'stack-form stack-form--embedded' : 'stack-form'
+          }
+          onSubmit={submit}
+        >
+          <label
+            htmlFor="dev-token"
+            className={embedded ? 'sr-only' : undefined}
+          >
+            Development token
+          </label>
           <input
             id="dev-token"
+            className="mono-field"
             type="password"
             autoComplete="off"
             value={value}
@@ -60,15 +71,20 @@ export function TokenGate({
             placeholder="DEV_AUTH_TOKEN"
             aria-describedby={error ? 'token-error' : undefined}
           />
+          <Button variant="primary" type="submit">
+            {embedded ? 'Connect' : 'Enter Project Studio'}
+          </Button>
           {error && (
             <span id="token-error" className="field-error">
               {error}
             </span>
           )}
-          <Button variant="primary" type="submit">
-            {embedded ? 'Connect VideoOps' : 'Enter Project Studio'}
-          </Button>
         </form>
+        {!embedded && (
+          <p className="auth-footer">
+            Session-only bearer token · never sent to the ComfyUI origin
+          </p>
+        )}
       </section>
     </main>
   );

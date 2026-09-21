@@ -1,5 +1,5 @@
 import type { ReactElement } from 'react';
-import { formatDate } from '../format.js';
+import { formatClock, formatDate } from '../format.js';
 import type { TimelineEvent } from '../types.js';
 import { EmptyState } from './StateBlock.js';
 import { Panel } from './Panel.js';
@@ -39,13 +39,18 @@ export function EventTimeline({
         <ol className="timeline-list">
           {events.map((event) => (
             <li key={event.id}>
+              <span
+                className="timeline-time"
+                title={formatDate(event.timestamp)}
+              >
+                {formatClock(event.timestamp)}
+              </span>
               <span className="timeline-dot" aria-hidden="true" />
-              <div>
+              <div className="timeline-body">
                 <strong>{event.title}</strong>
-                <small>
-                  {formatDate(event.timestamp)}
-                  {event.sequence ? ` · #${event.sequence}` : ''}
-                </small>
+                {event.sequence !== undefined && (
+                  <small>#{event.sequence}</small>
+                )}
                 {event.detail && (
                   <span className="timeline-detail">{event.detail}</span>
                 )}

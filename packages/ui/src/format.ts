@@ -18,6 +18,16 @@ export function formatDate(value: string): string {
     : value;
 }
 
+/** Formats an ISO timestamp as a bare clock time, for a narrow mono column
+ * where a full date would not fit. The full date stays available as a
+ * tooltip wherever this is used — nothing is actually lost. */
+export function formatClock(value: string): string {
+  const date = new Date(value);
+  return Number.isFinite(date.getTime())
+    ? new Intl.DateTimeFormat(undefined, { timeStyle: 'short' }).format(date)
+    : value;
+}
+
 /** Formats a seconds count, dropping the decimals when the value is whole. */
 export function formatDuration(value: number): string {
   return `${value.toFixed(value % 1 === 0 ? 0 : 2)}s`;

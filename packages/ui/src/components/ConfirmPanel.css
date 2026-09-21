@@ -1,10 +1,17 @@
+/* Amber-soft when the gate is about spending — the common case; fail-soft
+   when the action it guards is terminal (`destructive`). */
 .confirm-panel {
   display: grid;
   gap: 0.45rem;
-  padding: 0.9rem;
-  border: 1px solid rgb(246 203 123 / 42%);
-  border-radius: 0.75rem;
-  background: rgb(246 203 123 / 7%);
+  padding: 0.85rem 0.9rem;
+  border: 1px solid var(--acc-mid);
+  border-radius: 6px;
+  background: var(--acc-soft);
+}
+
+.confirm-panel--destructive {
+  border-color: var(--fail-mid);
+  background: var(--fail-soft);
 }
 
 .confirm-panel p {

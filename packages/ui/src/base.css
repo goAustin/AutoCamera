@@ -21,6 +21,7 @@
   font-family:
     ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
     Roboto, sans-serif;
+  font-size: var(--text-body);
   font-synthesis: none;
   text-rendering: optimizeLegibility;
 }
@@ -30,24 +31,24 @@
 .videoops-surface h3,
 .videoops-surface h4 {
   color: var(--ink);
-  letter-spacing: -0.04em;
+  letter-spacing: -0.01em;
 }
 
 label,
 legend {
   color: var(--muted);
   font-size: var(--text-small);
-  font-weight: 700;
+  font-weight: 600;
 }
 
 input,
 textarea {
   width: 100%;
   border: 1px solid var(--line-strong);
-  border-radius: 0.72rem;
-  background: rgb(4 12 15 / 78%);
+  border-radius: 6px;
+  background: rgb(0 0 0 / 22%);
   color: var(--ink);
-  padding: 0.78rem 0.85rem;
+  padding: 0.6rem 0.7rem;
   font: inherit;
   transition:
     border-color 140ms ease,
@@ -62,23 +63,23 @@ textarea {
 
 input:hover,
 textarea:hover {
-  border-color: rgb(178 205 197 / 45%);
+  border-color: var(--line-strong);
 }
 
 input:focus,
 textarea:focus {
-  border-color: var(--mint);
-  background: rgb(7 20 21 / 90%);
+  border-color: var(--acc);
+  background: rgb(0 0 0 / 28%);
   outline: none;
 }
 
 code {
   overflow: hidden;
   padding: 0.1rem 0.32rem;
-  border-radius: 0.3rem;
-  background: var(--surface-nested);
+  border-radius: 4px;
+  background: var(--panel2);
   color: var(--muted);
-  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-family: var(--mono);
   font-size: var(--text-label);
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -88,8 +89,8 @@ button:focus-visible,
 a:focus-visible,
 input:focus-visible,
 textarea:focus-visible {
-  outline: 3px solid var(--gold);
-  outline-offset: 3px;
+  outline: 2px solid var(--acc);
+  outline-offset: 2px;
 }
 
 .muted {
@@ -104,14 +105,14 @@ textarea:focus-visible {
   gap: 0.6rem;
 }
 
-/* Structural labels are not accents. Mint is reserved for things you can
-   act on and things that succeeded; an eyebrow is neither. */
+/* Structural labels are not the accent. Amber is reserved for actions and
+   in-flight state; an eyebrow is neither. */
 .eyebrow,
 .section-kicker {
   color: var(--faint);
-  font-size: var(--text-label);
-  font-weight: 800;
-  letter-spacing: 0.16em;
+  font-size: var(--text-micro);
+  font-weight: 700;
+  letter-spacing: 0.13em;
   text-transform: uppercase;
 }
 
@@ -122,7 +123,7 @@ textarea:focus-visible {
 .lede {
   color: var(--muted);
   font-size: var(--text-lead);
-  line-height: 1.65;
+  line-height: 1.6;
 }
 
 @media (prefers-reduced-motion: reduce) {

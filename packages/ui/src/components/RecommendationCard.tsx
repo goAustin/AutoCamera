@@ -3,7 +3,14 @@ import type { RecommendationView } from '../types.js';
 import { Button } from './Button.js';
 import { EmptyState } from './StateBlock.js';
 import { Panel } from './Panel.js';
-import { StatusBadge } from './StatusBadge.js';
+
+/** Severity is its own small vocabulary — distinct from `StatusTone` — kept
+ * to the same disciplined palette: fail for critical, neutral otherwise. */
+function severityClassName(severity: string): string {
+  if (severity === 'critical') return 'severity-chip severity-chip--critical';
+  if (severity === 'warning') return 'severity-chip severity-chip--warning';
+  return 'severity-chip severity-chip--info';
+}
 
 export interface RecommendationCardProps {
   readonly recommendation: RecommendationView;
@@ -29,13 +36,16 @@ export function RecommendationCard({
   return (
     <li className="recommendation-card">
       <div className="recommendation-heading">
-        <StatusBadge status={recommendation.severity} />
-        <strong>{recommendation.title}</strong>
+        <span className={severityClassName(recommendation.severity)}>
+          {recommendation.severity}
+        </span>
+        <code>{recommendation.recommendationCode}</code>
       </div>
+      <strong className="recommendation-title">{recommendation.title}</strong>
       <p>{recommendation.detail}</p>
-      <div className="recommendation-meta">
-        <span>{recommendation.recommendationCode}</span>
-        <span>Action: {recommendation.proposedAction}</span>
+      <div className="recommendation-proposed">
+        <span className="proposed-label">Proposed</span>
+        <span className="proposed-chip">{recommendation.proposedAction}</span>
       </div>
       {children}
       {(onApply || onDismiss) && (

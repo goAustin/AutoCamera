@@ -4,6 +4,8 @@
   place-items: center;
   gap: 0.45rem;
   min-height: 8rem;
+  border: 1px dashed var(--line-strong);
+  border-radius: 8px;
   color: var(--muted);
   text-align: center;
 }
@@ -21,8 +23,8 @@
 .spinner {
   width: 1rem;
   height: 1rem;
-  border: 2px solid rgb(139 224 195 / 25%);
-  border-top-color: var(--mint);
+  border: 2px solid var(--line-strong);
+  border-top-color: var(--acc);
   border-radius: 50%;
   animation: spin 850ms linear infinite;
 }

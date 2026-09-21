@@ -3,7 +3,7 @@ import { formatDate, humanize } from '../format.js';
 import type { EvaluationView } from '../types.js';
 import { FactList } from './FactList.js';
 import { Notice } from './Notice.js';
-import { StatusBadge } from './StatusBadge.js';
+import { toneForStatus } from './StatusBadge.js';
 
 export interface EvaluationPanelProps {
   /** Omit while the worker has not produced an evaluation yet. */
@@ -23,27 +23,35 @@ export function EvaluationPanel({
     label: humanize(name),
     value: String(value),
   }));
+  const verdictTone = toneForStatus(evaluation.status);
 
   return (
     <div className="evaluation-panel">
       <div className="evaluation-heading">
         <strong>Technical evaluation</strong>
-        <StatusBadge status={evaluation.status} />
+        <span
+          className={`evaluation-verdict evaluation-verdict--${verdictTone}`}
+        >
+          {humanize(evaluation.status)}
+        </span>
       </div>
       <div className="check-grid">
         {Object.entries(evaluation.checks).map(([name, check]) => (
           <div className="check-row" key={name}>
-            <span>{humanize(name)}</span>
-            <StatusBadge status={check.status} />
-            <small>{check.detail}</small>
+            <span
+              className={`check-dot check-dot--${toneForStatus(check.status)}`}
+              aria-hidden="true"
+            />
+            <span className="check-label">{humanize(name)}</span>
+            <span className="check-value">{check.detail}</span>
           </div>
         ))}
       </div>
       {details.length > 0 && <FactList facts={details} columns={3} />}
-      <small className="muted">
+      <div className="evaluation-footer">
         Evaluator {evaluation.evaluatorVersion} ·{' '}
         {formatDate(evaluation.evaluatedAt)}
-      </small>
+      </div>
     </div>
   );
 }

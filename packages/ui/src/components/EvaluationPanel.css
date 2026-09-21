@@ -1,39 +1,93 @@
 .evaluation-panel {
   display: grid;
   gap: 0.8rem;
-  padding: 0.9rem;
-  border-radius: 0.75rem;
-  background: var(--surface-nested);
 }
 
 .evaluation-heading {
   display: flex;
-  align-items: center;
+  align-items: baseline;
   justify-content: space-between;
   gap: 1rem;
 }
 
-.check-grid {
-  display: grid;
-  gap: 0.45rem;
+.evaluation-heading strong {
+  font-size: var(--text-lead);
+  font-weight: 600;
 }
 
-/* Same reason as FactList: wrap on the row's own width, not the window's.
-   Name and verdict stay together; the detail drops to its own line when tight. */
+/* The verdict appears once, as coloured text — not a second badge next to
+   the one on the attempt card. */
+.evaluation-verdict {
+  font-size: var(--text-small);
+  font-weight: 600;
+}
+
+.evaluation-verdict--positive {
+  color: var(--pass);
+}
+
+.evaluation-verdict--negative {
+  color: var(--fail);
+}
+
+.evaluation-verdict--active {
+  color: var(--acc);
+}
+
+.evaluation-verdict--neutral {
+  color: var(--muted);
+}
+
+.check-grid {
+  display: grid;
+  gap: 0.5rem;
+}
+
+/* Same reason as FactList: wrap on the row's own width, not the window's. */
 .check-row {
   display: flex;
   flex-wrap: wrap;
-  align-items: center;
-  gap: 0.3rem 0.6rem;
+  align-items: baseline;
+  gap: 0.4rem 0.6rem;
+}
+
+.check-dot {
+  align-self: center;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--muted);
+  flex-shrink: 0;
+}
+
+.check-dot--positive {
+  background: var(--pass);
+}
+
+.check-dot--negative {
+  background: var(--fail);
+}
+
+.check-dot--active {
+  background: var(--acc);
+}
+
+.check-label {
+  flex: 1 1 7rem;
   color: var(--muted);
   font-size: var(--text-small);
 }
 
-.check-row > :first-child {
-  flex: 1 1 7rem;
-}
-
-.check-row small {
+.check-value {
   flex: 1 1 11rem;
   color: var(--faint);
+  font-size: var(--text-small);
+}
+
+.evaluation-footer {
+  padding-top: 0.7rem;
+  border-top: var(--sep);
+  color: var(--faint);
+  font-family: var(--mono);
+  font-size: var(--text-label);
 }

@@ -25,7 +25,6 @@ export function AttemptSummary({
   children,
 }: AttemptSummaryProps): ReactElement {
   const facts: Fact[] = [
-    { label: 'Queued', value: formatDate(attempt.queuedAt) },
     {
       label: 'Profile hash',
       value: <code>{attempt.workflowHash.slice(0, 12)}…</code>,
@@ -50,12 +49,19 @@ export function AttemptSummary({
     <article className="attempt-card" aria-labelledby={`attempt-${attempt.id}`}>
       <div className="attempt-heading">
         <div>
-          <h4 id={`attempt-${attempt.id}`}>{shortId(attempt.id, 12, 0)}</h4>
+          <h4 id={`attempt-${attempt.id}`}>Generation attempt</h4>
+          <div className="attempt-meta">
+            {shortId(attempt.id, 12, 0)} · {formatDate(attempt.queuedAt)}
+          </div>
         </div>
         <StatusBadge status={attempt.status} />
       </div>
       <FactList facts={facts} columns={4} />
-      {progress && <ProgressBar value={progress.value} max={progress.max} />}
+      {progress && (
+        <div className="attempt-progress">
+          <ProgressBar value={progress.value} max={progress.max} />
+        </div>
+      )}
       {attempt.failureMessage && (
         <p className="failure-copy">{attempt.failureMessage}</p>
       )}

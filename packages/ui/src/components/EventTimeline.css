@@ -9,42 +9,46 @@
 .timeline-list li {
   position: relative;
   display: grid;
-  grid-template-columns: 1rem minmax(0, 1fr);
-  gap: 0.7rem;
-  min-height: 3.2rem;
+  grid-template-columns: 70px 14px minmax(0, 1fr);
+  align-items: start;
+  gap: 0 0.6rem;
+  min-height: 2.6rem;
+  padding: 0.35rem 0;
 }
 
 /* The connector spans whatever height the row turns out to be. A fixed
    height breaks the trail as soon as an event carries a detail line. */
 .timeline-list li:not(:last-child)::before {
   position: absolute;
-  top: 0.85rem;
-  left: 0.25rem;
+  top: 1.1rem;
+  left: calc(70px + 6px);
   width: 1px;
-  height: calc(100% - 0.85rem);
+  height: calc(100% - 0.35rem);
   background: var(--line-strong);
   content: "";
+}
+
+.timeline-time {
+  margin-top: 0.15rem;
+  color: var(--faint);
+  font-family: var(--mono);
+  font-size: var(--text-label);
+  white-space: nowrap;
 }
 
 .timeline-dot {
   position: relative;
   display: block;
-  width: 0.55rem;
-  height: 0.55rem;
-  margin-top: 0.3rem;
-  border: 2px solid var(--line-strong);
+  width: 7px;
+  height: 7px;
+  margin-top: 0.35rem;
   border-radius: 50%;
+  background: var(--faint);
 }
 
-/* Newest first, so the first dot is the live edge of the run. */
-.timeline-list li:first-child .timeline-dot {
-  border-color: var(--mint);
-}
-
-.timeline-list strong,
-.timeline-list small,
-.timeline-detail {
-  display: block;
+.timeline-body {
+  display: grid;
+  gap: 0.15rem;
 }
 
 .timeline-list strong {
@@ -52,14 +56,15 @@
   font-size: var(--text-body);
 }
 
-.timeline-list small,
-.timeline-detail {
-  margin-top: 0.18rem;
+.timeline-body small {
   color: var(--faint);
+  font-family: var(--mono);
   font-size: var(--text-label);
-  line-height: 1.4;
 }
 
 .timeline-detail {
+  display: block;
   color: var(--muted);
+  font-size: var(--text-small);
+  line-height: 1.4;
 }

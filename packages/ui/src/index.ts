@@ -72,6 +72,7 @@ export {
 export { TokenGate, type TokenGateProps } from './components/TokenGate.js';
 
 export {
+  formatClock,
   formatDate,
   formatDuration,
   formatMoney,

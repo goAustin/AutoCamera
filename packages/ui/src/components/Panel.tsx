@@ -42,7 +42,7 @@ export function Panel({
           ))}
       </div>
       {intro && <p className="panel-intro">{intro}</p>}
-      {children}
+      <div className="panel-body">{children}</div>
     </section>
   );
 }

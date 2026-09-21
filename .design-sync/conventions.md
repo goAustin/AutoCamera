@@ -2,17 +2,21 @@
 
 VideoOps is the control-plane UI for a durable video-operations system: runs,
 attempts, evaluations, and the human review that accepts or rejects generated
-clips. It is a **dark-only** system. There is no light theme.
+clips. It is a **dark-only** system. There is no light theme. The palette is
+graphite + amber — mint was retired as the accent (2026-09-21) and now means
+one thing only: passed / accepted / validated.
 
 ### The root wrapper is mandatory
 
 Every screen must sit inside an element with `className="videoops-surface"`.
 That class is where the ground lives — canvas colour, ink colour,
-`color-scheme: dark`, and the Inter-led font stack. The design tokens are
-defined on `:root` and always resolve, but **nothing applies them without this
-wrapper**: omit it and the screen renders as browser-default black text in a
-serif face on white, with every translucent panel compositing to grey. It is a
-class rather than a `body` rule so the library never restyles a host page.
+`color-scheme: dark`, and the font stack (system-ui; the repo has never
+shipped a webfont, so the stack names only what it actually renders). The
+design tokens are defined on `:root` and always resolve, but **nothing
+applies them without this wrapper**: omit it and the screen renders as
+browser-default black text in a serif face on white, with every translucent
+panel compositing to grey. It is a class rather than a `body` rule so the
+library never restyles a host page.
 
 `AppShell` and `TokenGate` carry `videoops-surface` themselves — a screen built
 from either is already wrapped. Anything else needs it explicitly:
@@ -35,14 +39,19 @@ Colour and surface tokens, all on `:root`:
 |---|---|
 | `--ink` | primary text |
 | `--muted` | secondary text, labels, body copy |
-| `--faint` | tertiary text, timestamps, uppercase eyebrows |
+| `--faint` | tertiary text, timestamps, uppercase eyebrows, mono meta |
 | `--canvas` | the page ground |
-| `--panel` | raised panel background |
-| `--panel-soft` | a recessed variant of the same |
+| `--panel` | raised panel background (cards) |
+| `--panel-rail` | the rail's own, slightly darker surface |
 | `--line` / `--line-strong` | hairline borders; `-strong` for interactive edges |
-| `--mint` / `--mint-deep` | the accent: primary actions, links, positive status |
-| `--coral` | negative status, destructive actions, failure copy |
-| `--gold` | in-flight status, confirmation gates, focus rings |
+| `--acc` / `--acc-soft` / `--acc-mid` | amber — the single action + in-flight colour |
+| `--ink-acc` | text colour on an amber fill |
+| `--pass` / `--pass-soft` / `--pass-mid` | passed / accepted / validated. Nothing else. |
+| `--fail` / `--fail-soft` / `--fail-mid` | negative status, destructive actions, failure copy |
+| `--done` | completed stepper nodes — done, not the live edge |
+| `--panel2` / `--panel2-bd` | a nested tint replacing a second border level |
+| `--sep` | the hairline that separates a heading from its body, or one row from the next |
+| `--mono` | `ui-monospace` stack — every id, hash, seed, timestamp, byte count and code string |
 | `--shadow` | the single elevation |
 
 Layout helpers you may reuse directly: `button-row` (a wrapping flex row of
@@ -52,11 +61,15 @@ paragraph).
 
 ### Composition rules that matter here
 
-- **One border level.** `Panel`, `AttemptSummary`, `RecommendationCard` and
-  `EvaluationPanel` each already draw a frame. Group content inside them with
-  spacing and a label, never another bordered box.
-- **One `primary` Button per surface.** Use `variant="danger"` for destructive
-  actions and `variant="quiet"` for everything else.
+- **One border level.** `Panel` draws the frame. Anything nested inside it
+  (`AttemptSummary`, `EvaluationPanel`, `RevisionHistory` rows,
+  `RecommendationCard`) separates by a `--panel2` tint, not another border.
+  Borders that remain are affordances (inputs, chips, the video frame) or
+  semantic (`Notice`, `ConfirmPanel`).
+- **One `primary` Button per surface.** It is filled amber. `variant="quiet"`
+  is transparent with a hairline for everything else. `variant="danger"` is
+  **outlined, never filled** — a filled destructive action reads as the
+  primary action at a glance, which defeats the point.
 - **Never headline a raw identifier.** Run, attempt and artifact ids are
   opaque; pass them through `shortId()` and title surfaces with something a
   human recognises.

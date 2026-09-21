@@ -2,13 +2,13 @@
   display: grid;
   gap: 0.9rem;
   padding: 1rem;
-  border-radius: 0.9rem;
-  background: var(--surface-nested);
+  border-radius: 8px;
+  background: var(--panel2);
 }
 
 .attempt-heading {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: space-between;
   gap: 1rem;
 }
@@ -20,13 +20,26 @@
 
 .attempt-heading h4 {
   margin: 0;
-  font-size: var(--text-subhead);
-  letter-spacing: -0.04em;
+  font-size: var(--text-lead);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.attempt-meta {
+  margin-top: 0.2rem;
+  color: var(--faint);
+  font-family: var(--mono);
+  font-size: var(--text-label);
+}
+
+.attempt-progress {
+  padding-top: 0.8rem;
+  border-top: var(--sep);
 }
 
 .failure-copy {
   margin: 0;
-  color: var(--coral);
+  color: var(--fail);
   font-size: var(--text-body);
   line-height: 1.55;
 }
@@ -40,9 +53,9 @@
   gap: 0.62rem;
   max-width: 360px;
   padding: 0.8rem;
-  border: 1px solid rgb(255 152 126 / 30%);
-  border-radius: 0.75rem;
-  background: rgb(255 152 126 / 5%);
+  border: 1px solid var(--fail-mid);
+  border-radius: 6px;
+  background: var(--fail-soft);
 }
 
 @media (max-width: 520px) {

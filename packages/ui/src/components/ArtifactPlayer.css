@@ -1,8 +1,93 @@
 .artifact-player {
+  display: grid;
+  gap: 0.5rem;
+  width: 100%;
+  max-width: 640px;
+}
+
+.artifact-frame {
+  position: relative;
+  aspect-ratio: 16 / 9;
+  overflow: hidden;
+  border-radius: 8px;
+  background: var(--panel2);
+}
+
+.artifact-frame video {
   display: block;
-  width: min(100%, 720px);
-  max-height: 420px;
-  border: 1px solid var(--line-strong);
-  border-radius: 0.75rem;
-  background: #000;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.artifact-play-toggle {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  border: none;
+  background: transparent;
+  color: var(--ink);
+  cursor: pointer;
+}
+
+.artifact-play-toggle svg {
+  width: 2.4rem;
+  height: 2.4rem;
+  padding: 0.6rem;
+  border-radius: 50%;
+  background: rgb(0 0 0 / 45%);
+  box-sizing: border-box;
+  transition: background 140ms ease;
+}
+
+.artifact-play-toggle:hover svg,
+.artifact-play-toggle:focus-visible svg {
+  background: rgb(0 0 0 / 62%);
+}
+
+.artifact-scrubber {
+  appearance: none;
+  width: 100%;
+  height: 3px;
+  border-radius: 999px;
+  background: var(--panel2);
+  cursor: pointer;
+}
+
+.artifact-scrubber::-webkit-slider-runnable-track {
+  height: 3px;
+  border-radius: 999px;
+  background: transparent;
+}
+
+.artifact-scrubber::-webkit-slider-thumb {
+  appearance: none;
+  width: 10px;
+  height: 10px;
+  margin-top: -3.5px;
+  border-radius: 50%;
+  background: var(--acc);
+  cursor: pointer;
+}
+
+.artifact-scrubber::-moz-range-track {
+  height: 3px;
+  border-radius: 999px;
+  background: transparent;
+}
+
+.artifact-scrubber::-moz-range-thumb {
+  width: 10px;
+  height: 10px;
+  border: none;
+  border-radius: 50%;
+  background: var(--acc);
+  cursor: pointer;
+}
+
+.artifact-meta {
+  color: var(--faint);
+  font-family: var(--mono);
+  font-size: var(--text-label);
 }

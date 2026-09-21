@@ -1,24 +1,45 @@
 .notice {
-  display: grid;
-  gap: 0.25rem;
+  display: flex;
+  align-items: flex-start;
+  gap: 0.55rem;
   margin-top: 0.75rem;
-  padding: 0.8rem 0.9rem;
+  padding: 0.65rem 0.8rem;
   border: 1px solid var(--line);
-  border-radius: 0.7rem;
+  border-radius: 6px;
   font-size: var(--text-body);
   line-height: 1.45;
 }
 
+.notice-dot {
+  width: 6px;
+  height: 6px;
+  margin-top: 0.5em;
+  border-radius: 50%;
+  background: currentcolor;
+  flex-shrink: 0;
+}
+
+.notice-content {
+  display: grid;
+  gap: 0.3rem;
+  min-width: 0;
+}
+
 .notice--info {
-  border-color: rgb(139 224 195 / 26%);
-  background: rgb(139 224 195 / 5%);
+  background: var(--panel2);
   color: var(--muted);
 }
 
 .notice--error {
-  border-color: rgb(255 152 126 / 38%);
-  background: rgb(255 152 126 / 6%);
-  color: var(--coral);
+  border-color: var(--fail-mid);
+  background: var(--fail-soft);
+  color: var(--fail);
+}
+
+.notice-trace {
+  color: var(--faint);
+  font-family: var(--mono);
+  font-size: var(--text-label);
 }
 
 .notice .button {

@@ -1,6 +1,6 @@
 .fact-list {
   display: grid;
-  gap: 0.7rem;
+  gap: 14px;
   margin: 0;
 }
 
@@ -11,8 +11,8 @@
 
 .fact-list dt {
   color: var(--faint);
-  font-size: var(--text-label);
-  font-weight: 800;
+  font-size: var(--text-micro);
+  font-weight: 700;
   letter-spacing: 0.08em;
   text-transform: uppercase;
 }
@@ -27,10 +27,8 @@
 /* auto-fit, not a viewport media query: these grids live inside cards whose
    width has nothing to do with the window. Empty tracks collapse, so the
    column count never exceeds the number of facts. */
-.fact-list--columns-3 {
-  grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr));
-}
-
+.fact-list--columns-3,
 .fact-list--columns-4 {
-  grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 14px 28px;
 }

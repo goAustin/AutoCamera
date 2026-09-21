@@ -23,7 +23,11 @@ const ACTIVE = new Set([
   'generating',
   'planning',
   'evaluating',
+  'awaiting_review',
 ]);
+/** The subset of active statuses that are actually happening right now, as
+ * opposed to waiting in a queue for one — these carry the pulsing dot. */
+const PULSING = new Set(['generating', 'awaiting_review']);
 
 /** Maps a domain status string onto the badge's four tones. */
 export function toneForStatus(status: string): StatusTone {
@@ -43,9 +47,13 @@ export interface StatusBadgeProps {
 /** A pill carrying a run, attempt, evaluation or revision status. */
 export function StatusBadge({ status, tone }: StatusBadgeProps): ReactElement {
   const resolved = tone ?? toneForStatus(status);
-  const className =
-    resolved === 'neutral'
-      ? 'status-badge'
-      : `status-badge status-badge--${resolved}`;
+  const pulsing = resolved === 'active' && PULSING.has(status);
+  const className = [
+    'status-badge',
+    resolved === 'neutral' ? '' : `status-badge--${resolved}`,
+    pulsing ? 'status-badge--pulsing' : '',
+  ]
+    .filter(Boolean)
+    .join(' ');
   return <span className={className}>{humanize(status)}</span>;
 }

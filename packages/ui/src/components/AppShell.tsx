@@ -15,9 +15,7 @@ export interface AppShellProps {
 
 const BRAND = (
   <>
-    <span className="brand-mark" aria-hidden="true">
-      H3
-    </span>
+    <span className="brand-mark" aria-hidden="true" />
     <span>
       <strong>VideoOps</strong>
       <small>Project Studio</small>

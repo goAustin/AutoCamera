@@ -1,21 +1,25 @@
 .progress-block {
   display: grid;
-  gap: 0.35rem;
-  color: var(--muted);
-  font-size: var(--text-label);
+  gap: 0.4rem;
 }
 
 .progress-track {
-  height: 0.48rem;
+  height: 3px;
   overflow: hidden;
   border-radius: 999px;
-  background: rgb(255 255 255 / 8%);
+  background: var(--panel2);
 }
 
 .progress-track span {
   display: block;
   height: 100%;
   border-radius: inherit;
-  background: var(--mint);
+  background: var(--acc);
   transition: width 200ms ease;
+}
+
+.progress-caption {
+  color: var(--faint);
+  font-family: var(--mono);
+  font-size: var(--text-label);
 }

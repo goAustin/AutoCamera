@@ -9,29 +9,24 @@
   gap: 1rem;
   width: min(100% - 2.5rem, 1440px);
   margin: 0 auto;
-  padding: 1.35rem 0;
+  padding: 1rem 0;
   border-bottom: 1px solid var(--line);
 }
 
 .brand {
   display: inline-flex;
   align-items: center;
-  gap: 0.75rem;
+  gap: 0.65rem;
   color: var(--ink);
   text-decoration: none;
 }
 
 .brand-mark {
-  display: grid;
-  width: 2.35rem;
-  height: 2.35rem;
-  place-items: center;
-  border: 1px solid var(--mint);
-  border-radius: 0.75rem;
-  color: var(--mint);
-  font-size: var(--text-label);
-  font-weight: 900;
-  letter-spacing: -0.08em;
+  display: inline-block;
+  width: 17px;
+  height: 17px;
+  border-radius: 4px;
+  background: var(--acc);
 }
 
 .brand strong,
@@ -41,13 +36,14 @@
 
 .brand strong {
   font-size: var(--text-lead);
-  letter-spacing: -0.02em;
+  font-weight: 600;
+  letter-spacing: -0.01em;
 }
 
 .brand small {
   color: var(--faint);
   font-size: var(--text-micro);
-  letter-spacing: 0.12em;
+  letter-spacing: 0.1em;
   text-transform: uppercase;
 }
 
@@ -59,10 +55,14 @@
 }
 
 .header-mode {
+  padding: 2px 8px;
+  border: var(--panel2-bd);
+  border-radius: 5px;
+  background: var(--panel2);
   color: var(--faint);
+  font-family: var(--mono);
   font-size: var(--text-label);
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
+  letter-spacing: 0.02em;
 }
 
 @media (max-width: 760px) {

@@ -27,7 +27,15 @@ export function ConfirmPanel({
   destructive = false,
 }: ConfirmPanelProps): ReactElement {
   return (
-    <div className="confirm-panel" role="alertdialog" aria-label={title}>
+    <div
+      className={
+        destructive
+          ? 'confirm-panel confirm-panel--destructive'
+          : 'confirm-panel'
+      }
+      role="alertdialog"
+      aria-label={title}
+    >
       <strong>{title}</strong>
       <p>{detail}</p>
       <div className="button-row">
@@ -39,6 +47,7 @@ export function ConfirmPanel({
           disabled={busy}
           onClick={onConfirm}
         >
+          {busy && <span className="button-spinner" aria-hidden="true" />}
           {busy ? 'Working…' : confirmLabel}
         </Button>
       </div>

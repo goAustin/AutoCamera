@@ -6,7 +6,8 @@ export interface NoticeProps {
   readonly children: ReactNode;
 }
 
-/** An inline message block. `error` takes `role="alert"` automatically. */
+/** An inline message block: a dot plus the text, no left-border rail.
+ * `error` takes `role="alert"` automatically. */
 export function Notice({
   variant = 'info',
   children,
@@ -16,7 +17,8 @@ export function Notice({
       className={`notice notice--${variant}`}
       role={variant === 'error' ? 'alert' : undefined}
     >
-      {children}
+      <span className="notice-dot" aria-hidden="true" />
+      <div className="notice-content">{children}</div>
     </div>
   );
 }
@@ -35,12 +37,12 @@ export function ErrorNotice({
   message,
   traceId,
   onRetry,
-  retryLabel = 'Try again',
+  retryLabel = 'Retry request',
 }: ErrorNoticeProps): ReactElement {
   return (
     <Notice variant="error">
       <strong>{message}</strong>
-      {traceId && <span>Trace {traceId}</span>}
+      {traceId && <span className="notice-trace">Trace {traceId}</span>}
       {onRetry && (
         <Button variant="quiet" onClick={onRetry}>
           {retryLabel}
